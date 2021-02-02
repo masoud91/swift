@@ -1,16 +1,32 @@
+language: python
+python:
+    - "3.7"
+
+install: 
+  - sudo apt-get update
+  - sudo apt-get install curl gcc memcached rsync sqlite3 xfsprogs \
+                     git-core libffi-dev python-setuptools \
+                     liberasurecode-dev libssl-dev
+  - sudo apt-get install python-coverage python-dev python-nose \
+                     python-xattr python-eventlet \
+                     python-greenlet python-pastedeploy \
+                     python-netifaces python-pip python-dnspython \
+                     python-mock
+
+script: tox
+
 # language: python
 
 # python:
 #   - "3.7"
 
-services:
-  - docker
+# services:
+#   - docker
   
-script:
-  - docker build -f Dockerfile-py3 .
+# script:
+#   - docker build -f Dockerfile-py3 -t swift_service .
+#   - docker run --rm swift_service sh -c "tox
 
-# python:
-#     - "3.7"
 
 # matrix:
 #   include:
