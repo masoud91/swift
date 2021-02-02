@@ -1,6 +1,8 @@
 language: python
 
-before_script: apt-get install liberasurecode-dev
+before_script: 
+  - apt-get install liberasurecode-dev
+  - apt-get install ssh rsync
 
 matrix:
   include:
