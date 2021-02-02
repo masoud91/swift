@@ -7,7 +7,7 @@ services:
   - docker
   
 script:
-  - docker build -f Dockerfile-py3"
+  - docker build -f Dockerfile-py3
 
 # python:
 #     - "3.7"
