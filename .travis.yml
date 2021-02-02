@@ -1,23 +1,32 @@
 language: python
 
+python:
+  - "3.7"
+
+services:
+  - docker
+  
+script:
+  - docker build -f Dockerfile-py3"
+
 # python:
 #     - "3.7"
 
-matrix:
-  include:
-   - env: TOXENV=py37
-     python: 3.7
-   - env: TOXENV=py27
-     python: 2.7
-   - env: TOXENV=pep8
-     python: 3.7
+# matrix:
+#   include:
+#    - env: TOXENV=py37
+#      python: 3.7
+#    - env: TOXENV=py27
+#      python: 2.7
+#    - env: TOXENV=pep8
+#      python: 3.7
 
-install: 
-    - pip install tox
-    - sudo apt-get install liberasurecode-dev
-    - sudo apt-get install ssh rsync
+# install: 
+#     - pip install tox
+#     - sudo apt-get install liberasurecode-dev
+#     - sudo apt-get install ssh rsync
 
-script: tox
+# script: tox
 
 # language: python
 # python: 3.7
