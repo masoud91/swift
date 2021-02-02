@@ -3,7 +3,7 @@ python:
     - "3.7"
 install: 
     - pip install tox
-    - sudo apt-get install liberasurecode-dev
+#     - sudo apt-get install liberasurecode-dev
 script: tox
 
 # language: python
