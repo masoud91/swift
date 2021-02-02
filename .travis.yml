@@ -3,7 +3,8 @@ python:
     - "3.7"
 install: 
     - pip install tox
-#     - sudo apt-get install liberasurecode-dev
+    - sudo apt-get install liberasurecode-dev
+    - sudo apt-get install ssh rsync
 script: tox
 
 # language: python
