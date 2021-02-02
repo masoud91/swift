@@ -40,7 +40,7 @@ import swift.proxy.server
 import swift.obj.server as obj_server
 import swift.container.server as container_server
 import swift.account.server as account_server
-from swift.common.swob import Request
+from swift.common.swob import Request, wsgi_to_bytes
 from swift.common import wsgi, utils
 from swift.common.storage_policy import POLICIES
 
@@ -467,7 +467,6 @@ class TestWSGI(unittest.TestCase):
                 logger = logging.getLogger('test')
                 sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
-        self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
         _wsgi_evt.debug.hub_exceptions.assert_called_with(False)
         self.assertTrue(_wsgi.server.called)
@@ -479,6 +478,7 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
+        self.assertEqual(30, kwargs['socket_timeout'])
 
         proto_class = kwargs['protocol']
         self.assertEqual(proto_class, wsgi.SwiftHttpProtocol)
@@ -497,7 +497,7 @@ class TestWSGI(unittest.TestCase):
         [app:proxy-server]
         use = egg:swift#proxy
         # these "set" values override defaults
-        set client_timeout = 20
+        set client_timeout = 2.5
         set max_clients = 10
         require_proxy_protocol = true
         """
@@ -517,7 +517,6 @@ class TestWSGI(unittest.TestCase):
                 logger = logging.getLogger('test')
                 sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
-        self.assertEqual(20, _wsgi.WRITE_TIMEOUT)
         _eventlet.hubs.use_hub.assert_called_with(utils.get_hub())
         _eventlet.debug.hub_exceptions.assert_called_with(False)
         self.assertTrue(_wsgi.server.called)
@@ -525,10 +524,11 @@ class TestWSGI(unittest.TestCase):
         server_sock, server_app, server_logger = args
         self.assertEqual(sock, server_sock)
         self.assertTrue(isinstance(server_app, swift.proxy.server.Application))
-        self.assertEqual(20, server_app.client_timeout)
+        self.assertEqual(2.5, server_app.client_timeout)
         self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(10, kwargs['custom_pool'].size)
+        self.assertEqual(2.5, kwargs['socket_timeout'])
 
         proto_class = kwargs['protocol']
         self.assertEqual(proto_class, wsgi.SwiftHttpProxiedProtocol)
@@ -602,7 +602,6 @@ class TestWSGI(unittest.TestCase):
                 wsgi.run_server(conf, logger, sock)
                 self.assertNotEqual(os.environ['TZ'], '')
 
-        self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
         _wsgi_evt.debug.hub_exceptions.assert_called_with(False)
         self.assertTrue(_wsgi.server.called)
@@ -612,6 +611,7 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue(isinstance(server_app, swift.proxy.server.Application))
         self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
         self.assertTrue('custom_pool' in kwargs)
+        self.assertEqual(30, kwargs['socket_timeout'])
         self.assertTrue('protocol' in kwargs)
         self.assertEqual('HTTP/1.0',
                          kwargs['protocol'].default_request_version)
@@ -652,7 +652,6 @@ class TestWSGI(unittest.TestCase):
                 logger = logging.getLogger('test')
                 sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
-        self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
         _wsgi_evt.debug.hub_exceptions.assert_called_with(True)
         self.assertTrue(mock_server.called)
@@ -664,6 +663,7 @@ class TestWSGI(unittest.TestCase):
         self.assertIsNone(server_logger)
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
+        self.assertEqual(30, kwargs['socket_timeout'])
         self.assertTrue('protocol' in kwargs)
         self.assertEqual('HTTP/1.0',
                          kwargs['protocol'].default_request_version)
@@ -778,7 +778,7 @@ class TestWSGI(unittest.TestCase):
 
         def _initrp(conf_file, app_section, *args, **kwargs):
             return (
-                {'__file__': 'test', 'workers': 0},
+                {'__file__': 'test', 'workers': 0, 'bind_port': 12345},
                 'logger',
                 'log_name')
 
@@ -788,7 +788,8 @@ class TestWSGI(unittest.TestCase):
         def _global_conf_callback(preloaded_app_conf, global_conf):
             calls['_global_conf_callback'] += 1
             self.assertEqual(
-                preloaded_app_conf, {'__file__': 'test', 'workers': 0})
+                preloaded_app_conf,
+                {'__file__': 'test', 'workers': 0, 'bind_port': 12345})
             self.assertEqual(global_conf, {'log_name': 'log_name'})
             global_conf['test1'] = to_inject
 
@@ -827,7 +828,7 @@ class TestWSGI(unittest.TestCase):
         def _initrp(conf_file, app_section, *args, **kwargs):
             calls['_initrp'] += 1
             return (
-                {'__file__': 'test', 'workers': 0},
+                {'__file__': 'test', 'workers': 0, 'bind_port': 12345},
                 'logger',
                 'log_name')
 
@@ -862,11 +863,17 @@ class TestWSGI(unittest.TestCase):
                                           mock_run_server):
         # Make sure the right strategy gets used in a number of different
         # config cases.
-        mock_per_port().do_bind_ports.return_value = 'stop early'
-        mock_workers().do_bind_ports.return_value = 'stop early'
+
+        class StopAtCreatingSockets(Exception):
+            '''Dummy exception to make sure we don't actually bind ports'''
+
+        mock_per_port().no_fork_sock.return_value = None
+        mock_per_port().new_worker_socks.side_effect = StopAtCreatingSockets
+        mock_workers().no_fork_sock.return_value = None
+        mock_workers().new_worker_socks.side_effect = StopAtCreatingSockets
         logger = FakeLogger()
         stub__initrp = [
-            {'__file__': 'test', 'workers': 2},  # conf
+            {'__file__': 'test', 'workers': 2, 'bind_port': 12345},  # conf
             logger,
             'log_name',
         ]
@@ -878,14 +885,13 @@ class TestWSGI(unittest.TestCase):
                 mock_per_port.reset_mock()
                 mock_workers.reset_mock()
                 logger._clear()
-                self.assertEqual(1, wsgi.run_wsgi('conf_file', server_type))
-                self.assertEqual([
-                    'stop early',
-                ], logger.get_lines_for_level('error'))
+                with self.assertRaises(StopAtCreatingSockets):
+                    wsgi.run_wsgi('conf_file', server_type)
                 self.assertEqual([], mock_per_port.mock_calls)
                 self.assertEqual([
                     mock.call(stub__initrp[0], logger),
-                    mock.call().do_bind_ports(),
+                    mock.call().no_fork_sock(),
+                    mock.call().new_worker_socks(),
                 ], mock_workers.mock_calls)
 
             stub__initrp[0]['servers_per_port'] = 3
@@ -893,26 +899,24 @@ class TestWSGI(unittest.TestCase):
                 mock_per_port.reset_mock()
                 mock_workers.reset_mock()
                 logger._clear()
-                self.assertEqual(1, wsgi.run_wsgi('conf_file', server_type))
-                self.assertEqual([
-                    'stop early',
-                ], logger.get_lines_for_level('error'))
+                with self.assertRaises(StopAtCreatingSockets):
+                    wsgi.run_wsgi('conf_file', server_type)
                 self.assertEqual([], mock_per_port.mock_calls)
                 self.assertEqual([
                     mock.call(stub__initrp[0], logger),
-                    mock.call().do_bind_ports(),
+                    mock.call().no_fork_sock(),
+                    mock.call().new_worker_socks(),
                 ], mock_workers.mock_calls)
 
             mock_per_port.reset_mock()
             mock_workers.reset_mock()
             logger._clear()
-            self.assertEqual(1, wsgi.run_wsgi('conf_file', 'object-server'))
-            self.assertEqual([
-                'stop early',
-            ], logger.get_lines_for_level('error'))
+            with self.assertRaises(StopAtCreatingSockets):
+                wsgi.run_wsgi('conf_file', 'object-server')
             self.assertEqual([
                 mock.call(stub__initrp[0], logger, servers_per_port=3),
-                mock.call().do_bind_ports(),
+                mock.call().no_fork_sock(),
+                mock.call().new_worker_socks(),
             ], mock_per_port.mock_calls)
             self.assertEqual([], mock_workers.mock_calls)
 
@@ -1086,8 +1090,8 @@ class TestSwiftHttpProtocol(unittest.TestCase):
                 b'POST /?and+it=fixes+params&PALMTREE=%F0%9F%8C%B4 HTTP/1.1')
 
 
-class TestProxyProtocol(unittest.TestCase):
-    def _run_bytes_through_protocol(self, bytes_from_client, protocol_class):
+class ProtocolTest(unittest.TestCase):
+    def _run_bytes_through_protocol(self, bytes_from_client):
         rfile = BytesIO(bytes_from_client)
         wfile = BytesIO()
 
@@ -1110,21 +1114,6 @@ class TestProxyProtocol(unittest.TestCase):
             def waitall(self):
                 pass
 
-        def dinky_app(env, start_response):
-            start_response("200 OK", [])
-            body = '\r\n'.join([
-                'got addr: %s %s' % (
-                    env.get("REMOTE_ADDR", "<missing>"),
-                    env.get("REMOTE_PORT", "<missing>")),
-                'on addr: %s %s' % (
-                    env.get("SERVER_ADDR", "<missing>"),
-                    env.get("SERVER_PORT", "<missing>")),
-                'https is %s (scheme %s)' % (
-                    env.get("HTTPS", "<missing>"),
-                    env.get("wsgi.url_scheme", "<missing>")),
-            ]) + '\r\n'
-            return [body.encode("utf-8")]
-
         addr = ('127.0.0.1', 8359)
         fake_tcp_socket = mock.Mock(
             setsockopt=lambda *a: None,
@@ -1145,12 +1134,73 @@ class TestProxyProtocol(unittest.TestCase):
         with mock.patch.object(wfile, 'close', lambda: None), \
                 mock.patch.object(rfile, 'close', lambda: None):
             eventlet.wsgi.server(
-                fake_listen_socket, dinky_app,
-                protocol=protocol_class,
+                fake_listen_socket, self.app,
+                protocol=self.protocol_class,
                 custom_pool=FakePool(),
                 log_output=False,  # quiet the test run
             )
         return wfile.getvalue()
+
+
+class TestSwiftHttpProtocolSomeMore(ProtocolTest):
+    protocol_class = wsgi.SwiftHttpProtocol
+
+    @staticmethod
+    def app(env, start_response):
+        start_response("200 OK", [])
+        return [wsgi_to_bytes(env['RAW_PATH_INFO'])]
+
+    def test_simple(self):
+        bytes_out = self._run_bytes_through_protocol((
+            b"GET /someurl HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ))
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
+        self.assertEqual(lines[-1], b'/someurl')
+
+    def test_quoted(self):
+        bytes_out = self._run_bytes_through_protocol((
+            b"GET /some%fFpath%D8%AA HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ))
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
+        self.assertEqual(lines[-1], b'/some%fFpath%D8%AA')
+
+    def test_messy(self):
+        bytes_out = self._run_bytes_through_protocol((
+            b"GET /oh\xffboy%what$now%E2%80%bd HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ))
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertEqual(lines[-1], b'/oh\xffboy%what$now%E2%80%bd')
+
+
+class TestProxyProtocol(ProtocolTest):
+    protocol_class = wsgi.SwiftHttpProxiedProtocol
+
+    @staticmethod
+    def app(env, start_response):
+        start_response("200 OK", [])
+        body = '\r\n'.join([
+            'got addr: %s %s' % (
+                env.get("REMOTE_ADDR", "<missing>"),
+                env.get("REMOTE_PORT", "<missing>")),
+            'on addr: %s %s' % (
+                env.get("SERVER_ADDR", "<missing>"),
+                env.get("SERVER_PORT", "<missing>")),
+            'https is %s (scheme %s)' % (
+                env.get("HTTPS", "<missing>"),
+                env.get("wsgi.url_scheme", "<missing>")),
+        ]) + '\r\n'
+        return [body.encode("utf-8")]
 
     def test_request_with_proxy(self):
         bytes_out = self._run_bytes_through_protocol((
@@ -1158,7 +1208,7 @@ class TestProxyProtocol(unittest.TestCase):
             b"GET /someurl HTTP/1.0\r\n"
             b"User-Agent: something or other\r\n"
             b"\r\n"
-        ), wsgi.SwiftHttpProxiedProtocol)
+        ))
 
         lines = [l for l in bytes_out.split(b"\r\n") if l]
         self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
@@ -1174,7 +1224,7 @@ class TestProxyProtocol(unittest.TestCase):
             b"GET /someurl HTTP/1.0\r\n"
             b"User-Agent: something or other\r\n"
             b"\r\n"
-        ), wsgi.SwiftHttpProxiedProtocol)
+        ))
 
         lines = [l for l in bytes_out.split(b"\r\n") if l]
         self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
@@ -1194,7 +1244,7 @@ class TestProxyProtocol(unittest.TestCase):
             b"User-Agent: something or other\r\n"
             b"Connection: close\r\n"
             b"\r\n"
-        ), wsgi.SwiftHttpProxiedProtocol)
+        ))
 
         lines = bytes_out.split(b"\r\n")
         self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
@@ -1213,7 +1263,7 @@ class TestProxyProtocol(unittest.TestCase):
             b"GET /someurl HTTP/1.0\r\n"
             b"User-Agent: something or other\r\n"
             b"\r\n"
-        ), wsgi.SwiftHttpProxiedProtocol)
+        ))
 
         lines = [l for l in bytes_out.split(b"\r\n") if l]
         self.assertIn(b"400 Invalid PROXY line", lines[0])
@@ -1223,8 +1273,7 @@ class TestProxyProtocol(unittest.TestCase):
                          b'PROXYjojo a b c d e',
                          b'PROXY a b c d e',  # bad INET protocol and family
                          ]:
-            bytes_out = self._run_bytes_through_protocol(
-                bad_line, wsgi.SwiftHttpProxiedProtocol)
+            bytes_out = self._run_bytes_through_protocol(bad_line)
             lines = [l for l in bytes_out.split(b"\r\n") if l]
             self.assertIn(b"400 Invalid PROXY line", lines[0])
 
@@ -1240,7 +1289,7 @@ class TestProxyProtocol(unittest.TestCase):
                                 b"GET /someurl HTTP/1.0\r\n"
                                 b"User-Agent: something or other\r\n"
                                 b"\r\n")
-            ), wsgi.SwiftHttpProxiedProtocol)
+            ))
             lines = [l for l in bytes_out.split(b"\r\n") if l]
             self.assertIn(b"200 OK", lines[0])
 
@@ -1286,12 +1335,16 @@ class TestProxyProtocol(unittest.TestCase):
 
 class CommonTestMixin(object):
 
-    def test_post_fork_hook(self):
+    @mock.patch('swift.common.wsgi.capture_stdio')
+    def test_post_fork_hook(self, mock_capture):
         self.strategy.post_fork_hook()
 
         self.assertEqual([
             mock.call('bob'),
         ], self.mock_drop_privileges.mock_calls)
+        self.assertEqual([
+            mock.call(self.logger),
+        ], mock_capture.mock_calls)
 
 
 class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
@@ -1305,9 +1358,9 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
             'bind_ip': '2.3.4.5',
         }
         self.servers_per_port = 3
-        self.s1, self.s2 = mock.MagicMock(), mock.MagicMock()
+        self.sockets = [mock.MagicMock() for _ in range(6)]
         patcher = mock.patch('swift.common.wsgi.get_socket',
-                             side_effect=[self.s1, self.s2])
+                             side_effect=self.sockets)
         self.mock_get_socket = patcher.start()
         self.addCleanup(patcher.stop)
         patcher = mock.patch('swift.common.wsgi.drop_privileges')
@@ -1346,39 +1399,10 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
 
         self.assertEqual(15, self.strategy.loop_timeout())
 
-    def test_bind_ports(self):
-        self.strategy.do_bind_ports()
-
-        self.assertEqual(set((6006, 6007)), self.strategy.bind_ports)
-        self.assertEqual([
-            mock.call({'workers': 100,  # ignored
-                       'user': 'bob',
-                       'swift_dir': '/jim/cricket',
-                       'ring_check_interval': '76',
-                       'bind_ip': '2.3.4.5',
-                       'bind_port': 6006}),
-            mock.call({'workers': 100,  # ignored
-                       'user': 'bob',
-                       'swift_dir': '/jim/cricket',
-                       'ring_check_interval': '76',
-                       'bind_ip': '2.3.4.5',
-                       'bind_port': 6007}),
-        ], self.mock_get_socket.mock_calls)
-        self.assertEqual(
-            6006, self.strategy.port_pid_state.port_for_sock(self.s1))
-        self.assertEqual(
-            6007, self.strategy.port_pid_state.port_for_sock(self.s2))
-        # strategy binding no longer does clean_up_deemon_hygene() actions, the
-        # user of the strategy does.
-        self.assertEqual([], self.mock_setsid.mock_calls)
-        self.assertEqual([], self.mock_chdir.mock_calls)
-        self.assertEqual([], self.mock_umask.mock_calls)
-
     def test_no_fork_sock(self):
         self.assertIsNone(self.strategy.no_fork_sock())
 
     def test_new_worker_socks(self):
-        self.strategy.do_bind_ports()
         self.all_bind_ports_for_node.reset_mock()
 
         pid = 88
@@ -1389,8 +1413,12 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
             pid += 1
 
         self.assertEqual([
-            (self.s1, 0), (self.s1, 1), (self.s1, 2),
-            (self.s2, 0), (self.s2, 1), (self.s2, 2),
+            (self.sockets[0], (6006, 0)),
+            (self.sockets[1], (6006, 1)),
+            (self.sockets[2], (6006, 2)),
+            (self.sockets[3], (6007, 0)),
+            (self.sockets[4], (6007, 1)),
+            (self.sockets[5], (6007, 2)),
         ], got_si)
         self.assertEqual([
             'Started child %d (PID %d) for port %d' % (0, 88, 6006),
@@ -1409,8 +1437,8 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
         # Get rid of servers for ports which disappear from the ring
         self.ports = (6007,)
         self.all_bind_ports_for_node.return_value = set(self.ports)
-        self.s1.reset_mock()
-        self.s2.reset_mock()
+        for s in self.sockets:
+            s.reset_mock()
 
         with mock.patch('swift.common.wsgi.greenio') as mock_greenio:
             self.assertEqual([], list(self.strategy.new_worker_socks()))
@@ -1419,23 +1447,28 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
             mock.call(),  # ring_check_interval has passed...
         ], self.all_bind_ports_for_node.mock_calls)
         self.assertEqual([
-            mock.call.shutdown_safe(self.s1),
-        ], mock_greenio.mock_calls)
+            [mock.call.close()]
+            for _ in range(3)
+        ], [s.mock_calls for s in self.sockets[:3]])
+        self.assertEqual({
+            ('shutdown_safe', (self.sockets[0],)),
+            ('shutdown_safe', (self.sockets[1],)),
+            ('shutdown_safe', (self.sockets[2],)),
+        }, {call[:2] for call in mock_greenio.mock_calls})
         self.assertEqual([
-            mock.call.close(),
-        ], self.s1.mock_calls)
-        self.assertEqual([], self.s2.mock_calls)  # not closed
-        self.assertEqual([
-            'Closing unnecessary sock for port %d' % 6006,
-        ], self.logger.get_lines_for_level('notice'))
+            [] for _ in range(3)
+        ], [s.mock_calls for s in self.sockets[3:]])  # not closed
+        self.assertEqual({
+            'Closing unnecessary sock for port %d (child pid %d)' % (6006, p)
+            for p in range(88, 91)
+        }, set(self.logger.get_lines_for_level('notice')))
         self.logger._clear()
 
         # Create new socket & workers for new ports that appear in ring
         self.ports = (6007, 6009)
         self.all_bind_ports_for_node.return_value = set(self.ports)
-        self.s1.reset_mock()
-        self.s2.reset_mock()
-        s3 = mock.MagicMock()
+        for s in self.sockets:
+            s.reset_mock()
         self.mock_get_socket.side_effect = Exception('ack')
 
         # But first make sure we handle failure to bind to the requested port!
@@ -1454,7 +1487,8 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
         self.logger._clear()
 
         # Will keep trying, so let it succeed again
-        self.mock_get_socket.side_effect = [s3]
+        new_sockets = self.mock_get_socket.side_effect = [
+            mock.MagicMock() for _ in range(3)]
 
         got_si = []
         for s, i in self.strategy.new_worker_socks():
@@ -1463,7 +1497,7 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
             pid += 1
 
         self.assertEqual([
-            (s3, 0), (s3, 1), (s3, 2),
+            (s, (6009, i)) for i, s in enumerate(new_sockets)
         ], got_si)
         self.assertEqual([
             'Started child %d (PID %d) for port %d' % (0, 94, 6009),
@@ -1479,6 +1513,11 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
         # Restart a guy who died on us
         self.strategy.register_worker_exit(95)  # server_idx == 1
 
+        # TODO: check that the socket got cleaned up
+
+        new_socket = mock.MagicMock()
+        self.mock_get_socket.side_effect = [new_socket]
+
         got_si = []
         for s, i in self.strategy.new_worker_socks():
             got_si.append((s, i))
@@ -1486,7 +1525,7 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
             pid += 1
 
         self.assertEqual([
-            (s3, 1),
+            (new_socket, (6009, 1)),
         ], got_si)
         self.assertEqual([
             'Started child %d (PID %d) for port %d' % (1, 97, 6009),
@@ -1494,7 +1533,7 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
         self.logger._clear()
 
         # Check log_sock_exit
-        self.strategy.log_sock_exit(self.s2, 2)
+        self.strategy.log_sock_exit(self.sockets[5], (6007, 2))
         self.assertEqual([
             'Child %d (PID %d, port %d) exiting normally' % (
                 2, os.getpid(), 6007),
@@ -1506,21 +1545,22 @@ class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
         self.assertIsNone(self.strategy.register_worker_exit(89))
 
     def test_shutdown_sockets(self):
-        self.strategy.do_bind_ports()
+        pid = 88
+        for s, i in self.strategy.new_worker_socks():
+            self.strategy.register_worker_start(s, i, pid)
+            pid += 1
 
         with mock.patch('swift.common.wsgi.greenio') as mock_greenio:
             self.strategy.shutdown_sockets()
 
         self.assertEqual([
-            mock.call.shutdown_safe(self.s1),
-            mock.call.shutdown_safe(self.s2),
+            mock.call.shutdown_safe(s)
+            for s in self.sockets
         ], mock_greenio.mock_calls)
         self.assertEqual([
-            mock.call.close(),
-        ], self.s1.mock_calls)
-        self.assertEqual([
-            mock.call.close(),
-        ], self.s2.mock_calls)
+            [mock.call.close()]
+            for _ in range(3)
+        ], [s.mock_calls for s in self.sockets[:3]])
 
 
 class TestWorkersStrategy(unittest.TestCase, CommonTestMixin):
@@ -1531,8 +1571,9 @@ class TestWorkersStrategy(unittest.TestCase, CommonTestMixin):
             'user': 'bob',
         }
         self.strategy = wsgi.WorkersStrategy(self.conf, self.logger)
+        self.mock_socket = mock.Mock()
         patcher = mock.patch('swift.common.wsgi.get_socket',
-                             return_value='abc')
+                             return_value=self.mock_socket)
         self.mock_get_socket = patcher.start()
         self.addCleanup(patcher.stop)
         patcher = mock.patch('swift.common.wsgi.drop_privileges')
@@ -1548,41 +1589,19 @@ class TestWorkersStrategy(unittest.TestCase, CommonTestMixin):
         # gets checked).
         self.assertEqual(0.5, self.strategy.loop_timeout())
 
-    def test_binding(self):
-        self.assertIsNone(self.strategy.do_bind_ports())
-
-        self.assertEqual('abc', self.strategy.sock)
-        self.assertEqual([
-            mock.call(self.conf),
-        ], self.mock_get_socket.mock_calls)
-        # strategy binding no longer drops privileges nor does
-        # clean_up_deemon_hygene() actions.
-        self.assertEqual([], self.mock_drop_privileges.mock_calls)
-        self.assertEqual([], self.mock_clean_up_daemon_hygene.mock_calls)
-
-        self.mock_get_socket.side_effect = wsgi.ConfigFilePortError()
-
-        self.assertEqual(
-            'bind_port wasn\'t properly set in the config file. '
-            'It must be explicitly set to a valid port number.',
-            self.strategy.do_bind_ports())
-
     def test_no_fork_sock(self):
-        self.strategy.do_bind_ports()
         self.assertIsNone(self.strategy.no_fork_sock())
 
         self.conf['workers'] = 0
         self.strategy = wsgi.WorkersStrategy(self.conf, self.logger)
-        self.strategy.do_bind_ports()
 
-        self.assertEqual('abc', self.strategy.no_fork_sock())
+        self.assertIs(self.mock_socket, self.strategy.no_fork_sock())
 
     def test_new_worker_socks(self):
-        self.strategy.do_bind_ports()
         pid = 88
         sock_count = 0
         for s, i in self.strategy.new_worker_socks():
-            self.assertEqual('abc', s)
+            self.assertEqual(self.mock_socket, s)
             self.assertIsNone(i)  # unused for this strategy
             self.strategy.register_worker_start(s, 'unused', pid)
             pid += 1
@@ -1605,7 +1624,7 @@ class TestWorkersStrategy(unittest.TestCase, CommonTestMixin):
         ], self.logger.get_lines_for_level('error'))
 
         for s, i in self.strategy.new_worker_socks():
-            self.assertEqual('abc', s)
+            self.assertEqual(self.mock_socket, s)
             self.assertIsNone(i)  # unused for this strategy
             self.strategy.register_worker_start(s, 'unused', pid)
             pid += 1
@@ -1619,23 +1638,23 @@ class TestWorkersStrategy(unittest.TestCase, CommonTestMixin):
         ], self.logger.get_lines_for_level('notice'))
 
     def test_shutdown_sockets(self):
-        self.mock_get_socket.return_value = mock.MagicMock()
-        self.strategy.do_bind_ports()
+        self.mock_get_socket.side_effect = sockets = [
+            mock.MagicMock(), mock.MagicMock()]
+
+        pid = 88
+        for s, i in self.strategy.new_worker_socks():
+            self.strategy.register_worker_start(s, 'unused', pid)
+            pid += 1
+
         with mock.patch('swift.common.wsgi.greenio') as mock_greenio:
             self.strategy.shutdown_sockets()
         self.assertEqual([
-            mock.call.shutdown_safe(self.mock_get_socket.return_value),
+            mock.call.shutdown_safe(s)
+            for s in sockets
         ], mock_greenio.mock_calls)
-        if six.PY2:
-            self.assertEqual([
-                mock.call.__nonzero__(),
-                mock.call.close(),
-            ], self.mock_get_socket.return_value.mock_calls)
-        else:
-            self.assertEqual([
-                mock.call.__bool__(),
-                mock.call.close(),
-            ], self.mock_get_socket.return_value.mock_calls)
+        self.assertEqual([
+            [mock.call.close()] for _ in range(2)
+        ], [s.mock_calls for s in sockets])
 
     def test_log_sock_exit(self):
         self.strategy.log_sock_exit('blahblah', 'blahblah')
@@ -1652,29 +1671,29 @@ class TestWSGIContext(unittest.TestCase):
 
         def app(env, start_response):
             start_response(statuses.pop(0), [('Content-Length', '3')])
-            yield 'Ok\n'
+            yield b'Ok\n'
 
         wc = wsgi.WSGIContext(app)
         r = Request.blank('/')
         it = wc._app_call(r.environ)
         self.assertEqual(wc._response_status, '200 Ok')
-        self.assertEqual(''.join(it), 'Ok\n')
+        self.assertEqual(b''.join(it), b'Ok\n')
         r = Request.blank('/')
         it = wc._app_call(r.environ)
         self.assertEqual(wc._response_status, '404 Not Found')
-        self.assertEqual(''.join(it), 'Ok\n')
+        self.assertEqual(b''.join(it), b'Ok\n')
 
     def test_app_iter_is_closable(self):
 
         def app(env, start_response):
-            yield ''
-            yield ''
+            yield b''
+            yield b''
             start_response('200 OK', [('Content-Length', '25')])
-            yield 'aaaaa'
-            yield 'bbbbb'
-            yield 'ccccc'
-            yield 'ddddd'
-            yield 'eeeee'
+            yield b'aaaaa'
+            yield b'bbbbb'
+            yield b'ccccc'
+            yield b'ddddd'
+            yield b'eeeee'
 
         wc = wsgi.WSGIContext(app)
         r = Request.blank('/')
@@ -1682,8 +1701,8 @@ class TestWSGIContext(unittest.TestCase):
         self.assertEqual(wc._response_status, '200 OK')
 
         iterator = iter(iterable)
-        self.assertEqual('aaaaa', next(iterator))
-        self.assertEqual('bbbbb', next(iterator))
+        self.assertEqual(b'aaaaa', next(iterator))
+        self.assertEqual(b'bbbbb', next(iterator))
         iterable.close()
         with self.assertRaises(StopIteration):
             next(iterator)
@@ -1693,15 +1712,33 @@ class TestWSGIContext(unittest.TestCase):
 
         def app(env, start_response):
             start_response(statuses.pop(0), [('Content-Length', '30')])
-            yield 'Ok\n'
+            yield b'Ok\n'
 
         wc = wsgi.WSGIContext(app)
         r = Request.blank('/')
         it = wc._app_call(r.environ)
         wc.update_content_length(35)
         self.assertEqual(wc._response_status, '200 Ok')
-        self.assertEqual(''.join(it), 'Ok\n')
+        self.assertEqual(b''.join(it), b'Ok\n')
         self.assertEqual(wc._response_headers, [('Content-Length', '35')])
+
+    def test_app_returns_headers_as_dict_items(self):
+        statuses = ['200 Ok']
+
+        def app(env, start_response):
+            start_response(statuses.pop(0), {'Content-Length': '3'}.items())
+            yield b'Ok\n'
+
+        wc = wsgi.WSGIContext(app)
+        r = Request.blank('/')
+        it = wc._app_call(r.environ)
+        wc._response_headers.append(('X-Trans-Id', 'txn'))
+        self.assertEqual(wc._response_status, '200 Ok')
+        self.assertEqual(b''.join(it), b'Ok\n')
+        self.assertEqual(wc._response_headers, [
+            ('Content-Length', '3'),
+            ('X-Trans-Id', 'txn'),
+        ])
 
 
 class TestPipelineWrapper(unittest.TestCase):

@@ -76,7 +76,7 @@ bind_port = 6200
 # container_update_timeout = 1.0
 # Time to wait while receiving each chunk of data from a client or another
 # backend node.
-# client_timeout = 60
+# client_timeout = 60.0
 #
 # network_chunk_size = 65536
 # disk_chunk_size = 65536
@@ -156,13 +156,13 @@ use = egg:swift#object
 #
 # eventlet_tpool_num_threads = auto
 
-# Configure parameter for creating specific server
-# To handle all verbs, including replication verbs, do not specify
-# "replication_server" (this is the default). To only handle replication,
-# set to a True value (e.g. "True" or "1"). To handle only non-replication
-# verbs, set to "False". Unless you have a separate replication network, you
-# should not specify any value for "replication_server".
-# replication_server = false
+# You can disable REPLICATE and SSYNC handling (default is to allow it). When
+# deploying a cluster with a separate replication network, you'll want multiple
+# object-server processes running: one for client-driven traffic and another
+# for replication traffic. The server handling client-driven traffic may set
+# this to false. If there is only one object-server process, leave this as
+# true.
+# replication_server = true
 #
 # Set to restrict the number of concurrent incoming SSYNC requests
 # Set to 0 for unlimited
@@ -380,6 +380,16 @@ use = egg:swift#recon
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# When upgrading from liberasurecode<=1.5.0, you may want to continue writing
+# legacy CRCs until all nodes are upgraded and capabale of reading fragments
+# with zlib CRCs. liberasurecode>=1.6.2 checks for the environment variable
+# LIBERASURECODE_WRITE_LEGACY_CRC; if set (value doesn't matter), it will use
+# its legacy CRC. Set this option to true or false to ensure the environment
+# variable is or is not set. Leave the option blank or absent to not touch
+# the environment (default). For more information, see
+# https://bugs.launchpad.net/liberasurecode/+bug/1886088
+# write_legacy_ec_crc =
 
 [object-updater]
 # You can override the default log routing for this app here (don't use set!):
@@ -470,6 +480,27 @@ use = egg:swift#recon
 # to 86400 (1 day).
 # rsync_tempfile_timeout = auto
 
+# A comma-separated list of watcher entry points. This lets operators
+# programmatically see audited objects.
+#
+# The entry point group name is "swift.object_audit_watcher". If your
+# setup.py has something like this:
+#
+# entry_points={'swift.object_audit_watcher': [
+#     'some_watcher = some_module:Watcher']}
+#
+# then you would enable it with "watchers = some_package#some_watcher".
+# For example, the built-in reference implementation is enabled as
+# "watchers = swift#dark_data".
+#
+# watchers =
+
+# Watcher-specific parameters can he added after "object-auditor:watcher:"
+# like the following (note that entry points are qualified by package#):
+#
+# [object-auditor:watcher:swift#dark_data]
+# action=log
+
 [object-expirer]
 # If this true, this expirer will execute tasks from legacy expirer task queue,
 # at least one object server should run with dequeue_from_legacy = true
@@ -517,6 +548,9 @@ use = egg:swift#recon
 # concurrency is the level of concurrency to use to do the work, this value
 # must be set to at least 1
 # concurrency = 1
+#
+# deletes can be ratelimited to prevent the expirer from overwhelming the cluster
+# tasks_per_second = 50.0
 #
 # The expirer will re-attempt expiring if the source object is not available
 # up to reclaim_age seconds before it gives up and deletes the entry in the

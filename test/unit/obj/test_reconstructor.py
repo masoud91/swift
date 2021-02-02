@@ -16,7 +16,6 @@ import itertools
 import json
 import unittest
 import os
-from hashlib import md5
 import mock
 import six
 import six.moves.cPickle as pickle
@@ -37,7 +36,7 @@ from six.moves.urllib.parse import unquote
 from swift.common import utils
 from swift.common.exceptions import DiskFileError
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import dump_recon_cache
+from swift.common.utils import dump_recon_cache, md5
 from swift.obj import diskfile, reconstructor as object_reconstructor
 from swift.common import ring
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
@@ -53,10 +52,11 @@ from test.unit.obj.common import write_diskfile
 
 @contextmanager
 def mock_ssync_sender(ssync_calls=None, response_callback=None, **kwargs):
-    def fake_ssync(daemon, node, job, suffixes):
+    def fake_ssync(daemon, node, job, suffixes, **kwargs):
         if ssync_calls is not None:
-            ssync_calls.append(
-                {'node': node, 'job': job, 'suffixes': suffixes})
+            call_args = {'node': node, 'job': job, 'suffixes': suffixes}
+            call_args.update(kwargs)
+            ssync_calls.append(call_args)
 
         def fake_call():
             if response_callback:
@@ -1137,6 +1137,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                         self.success = False
                         break
                 context['success'] = self.success
+                context.update(kwargs)
 
             def __call__(self, *args, **kwargs):
                 return self.success, self.available_map if self.success else {}
@@ -1162,13 +1163,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         ssync_calls = []
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)), \
-                mocked_http_conn(*[200] * 17, body=pickle.dumps({})), \
+                mocked_http_conn(*[200] * 6, body=pickle.dumps({})), \
                 mock.patch.object(
                     self.reconstructor, 'delete_reverted_objs') as mock_delete:
             self.reconstructor.reconstruct()
         expected_calls = []
         for context in ssync_calls:
             if context['job']['job_type'] == REVERT:
+                self.assertTrue(context.get('include_non_durable'))
                 for dirpath, files in visit_obj_dirs(context):
                     # sanity check - expect some files to be in dir,
                     # may not be for the reverted frag index
@@ -1177,6 +1179,9 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                 expected_calls.append(mock.call(context['job'],
                                       context['available_map'],
                                       context['node']['index']))
+            else:
+                self.assertFalse(context.get('include_non_durable'))
+
         mock_delete.assert_has_calls(expected_calls, any_order=True)
 
         # N.B. in this next test sequence we acctually delete files after
@@ -1189,17 +1194,20 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         ssync_calls = []
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)), \
-                mocked_http_conn(*[200] * 17, body=pickle.dumps({})), \
+                mocked_http_conn(*[200] * 6, body=pickle.dumps({})), \
                 mock.patch('swift.obj.reconstructor.random.shuffle'):
             self.reconstructor.reconstruct()
         for context in ssync_calls:
             if context['job']['job_type'] == REVERT:
+                self.assertTrue(True, context.get('include_non_durable'))
                 data_file_tail = ('#%s.data'
                                   % context['node']['index'])
                 for dirpath, files in visit_obj_dirs(context):
                     n_files_after += len(files)
                     for filename in files:
                         self.assertFalse(filename.endswith(data_file_tail))
+            else:
+                self.assertFalse(context.get('include_non_durable'))
 
         # sanity check that some files should were deleted
         self.assertGreater(n_files, n_files_after)
@@ -1226,13 +1234,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertEqual(len(captured_ssync), 2)
         expected_ssync_calls = {
             # device, part, frag_index: expected_occurrences
-            ('sda1', 2, 2): 1,
-            ('sda1', 2, 0): 1,
+            ('sda1', 2, 2, True): 1,
+            ('sda1', 2, 0, True): 1,
         }
         self.assertEqual(expected_ssync_calls, dict(collections.Counter(
             (context['job']['device'],
              context['job']['partition'],
-             context['job']['frag_index'])
+             context['job']['frag_index'],
+             context['include_non_durable'])
             for context in captured_ssync
         )))
 
@@ -1248,28 +1257,10 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         # again with no failures
         captured_ssync = []
         with mock.patch('swift.obj.reconstructor.ssync_sender',
-                        self._make_fake_ssync(captured_ssync)), \
-                mocked_http_conn(
-                    200, 200, body=pickle.dumps({})) as request_log:
+                        self._make_fake_ssync(captured_ssync)):
             self.reconstructor.reconstruct()
-        self.assertFalse(request_log.unexpected_requests)
         # same jobs
         self.assertEqual(len(captured_ssync), 2)
-        # but this time we rehash at the end
-        expected_suffix_calls = []
-        for context in captured_ssync:
-            if not context['success']:
-                # only successful jobs generate suffix rehash calls
-                continue
-            job = context['job']
-            expected_suffix_calls.append(
-                (job['sync_to'][0]['replication_ip'], '/%s/%s/%s' % (
-                    job['sync_to'][0]['device'], job['partition'],
-                    '-'.join(sorted(job['suffixes']))))
-            )
-        self.assertEqual(set(expected_suffix_calls),
-                         set((r['ip'], r['path'])
-                             for r in request_log.requests))
         self.assertFalse(
             self.logger.get_lines_for_level('error'))
         # handoffs are cleaned up
@@ -1310,29 +1301,20 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertTrue(os.access(part_path, os.F_OK))
 
         ssync_calls = []
-        status = [200] * 2
-        body = pickle.dumps({})
-        with mocked_http_conn(*status, body=body) as request_log:
-            with mock.patch('swift.obj.reconstructor.ssync_sender',
-                            self._make_fake_ssync(ssync_calls)):
-                self.reconstructor.reconstruct(override_partitions=[2])
-        expected_repliate_calls = set([
-            (u'10.0.0.0', '/sda4/2/3c1'),
-            (u'10.0.0.2', '/sda2/2/061'),
-        ])
-        found_calls = set((r['ip'], r['path'])
-                          for r in request_log.requests)
-        self.assertEqual(expected_repliate_calls, found_calls)
+        with mock.patch('swift.obj.reconstructor.ssync_sender',
+                        self._make_fake_ssync(ssync_calls)):
+            self.reconstructor.reconstruct(override_partitions=[2])
 
         expected_ssync_calls = sorted([
-            (u'10.0.0.0', REVERT, 2, [u'3c1']),
-            (u'10.0.0.2', REVERT, 2, [u'061']),
+            (u'10.0.0.0', REVERT, 2, [u'3c1'], True),
+            (u'10.0.0.2', REVERT, 2, [u'061'], True),
         ])
         self.assertEqual(expected_ssync_calls, sorted((
             c['node']['ip'],
             c['job']['job_type'],
             c['job']['partition'],
             c['suffixes'],
+            c.get('include_non_durable')
         ) for c in ssync_calls))
 
         expected_stats = {
@@ -1367,10 +1349,11 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                             self._make_fake_ssync(ssync_calls)):
                 self.reconstructor.reconstruct(override_partitions=[2])
         self.assertEqual([], ssync_calls)
+        self.assertEqual([], request_log.requests)
         self.assertFalse(os.access(part_path, os.F_OK))
 
     def test_process_job_all_success(self):
-        rehash_per_job_type = {SYNC: 2, REVERT: 1}
+        rehash_per_job_type = {SYNC: 1, REVERT: 0}
         self.reconstructor._reset_stats()
         with mock_ssync_sender():
             found_jobs = []
@@ -1413,7 +1396,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
     def test_process_job_all_insufficient_storage(self):
         self.reconstructor._reset_stats()
         with mock_ssync_sender():
-            with mocked_http_conn(*[507] * 15):
+            with mocked_http_conn(*[507] * 10):
                 found_jobs = []
                 for part_info in self.reconstructor.collect_parts():
                     jobs = self.reconstructor.build_reconstruction_jobs(
@@ -1446,7 +1429,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
     def test_process_job_all_client_error(self):
         self.reconstructor._reset_stats()
         with mock_ssync_sender():
-            with mocked_http_conn(*[400] * 11):
+            with mocked_http_conn(*[400] * 6):
                 found_jobs = []
                 for part_info in self.reconstructor.collect_parts():
                     jobs = self.reconstructor.build_reconstruction_jobs(
@@ -1478,7 +1461,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
 
     def test_process_job_all_timeout(self):
         self.reconstructor._reset_stats()
-        with mock_ssync_sender(), mocked_http_conn(*[Timeout()] * 11):
+        with mock_ssync_sender(), mocked_http_conn(*[Timeout()] * 6):
             found_jobs = []
             for part_info in self.reconstructor.collect_parts():
                 jobs = self.reconstructor.build_reconstruction_jobs(
@@ -3605,33 +3588,6 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                 v, job[k], k)
             self.assertEqual(v, job[k], msg)
 
-    def test_rehash_remote(self):
-        part_path = os.path.join(self.devices, self.local_dev['device'],
-                                 diskfile.get_data_dir(self.policy), '1')
-        utils.mkdirs(part_path)
-        part_info = {
-            'local_dev': self.local_dev,
-            'policy': self.policy,
-            'partition': 1,
-            'part_path': part_path,
-        }
-        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
-        self.assertEqual(1, len(jobs))
-        job = jobs[0]
-        node = job['sync_to'][0]
-        # process_job used to try and modify the instance base headers
-        self.reconstructor.headers['X-Backend-Storage-Policy-Index'] = \
-            int(POLICIES[1])
-        # ... which doesn't work out under concurrency with multiple policies
-        self.assertNotEqual(
-            self.reconstructor.headers['X-Backend-Storage-Policy-Index'],
-            int(job['policy']))
-        with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
-            self.reconstructor.rehash_remote(node, job, [])
-        self.assertEqual([int(job['policy'])], [
-            r['headers']['X-Backend-Storage-Policy-Index']
-            for r in request_log.requests])
-
     def test_get_suffixes_to_sync(self):
         part_path = os.path.join(self.devices, self.local_dev['device'],
                                  diskfile.get_data_dir(self.policy), '1')
@@ -3833,7 +3789,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         responses = []
         for hashes in (left_hashes, right_hashes, far_hashes):
-            responses.extend([(200, pickle.dumps(hashes))] * 2)
+            responses.append((200, pickle.dumps(hashes)))
         codes, body_iter = zip(*responses)
 
         ssync_calls = []
@@ -3845,24 +3801,22 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         expected_suffix_calls = [
             (sync_to[0]['ip'], '/%s/0' % sync_to[0]['device']),
-            (sync_to[0]['ip'], '/%s/0/123-abc' % sync_to[0]['device']),
             (sync_to[1]['ip'], '/%s/0' % sync_to[1]['device']),
-            (sync_to[1]['ip'], '/%s/0/123-abc' % sync_to[1]['device']),
             (sync_to[2]['ip'], '/%s/0' % sync_to[2]['device']),
-            (sync_to[2]['ip'], '/%s/0/123-abc' % sync_to[2]['device']),
         ]
         self.assertEqual(expected_suffix_calls,
                          [(r['ip'], r['path']) for r in request_log.requests])
 
         expected_ssync_calls = sorted([
-            (sync_to[0]['ip'], 0, set(['123', 'abc'])),
-            (sync_to[1]['ip'], 0, set(['123', 'abc'])),
-            (sync_to[2]['ip'], 0, set(['123', 'abc'])),
+            (sync_to[0]['ip'], 0, set(['123', 'abc']), False),
+            (sync_to[1]['ip'], 0, set(['123', 'abc']), False),
+            (sync_to[2]['ip'], 0, set(['123', 'abc']), False),
         ])
         self.assertEqual(expected_ssync_calls, sorted((
             c['node']['ip'],
             c['job']['partition'],
             set(c['suffixes']),
+            c.get('include_non_durable'),
         ) for c in ssync_calls))
 
     def test_sync_duplicates_to_remote_region(self):
@@ -3914,7 +3868,6 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         responses = [
             (200, pickle.dumps(left_hashes)),
-            (200, pickle.dumps(right_hashes)),
             (200, pickle.dumps(right_hashes)),
             (200, pickle.dumps(far_hashes)),
         ]
@@ -4005,7 +3958,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         }
 
         responses = [(200, pickle.dumps(hashes)) for hashes in (
-            left_hashes, right_hashes, right_hashes, far_hashes)]
+            left_hashes, right_hashes, far_hashes)]
         codes, body_iter = zip(*responses)
 
         ssync_calls = []
@@ -4018,7 +3971,6 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         expected_suffix_calls = set([
             (sync_to[0]['ip'], '/%s/0' % sync_to[0]['device']),
             (sync_to[1]['ip'], '/%s/0' % sync_to[1]['device']),
-            (sync_to[1]['ip'], '/%s/0/abc' % sync_to[1]['device']),
             (sync_to[2]['ip'], '/%s/0' % sync_to[2]['device']),
         ])
         self.assertEqual(expected_suffix_calls,
@@ -4026,12 +3978,13 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                              for r in request_log.requests))
 
         expected_ssync_calls = sorted([
-            (sync_to[1]['ip'], 0, ['abc']),
+            (sync_to[1]['ip'], 0, ['abc'], False),
         ])
         self.assertEqual(expected_ssync_calls, sorted((
             c['node']['ip'],
             c['job']['partition'],
             c['suffixes'],
+            c.get('include_non_durable')
         ) for c in ssync_calls))
 
     def test_process_job_primary_some_in_sync(self):
@@ -4076,7 +4029,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         responses = []
         for hashes in (left_hashes, right_hashes, far_hashes):
-            responses.extend([(200, pickle.dumps(hashes))] * 2)
+            responses.append((200, pickle.dumps(hashes)))
         codes, body_iter = zip(*responses)
 
         ssync_calls = []
@@ -4089,11 +4042,8 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         expected_suffix_calls = set([
             (sync_to[0]['ip'], '/%s/0' % sync_to[0]['device']),
-            (sync_to[0]['ip'], '/%s/0/123' % sync_to[0]['device']),
             (sync_to[1]['ip'], '/%s/0' % sync_to[1]['device']),
-            (sync_to[1]['ip'], '/%s/0/abc' % sync_to[1]['device']),
             (sync_to[2]['ip'], '/%s/0' % sync_to[2]['device']),
-            (sync_to[2]['ip'], '/%s/0/123-abc' % sync_to[2]['device']),
         ])
         self.assertEqual(expected_suffix_calls,
                          set((r['ip'], r['path'])
@@ -4101,11 +4051,12 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         self.assertEqual(
             dict(collections.Counter(
-                (c['node']['index'], tuple(sorted(c['suffixes'])))
+                (c['node']['index'], tuple(sorted(c['suffixes'])),
+                 c.get('include_non_durable'))
                 for c in ssync_calls)),
-            {(sync_to[0]['index'], ('123',)): 1,
-             (sync_to[1]['index'], ('abc',)): 1,
-             (sync_to[2]['index'], ('123', 'abc')): 1,
+            {(sync_to[0]['index'], ('123',), False): 1,
+             (sync_to[1]['index'], ('abc',), False): 1,
+             (sync_to[2]['index'], ('123', 'abc'), False): 1,
              })
 
     def test_process_job_primary_down(self):
@@ -4149,13 +4100,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         for node in part_nodes[:3]:
             expected_suffix_calls.update([
                 (node['replication_ip'], '/%s/0' % node['device']),
-                (node['replication_ip'], '/%s/0/123-abc' % node['device']),
             ])
-        # the first (primary sync_to) node's rehash_remote will be skipped
-        first_node = part_nodes[0]
-        expected_suffix_calls.remove(
-            (first_node['replication_ip'], '/%s/0/123-abc'
-             % first_node['device']))
 
         ssync_calls = []
         with mock_ssync_sender(ssync_calls,
@@ -4171,14 +4116,15 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         self.assertEqual(expected_suffix_calls, found_suffix_calls)
 
         expected_ssync_calls = sorted([
-            ('10.0.0.0', 0, set(['123', 'abc'])),
-            ('10.0.0.1', 0, set(['123', 'abc'])),
-            ('10.0.0.2', 0, set(['123', 'abc'])),
+            ('10.0.0.0', 0, set(['123', 'abc']), False),
+            ('10.0.0.1', 0, set(['123', 'abc']), False),
+            ('10.0.0.2', 0, set(['123', 'abc']), False),
         ])
         found_ssync_calls = sorted((
             c['node']['ip'],
             c['job']['partition'],
             set(c['suffixes']),
+            c.get('include_non_durable')
         ) for c in ssync_calls)
         self.assertEqual(expected_ssync_calls, found_ssync_calls)
 
@@ -4272,10 +4218,8 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         responses = [
             (200, pickle.dumps(left_hashes)),  # hashes left partner
-            (200, pickle.dumps(left_hashes)),  # hashes post-sync
             (507, ''),  # unmounted right partner
             (200, pickle.dumps({})),  # hashes handoff
-            (200, ''),  # hashes post-sync
             (200, pickle.dumps(far_hashes)),  # hashes far partner
         ]
         codes, body_iter = zip(*responses)
@@ -4296,9 +4240,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             self.fail('Unable to find handoff?!')
         expected = collections.Counter([
             (200, sync_to[0]['ip']),
-            (200, sync_to[0]['ip']),
             (507, sync_to[1]['ip']),
-            (200, handoff['ip']),
             (200, handoff['ip']),
             (200, sync_to[2]['ip']),
         ])
@@ -4326,6 +4268,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         part_path = os.path.join(self.devices, self.local_dev['device'],
                                  diskfile.get_data_dir(self.policy),
                                  str(partition))
+        os.makedirs(part_path)
         job = {
             'job_type': object_reconstructor.REVERT,
             'frag_index': frag_index,
@@ -4336,29 +4279,23 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'hashes': stub_hashes,
             'policy': self.policy,
             'local_dev': self.local_dev,
+            'device': self.local_dev['device'],
         }
 
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
-                mocked_http_conn(200, body=pickle.dumps({})) as request_log:
+                           return_value=(None, stub_hashes)):
             self.reconstructor.process_job(job)
-
-        expected_suffix_calls = set([
-            (sync_to[0]['ip'], '/%s/0/123-abc' % sync_to[0]['device']),
-        ])
-        found_suffix_calls = set((r['ip'], r['path'])
-                                 for r in request_log.requests)
-        self.assertEqual(expected_suffix_calls, found_suffix_calls)
 
         self.assertEqual(
             sorted(collections.Counter(
                 (c['node']['ip'], c['node']['port'], c['node']['device'],
-                 tuple(sorted(c['suffixes'])))
+                 tuple(sorted(c['suffixes'])),
+                 c.get('include_non_durable'))
                 for c in ssync_calls).items()),
             [((sync_to[0]['ip'], sync_to[0]['port'], sync_to[0]['device'],
-               ('123', 'abc')), 1)])
+               ('123', 'abc'), True), 1)])
 
     def test_process_job_will_not_revert_to_handoff(self):
         frag_index = random.randint(
@@ -4375,6 +4312,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         part_path = os.path.join(self.devices, self.local_dev['device'],
                                  diskfile.get_data_dir(self.policy),
                                  str(partition))
+        os.makedirs(part_path)
         job = {
             'job_type': object_reconstructor.REVERT,
             'frag_index': frag_index,
@@ -4385,6 +4323,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'hashes': stub_hashes,
             'policy': self.policy,
             'local_dev': self.local_dev,
+            'device': self.local_dev['device'],
         }
 
         non_local = {'called': 0}
@@ -4408,10 +4347,11 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         self.assertEqual(
             sorted(collections.Counter(
                 (c['node']['ip'], c['node']['port'], c['node']['device'],
-                 tuple(sorted(c['suffixes'])))
+                 tuple(sorted(c['suffixes'])),
+                 c.get('include_non_durable'))
                 for c in ssync_calls).items()),
             [((sync_to[0]['ip'], sync_to[0]['port'], sync_to[0]['device'],
-               ('123', 'abc')), 1)])
+               ('123', 'abc'), True), 1)])
 
     def test_process_job_revert_is_handoff_fails(self):
         frag_index = random.randint(
@@ -4429,6 +4369,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         part_path = os.path.join(self.devices, self.local_dev['device'],
                                  diskfile.get_data_dir(self.policy),
                                  str(partition))
+        os.makedirs(part_path)
         job = {
             'job_type': object_reconstructor.REVERT,
             'frag_index': frag_index,
@@ -4439,6 +4380,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'hashes': stub_hashes,
             'policy': self.policy,
             'local_dev': handoff_nodes[-1],
+            'device': self.local_dev['device'],
         }
 
         def ssync_response_callback(*args):
@@ -4460,10 +4402,11 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         self.assertEqual(
             sorted(collections.Counter(
                 (c['node']['ip'], c['node']['port'], c['node']['device'],
-                 tuple(sorted(c['suffixes'])))
+                 tuple(sorted(c['suffixes'])),
+                 c.get('include_non_durable'))
                 for c in ssync_calls).items()),
             [((sync_to[0]['ip'], sync_to[0]['port'], sync_to[0]['device'],
-               ('123', 'abc')), 1)])
+               ('123', 'abc'), True), 1)])
         self.assertEqual(self.reconstructor.handoffs_remaining, 1)
 
     def test_process_job_revert_cleanup(self):
@@ -4488,7 +4431,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             metadata = {
                 'X-Timestamp': ts.internal,
                 'Content-Length': len(test_data),
-                'Etag': md5(test_data).hexdigest(),
+                'Etag': md5(test_data, usedforsecurity=False).hexdigest(),
                 'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
             }
             writer.put(metadata)
@@ -4507,6 +4450,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'hashes': {},
             'policy': self.policy,
             'local_dev': self.local_dev,
+            'device': self.local_dev['device'],
         }
 
         def ssync_response_callback(*args):
@@ -4516,15 +4460,8 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls,
                                response_callback=ssync_response_callback):
-            with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+            self.reconstructor.process_job(job)
 
-        self.assertEqual([
-            (sync_to[0]['replication_ip'], '/%s/0/%s' % (
-                sync_to[0]['device'], suffix)),
-        ], [
-            (r['ip'], r['path']) for r in request_log.requests
-        ])
         # hashpath has been removed
         self.assertFalse(os.path.exists(df._datadir))
 
@@ -4559,6 +4496,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'hashes': {},
             'policy': self.policy,
             'local_dev': self.local_dev,
+            'device': self.local_dev['device'],
         }
 
         def ssync_response_callback(*args):
@@ -4567,15 +4505,8 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls,
                                response_callback=ssync_response_callback):
-            with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+            self.reconstructor.process_job(job)
 
-        self.assertEqual([
-            (sync_to[0]['replication_ip'], '/%s/0/%s' % (
-                sync_to[0]['device'], suffix)),
-        ], [
-            (r['ip'], r['path']) for r in request_log.requests
-        ])
         # hashpath is still there, but it's empty
         self.assertEqual([], os.listdir(df._datadir))
 
@@ -4639,7 +4570,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
         broken_body = ec_archive_bodies.pop(1)
 
@@ -4669,8 +4600,8 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 self.assertEqual(0, df.content_length)
                 fixed_body = b''.join(df.reader())
         self.assertEqual(len(fixed_body), len(broken_body))
-        self.assertEqual(md5(fixed_body).hexdigest(),
-                         md5(broken_body).hexdigest())
+        self.assertEqual(md5(fixed_body, usedforsecurity=False).hexdigest(),
+                         md5(broken_body, usedforsecurity=False).hexdigest())
         self.assertEqual(len(part_nodes) - 1, len(called_headers),
                          'Expected %d calls, got %r' % (len(part_nodes) - 1,
                                                         called_headers))
@@ -4703,7 +4634,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(4)
@@ -4727,8 +4658,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                     job, node, dict(self.obj_metadata))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
-                self.assertEqual(md5(fixed_body).hexdigest(),
-                                 md5(broken_body).hexdigest())
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
 
     def test_reconstruct_fa_error_with_invalid_header(self):
         job = {
@@ -4740,7 +4672,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(4)
@@ -4773,8 +4705,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             fixed_body = b''.join(df.reader())
             # ... this bad response should be ignored like any other failure
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
     def test_reconstruct_parity_fa_with_data_node_failure(self):
         job = {
@@ -4788,7 +4721,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         # make up some data (trim some amount to make it unaligned with
         # segment size)
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-454]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
         # the scheme is 10+4, so this gets a parity node
         broken_body = ec_archive_bodies.pop(-4)
@@ -4810,8 +4743,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                     job, node, dict(self.obj_metadata))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
-                self.assertEqual(md5(fixed_body).hexdigest(),
-                                 md5(broken_body).hexdigest())
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
 
     def test_reconstruct_fa_exceptions_fails(self):
         job = {
@@ -4878,7 +4812,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         # bad response
@@ -4912,8 +4846,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, self.obj_metadata)
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # no error and warning
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -4929,7 +4864,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
@@ -4951,8 +4886,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, dict(self.obj_metadata))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # one newer etag won't spoil the bunch
         new_index = random.randint(0, self.policy.ec_ndata - 1)
@@ -4967,8 +4903,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, dict(self.obj_metadata))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # no error and warning
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -4984,7 +4921,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
@@ -5003,8 +4940,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, dict(self.obj_metadata))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # a response at same timestamp but different etag won't spoil the bunch
         # N.B. (FIXME). if we choose the first response as garbage, the
@@ -5023,8 +4961,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, dict(self.obj_metadata))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # expect an error log but no warnings
         error_log_lines = self.logger.get_lines_for_level('error')
@@ -5054,7 +4993,8 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             archive_bodies = encode_frag_archive_bodies(self.policy, body)
             # pop the index to the destination node
             archive_bodies.pop(1)
-            key = (md5(body).hexdigest(), next(ts).internal, bool(i % 2))
+            key = (md5(body, usedforsecurity=False).hexdigest(),
+                   next(ts).internal, bool(i % 2))
             ec_archive_dict[key] = archive_bodies
 
         responses = list()
@@ -5127,7 +5067,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         # instead of popping the broken body, we'll just leave it in the list
@@ -5148,8 +5088,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, self.obj_metadata)
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # no error, no warning
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -5186,7 +5127,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
@@ -5208,8 +5149,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 job, node, self.obj_metadata)
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
         # no error and warning
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -5236,7 +5178,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
@@ -5266,8 +5208,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                     job, node, self.obj_metadata)
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
-                self.assertEqual(md5(fixed_body).hexdigest(),
-                                 md5(broken_body).hexdigest())
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
 
             # no errors
             self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -5308,7 +5251,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         node['backend_index'] = self.policy.get_backend_index(node['index'])
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
@@ -5333,8 +5276,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                     job, node, self.obj_metadata)
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
-                self.assertEqual(md5(fixed_body).hexdigest(),
-                                 md5(broken_body).hexdigest())
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
 
             # no errors
             self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -5391,7 +5335,7 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         }
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(index)
@@ -5429,8 +5373,9 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
                     job, node, metadata)
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
-                self.assertEqual(md5(fixed_body).hexdigest(),
-                                 md5(broken_body).hexdigest())
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
                 for called_header in called_headers:
                     called_header = HeaderKeyDict(called_header)
                     self.assertIn('Content-Length', called_header)

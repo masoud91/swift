@@ -14,10 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from hashlib import md5
 import itertools
 import unittest
-import uuid
 import random
 import shutil
 from collections import defaultdict
@@ -25,45 +23,12 @@ from collections import defaultdict
 from test.probe.common import ECProbeTest, Body
 
 from swift.common import direct_client
-from swift.common.storage_policy import EC_POLICY
-from swift.common.manager import Manager
 from swift.obj import reconstructor
 
 from swiftclient import client
 
 
 class TestReconstructorRevert(ECProbeTest):
-
-    def setUp(self):
-        super(TestReconstructorRevert, self).setUp()
-        self.container_name = 'container-%s' % uuid.uuid4()
-        self.object_name = 'object-%s' % uuid.uuid4()
-
-        # sanity
-        self.assertEqual(self.policy.policy_type, EC_POLICY)
-        self.reconstructor = Manager(["object-reconstructor"])
-
-    def proxy_get(self):
-        # GET object
-        headers, body = client.get_object(self.url, self.token,
-                                          self.container_name,
-                                          self.object_name,
-                                          resp_chunk_size=64 * 2 ** 10)
-        resp_checksum = md5()
-        for chunk in body:
-            resp_checksum.update(chunk)
-        return resp_checksum.hexdigest()
-
-    def direct_get(self, node, part):
-        req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
-        headers, data = direct_client.direct_get_object(
-            node, part, self.account, self.container_name,
-            self.object_name, headers=req_headers,
-            resp_chunk_size=64 * 2 ** 20)
-        hasher = md5()
-        for chunk in data:
-            hasher.update(chunk)
-        return hasher.hexdigest()
 
     def test_revert_object(self):
         # create EC container
@@ -79,8 +44,8 @@ class TestReconstructorRevert(ECProbeTest):
         # kill 2 a parity count number of primary nodes so we can
         # force data onto handoffs, we do that by renaming dev dirs
         # to induce 507
-        p_dev1 = self.device_dir('object', onodes[0])
-        p_dev2 = self.device_dir('object', onodes[1])
+        p_dev1 = self.device_dir(onodes[0])
+        p_dev2 = self.device_dir(onodes[1])
         self.kill_drive(p_dev1)
         self.kill_drive(p_dev2)
 
@@ -99,30 +64,18 @@ class TestReconstructorRevert(ECProbeTest):
         # these primaries can't serve the data any more, we expect 507
         # here and not 404 because we're using mount_check to kill nodes
         for onode in (onodes[0], onodes[1]):
-            try:
-                self.direct_get(onode, opart)
-            except direct_client.DirectClientException as err:
-                self.assertEqual(err.http_status, 507)
-            else:
-                self.fail('Node data on %r was not fully destroyed!' %
-                          (onode,))
+            self.assert_direct_get_fails(onode, opart, 507)
 
         # now take out another primary
-        p_dev3 = self.device_dir('object', onodes[2])
+        p_dev3 = self.device_dir(onodes[2])
         self.kill_drive(p_dev3)
 
-        # this node can't servce the data any more
-        try:
-            self.direct_get(onodes[2], opart)
-        except direct_client.DirectClientException as err:
-            self.assertEqual(err.http_status, 507)
-        else:
-            self.fail('Node data on %r was not fully destroyed!' %
-                      (onode,))
+        # this node can't serve the data any more
+        self.assert_direct_get_fails(onodes[2], opart, 507)
 
         # make sure we can still GET the object and its correct
         # we're now pulling from handoffs and reconstructing
-        etag = self.proxy_get()
+        _headers, etag = self.proxy_get()
         self.assertEqual(etag, contents.etag)
 
         # rename the dev dirs so they don't 507 anymore
@@ -132,12 +85,12 @@ class TestReconstructorRevert(ECProbeTest):
 
         # fire up reconstructor on handoff nodes only
         for hnode in hnodes:
-            hnode_id = (hnode['port'] - 6000) // 10
+            hnode_id = (hnode['port'] % 100) // 10
             self.reconstructor.once(number=hnode_id)
 
         # first three primaries have data again
         for onode in (onodes[0], onodes[2]):
-            self.direct_get(onode, opart)
+            self.assert_direct_get_succeeds(onode, opart)
 
         # check meta
         meta = client.head_object(self.url, self.token,
@@ -149,13 +102,7 @@ class TestReconstructorRevert(ECProbeTest):
 
         # handoffs are empty
         for hnode in hnodes:
-            try:
-                self.direct_get(hnode, opart)
-            except direct_client.DirectClientException as err:
-                self.assertEqual(err.http_status, 404)
-            else:
-                self.fail('Node data on %r was not fully destroyed!' %
-                          (hnode,))
+            self.assert_direct_get_fails(hnode, opart, 404)
 
     def test_delete_propagate(self):
         # create EC container
@@ -177,7 +124,7 @@ class TestReconstructorRevert(ECProbeTest):
         # now lets shut down a couple of primaries
         failed_nodes = random.sample(onodes, 2)
         for node in failed_nodes:
-            self.kill_drive(self.device_dir('object', node))
+            self.kill_drive(self.device_dir(node))
 
         # Write tombstones over the nodes that are still online
         client.delete_object(self.url, self.token,
@@ -228,8 +175,8 @@ class TestReconstructorRevert(ECProbeTest):
             self.fail('Found obj data on %r' % hnodes[1])
 
         # repair the primaries
-        self.revive_drive(self.device_dir('object', failed_nodes[0]))
-        self.revive_drive(self.device_dir('object', failed_nodes[1]))
+        self.revive_drive(self.device_dir(failed_nodes[0]))
+        self.revive_drive(self.device_dir(failed_nodes[1]))
 
         # run reconstructor on second handoff
         self.reconstructor.once(number=self.config_number(hnodes[1]))
@@ -274,7 +221,7 @@ class TestReconstructorRevert(ECProbeTest):
         primary_node = node_list[0]
 
         # ... and 507 it's device
-        primary_device = self.device_dir('object', primary_node)
+        primary_device = self.device_dir(primary_node)
         self.kill_drive(primary_device)
 
         # PUT object
@@ -285,12 +232,13 @@ class TestReconstructorRevert(ECProbeTest):
 
         # fix the primary device and sanity GET
         self.revive_drive(primary_device)
-        self.assertEqual(etag, self.proxy_get())
+        _headers, actual_etag = self.proxy_get()
+        self.assertEqual(etag, actual_etag)
 
         # find a handoff holding the fragment
         for hnode in self.object_ring.get_more_nodes(opart):
             try:
-                reverted_fragment_etag = self.direct_get(hnode, opart)
+                _hdrs, reverted_fragment_etag = self.direct_get(hnode, opart)
             except direct_client.DirectClientException as err:
                 if err.http_status != 404:
                     raise
@@ -308,7 +256,7 @@ class TestReconstructorRevert(ECProbeTest):
                 # we'll keep track of the etag of this fragment we're removing
                 # in case we need it later (queue forshadowing music)...
                 try:
-                    handoff_fragment_etag = self.direct_get(node, opart)
+                    _hdrs, handoff_fragment_etag = self.direct_get(node, opart)
                 except direct_client.DirectClientException as err:
                     if err.http_status != 404:
                         raise
@@ -316,7 +264,7 @@ class TestReconstructorRevert(ECProbeTest):
                     # machine as the primary!
                     continue
                 # use the primary nodes device - not the hnode device
-                part_dir = self.storage_dir('object', node, part=opart)
+                part_dir = self.storage_dir(node, part=opart)
                 shutil.rmtree(part_dir, True)
 
         # revert from handoff device with reconstructor
@@ -324,14 +272,14 @@ class TestReconstructorRevert(ECProbeTest):
 
         # verify fragment reverted to primary server
         self.assertEqual(reverted_fragment_etag,
-                         self.direct_get(primary_node, opart))
+                         self.direct_get(primary_node, opart)[1])
 
         # now we'll remove some data on one of the primary node's partners
         partner = random.choice(reconstructor._get_partners(
             primary_node['index'], onodes))
 
         try:
-            rebuilt_fragment_etag = self.direct_get(partner, opart)
+            _hdrs, rebuilt_fragment_etag = self.direct_get(partner, opart)
         except direct_client.DirectClientException as err:
             if err.http_status != 404:
                 raise
@@ -343,7 +291,7 @@ class TestReconstructorRevert(ECProbeTest):
             else:
                 # I wonder what happened?
                 self.fail('Partner inexplicably missing fragment!')
-        part_dir = self.storage_dir('object', partner, part=opart)
+        part_dir = self.storage_dir(partner, part=opart)
         shutil.rmtree(part_dir, True)
 
         # sanity, it's gone
@@ -361,12 +309,143 @@ class TestReconstructorRevert(ECProbeTest):
         # and validate the partners rebuilt_fragment_etag
         try:
             self.assertEqual(rebuilt_fragment_etag,
-                             self.direct_get(partner, opart))
+                             self.direct_get(partner, opart)[1])
         except direct_client.DirectClientException as err:
             if err.http_status != 404:
                 raise
             else:
                 self.fail('Did not find rebuilt fragment on partner node')
+
+    def test_handoff_non_durable(self):
+        # verify that reconstructor reverts non-durable frags from handoff to
+        # primary (and also durable frag of same object on same handoff) and
+        # cleans up non-durable data files on handoffs after revert
+        headers = {'X-Storage-Policy': self.policy.name}
+        client.put_container(self.url, self.token, self.container_name,
+                             headers=headers)
+
+        # get our node lists
+        opart, onodes = self.object_ring.get_nodes(
+            self.account, self.container_name, self.object_name)
+        pdevs = [self.device_dir(onode) for onode in onodes]
+        hnodes = list(itertools.islice(
+            self.object_ring.get_more_nodes(opart), 2))
+
+        # kill a primary nodes so we can force data onto a handoff
+        self.kill_drive(pdevs[0])
+
+        # PUT object at t1
+        contents = Body(total=3.5 * 2 ** 20)
+        headers = {'x-object-meta-foo': 'meta-foo'}
+        headers_post = {'x-object-meta-bar': 'meta-bar'}
+        client.put_object(self.url, self.token, self.container_name,
+                          self.object_name, contents=contents,
+                          headers=headers)
+        client.post_object(self.url, self.token, self.container_name,
+                           self.object_name, headers=headers_post)
+        # (Some versions of?) swiftclient will mutate the headers dict on post
+        headers_post.pop('X-Auth-Token', None)
+
+        # this primary can't serve the data; we expect 507 here and not 404
+        # because we're using mount_check to kill nodes
+        self.assert_direct_get_fails(onodes[0], opart, 507)
+        # these primaries and first handoff do have the data
+        for onode in (onodes[1:]):
+            self.assert_direct_get_succeeds(onode, opart)
+        _hdrs, older_frag_etag = self.assert_direct_get_succeeds(hnodes[0],
+                                                                 opart)
+        self.assert_direct_get_fails(hnodes[1], opart, 404)
+
+        # make sure we can GET the object; there's 5 primaries and 1 handoff
+        headers, older_obj_etag = self.proxy_get()
+        self.assertEqual(contents.etag, older_obj_etag)
+        self.assertEqual('meta-bar', headers.get('x-object-meta-bar'))
+
+        # PUT object at t2; make all frags non-durable so that the previous
+        # durable frags at t1 remain on object server; use InternalClient so
+        # that x-backend-no-commit is passed through
+        internal_client = self.make_internal_client()
+        contents2 = Body(total=2.5 * 2 ** 20)  # different content
+        self.assertNotEqual(contents2.etag, older_obj_etag)  # sanity check
+        headers = {'x-backend-no-commit': 'True',
+                   'x-object-meta-bar': 'meta-bar-new'}
+        internal_client.upload_object(contents2, self.account,
+                                      self.container_name.decode('utf8'),
+                                      self.object_name.decode('utf8'),
+                                      headers)
+        # GET should still return the older durable object
+        headers, obj_etag = self.proxy_get()
+        self.assertEqual(older_obj_etag, obj_etag)
+        self.assertEqual('meta-bar', headers.get('x-object-meta-bar'))
+        # on handoff we have older durable and newer non-durable
+        _hdrs, frag_etag = self.assert_direct_get_succeeds(hnodes[0], opart)
+        self.assertEqual(older_frag_etag, frag_etag)
+        _hdrs, newer_frag_etag = self.assert_direct_get_succeeds(
+            hnodes[0], opart, require_durable=False)
+        self.assertNotEqual(older_frag_etag, newer_frag_etag)
+
+        # now make all the newer frags durable only on the 5 primaries
+        self.assertEqual(5, self.make_durable(onodes[1:], opart))
+        # now GET will return the newer object
+        headers, newer_obj_etag = self.proxy_get()
+        self.assertEqual(contents2.etag, newer_obj_etag)
+        self.assertNotEqual(older_obj_etag, newer_obj_etag)
+        self.assertEqual('meta-bar-new', headers.get('x-object-meta-bar'))
+
+        # fix the 507'ing primary
+        self.revive_drive(pdevs[0])
+
+        # fire up reconstructor on handoff node only
+        hnode_id = (hnodes[0]['port'] % 100) // 10
+        self.reconstructor.once(number=hnode_id)
+
+        # primary now has only the newer non-durable frag
+        self.assert_direct_get_fails(onodes[0], opart, 404)
+        _hdrs, frag_etag = self.assert_direct_get_succeeds(
+            onodes[0], opart, require_durable=False)
+        self.assertEqual(newer_frag_etag, frag_etag)
+
+        # handoff has only the older durable
+        _hdrs, frag_etag = self.assert_direct_get_succeeds(hnodes[0], opart)
+        self.assertEqual(older_frag_etag, frag_etag)
+        headers, frag_etag = self.assert_direct_get_succeeds(
+            hnodes[0], opart, require_durable=False)
+        self.assertEqual(older_frag_etag, frag_etag)
+        self.assertEqual('meta-bar', headers.get('x-object-meta-bar'))
+
+        # fire up reconstructor on handoff node only, again
+        self.reconstructor.once(number=hnode_id)
+
+        # primary now has the newer non-durable frag and the older durable frag
+        headers, frag_etag = self.assert_direct_get_succeeds(onodes[0], opart)
+        self.assertEqual(older_frag_etag, frag_etag)
+        self.assertEqual('meta-bar', headers.get('x-object-meta-bar'))
+        headers, frag_etag = self.assert_direct_get_succeeds(
+            onodes[0], opart, require_durable=False)
+        self.assertEqual(newer_frag_etag, frag_etag)
+        self.assertEqual('meta-bar-new', headers.get('x-object-meta-bar'))
+
+        # handoff has nothing
+        self.assert_direct_get_fails(hnodes[0], opart, 404,
+                                     require_durable=False)
+
+        # kill all but first two primaries
+        for pdev in pdevs[2:]:
+            self.kill_drive(pdev)
+        # fire up reconstructor on the remaining primary[1]; without the
+        # other primaries, primary[1] cannot rebuild the frag but it can let
+        # primary[0] know that its non-durable frag can be made durable
+        self.reconstructor.once(number=self.config_number(onodes[1]))
+
+        # first primary now has a *durable* *newer* frag - it *was* useful to
+        # sync the non-durable!
+        headers, frag_etag = self.assert_direct_get_succeeds(onodes[0], opart)
+        self.assertEqual(newer_frag_etag, frag_etag)
+        self.assertEqual('meta-bar-new', headers.get('x-object-meta-bar'))
+
+        # revive primaries (in case we want to debug)
+        for pdev in pdevs[2:]:
+            self.revive_drive(pdev)
 
 
 if __name__ == "__main__":

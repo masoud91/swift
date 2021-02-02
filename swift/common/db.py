@@ -17,7 +17,6 @@
 
 from contextlib import contextmanager, closing
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -36,7 +35,7 @@ import sqlite3
 from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
 from swift.common.utils import Timestamp, renamer, \
-    mkdirs, lock_parent_directory, fallocate
+    mkdirs, lock_parent_directory, fallocate, md5
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPBadRequest
 
@@ -52,6 +51,9 @@ PICKLE_PROTOCOL = 2
 #: Max size of .pending file in bytes. When this is exceeded, the pending
 # records will be merged.
 PENDING_CAP = 131072
+
+SQLITE_ARG_LIMIT = 999
+RECLAIM_PAGE_SIZE = 10000
 
 
 def utf8encode(*args):
@@ -183,7 +185,8 @@ def chexor(old, name, timestamp):
     """
     if name is None:
         raise Exception('name is None!')
-    new = hashlib.md5(('%s-%s' % (name, timestamp)).encode('utf8')).hexdigest()
+    new = md5(('%s-%s' % (name, timestamp)).encode('utf8'),
+              usedforsecurity=False).hexdigest()
     return '%032x' % (int(old, 16) ^ int(new, 16))
 
 
@@ -981,16 +984,48 @@ class DatabaseBroker(object):
             with lock_parent_directory(self.pending_file,
                                        self.pending_timeout):
                 self._commit_puts()
-        with self.get() as conn:
-            self._reclaim(conn, age_timestamp, sync_timestamp)
-            self._reclaim_metadata(conn, age_timestamp)
-            conn.commit()
+        marker = ''
+        finished = False
+        while not finished:
+            with self.get() as conn:
+                marker = self._reclaim(conn, age_timestamp, marker)
+                if not marker:
+                    finished = True
+                    self._reclaim_other_stuff(
+                        conn, age_timestamp, sync_timestamp)
+                conn.commit()
 
-    def _reclaim(self, conn, age_timestamp, sync_timestamp):
-        conn.execute('''
-            DELETE FROM %s WHERE deleted = 1 AND %s < ?
-        ''' % (self.db_contains_type, self.db_reclaim_timestamp),
-            (age_timestamp,))
+    def _reclaim_other_stuff(self, conn, age_timestamp, sync_timestamp):
+        """
+        This is only called once at the end of reclaim after _reclaim has been
+        called for each page.
+        """
+        self._reclaim_sync(conn, sync_timestamp)
+        self._reclaim_metadata(conn, age_timestamp)
+
+    def _reclaim(self, conn, age_timestamp, marker):
+        clean_batch_qry = '''
+            DELETE FROM %s WHERE deleted = 1
+            AND name > ? AND %s < ?
+        ''' % (self.db_contains_type, self.db_reclaim_timestamp)
+        curs = conn.execute('''
+            SELECT name FROM %s WHERE deleted = 1
+            AND name > ?
+            ORDER BY NAME LIMIT 1 OFFSET ?
+        ''' % (self.db_contains_type,), (marker, RECLAIM_PAGE_SIZE))
+        row = curs.fetchone()
+        if row:
+            # do a single book-ended DELETE and bounce out
+            end_marker = row[0]
+            conn.execute(clean_batch_qry + ' AND name <= ?', (
+                marker, age_timestamp, end_marker))
+        else:
+            # delete off the end and reset marker to indicate we're done
+            end_marker = ''
+            conn.execute(clean_batch_qry, (marker, age_timestamp))
+        return end_marker
+
+    def _reclaim_sync(self, conn, sync_timestamp):
         try:
             conn.execute('''
                 DELETE FROM outgoing_sync WHERE updated_at < ?

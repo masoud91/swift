@@ -58,11 +58,11 @@ class TestContainerDeleter(unittest.TestCase):
         patcher = mock.patch.object(container_deleter.time, 'time',
                                     side_effect=itertools.count())
         patcher.__enter__()
-        self.addCleanup(patcher.__exit__)
+        self.addCleanup(patcher.__exit__, None, None, None)
 
         patcher = mock.patch.object(container_deleter, 'OBJECTS_PER_UPDATE', 5)
         patcher.__enter__()
-        self.addCleanup(patcher.__exit__)
+        self.addCleanup(patcher.__exit__, None, None, None)
 
     def test_make_delete_jobs(self):
         ts = '1558463777.42739'
@@ -70,14 +70,14 @@ class TestContainerDeleter(unittest.TestCase):
             container_deleter.make_delete_jobs(
                 'acct', 'cont', ['obj1', 'obj2'],
                 utils.Timestamp(ts)),
-            [{'name': ts.split('.')[0] + '-acct/cont/obj1',
+            [{'name': ts + '-acct/cont/obj1',
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,
               'size': 0,
               'storage_policy_index': 0,
               'content_type': 'application/async-deleted'},
-             {'name': ts.split('.')[0] + '-acct/cont/obj2',
+             {'name': ts + '-acct/cont/obj2',
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,
@@ -99,14 +99,14 @@ class TestContainerDeleter(unittest.TestCase):
         self.assertEqual(
             container_deleter.make_delete_jobs(
                 acct, cont, [obj1, obj2], utils.Timestamp(ts)),
-            [{'name': u'%s-%s/%s/%s' % (ts.split('.')[0], uacct, ucont, uobj1),
+            [{'name': u'%s-%s/%s/%s' % (ts, uacct, ucont, uobj1),
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,
               'size': 0,
               'storage_policy_index': 0,
               'content_type': 'application/async-deleted'},
-             {'name': u'%s-%s/%s/%s' % (ts.split('.')[0], uacct, ucont, uobj2),
+             {'name': u'%s-%s/%s/%s' % (ts, uacct, ucont, uobj2),
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,
@@ -123,14 +123,14 @@ class TestContainerDeleter(unittest.TestCase):
         self.assertEqual(
             container_deleter.make_delete_jobs(
                 acct, cont, [obj1, obj2], utils.Timestamp(ts)),
-            [{'name': u'%s-%s/%s/%s' % (ts.split('.')[0], acct, cont, obj1),
+            [{'name': u'%s-%s/%s/%s' % (ts, acct, cont, obj1),
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,
               'size': 0,
               'storage_policy_index': 0,
               'content_type': 'application/async-deleted'},
-             {'name': u'%s-%s/%s/%s' % (ts.split('.')[0], acct, cont, obj2),
+             {'name': u'%s-%s/%s/%s' % (ts, acct, cont, obj2),
               'deleted': 0,
               'created_at': ts,
               'etag': utils.MD5_OF_EMPTY_STRING,

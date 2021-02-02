@@ -15,6 +15,8 @@
 
 import unittest
 import traceback
+from contextlib import contextmanager
+import logging
 import test.functional as tf
 from test.functional.s3api.s3_test_client import (
     Connection, get_boto3_conn, tear_down_s3)
@@ -33,11 +35,23 @@ class S3ApiBase(unittest.TestCase):
         super(S3ApiBase, self).__init__(method_name)
         self.method_name = method_name
 
+    @contextmanager
+    def quiet_boto_logging(self):
+        try:
+            logging.getLogger('boto').setLevel(logging.INFO)
+            yield
+        finally:
+            logging.getLogger('boto').setLevel(logging.DEBUG)
+
     def setUp(self):
         if 's3api' not in tf.cluster_info:
             raise tf.SkipTest('s3api middleware is not enabled')
         try:
-            self.conn = Connection()
+            self.conn = Connection(
+                tf.config['s3_access_key'], tf.config['s3_secret_key'],
+                user_id='%s:%s' % (tf.config['account'],
+                                   tf.config['username']))
+
             self.conn.reset()
         except Exception:
             message = '%s got an error during initialize process.\n\n%s' % \
@@ -67,7 +81,8 @@ class S3ApiBaseBoto3(S3ApiBase):
         if 's3api' not in tf.cluster_info:
             raise tf.SkipTest('s3api middleware is not enabled')
         try:
-            self.conn = get_boto3_conn()
+            self.conn = get_boto3_conn(
+                tf.config['s3_access_key'], tf.config['s3_secret_key'])
             self.endpoint_url = self.conn._endpoint.host
             self.access_key = self.conn._request_signer._credentials.access_key
             self.region = self.conn._client_config.region_name

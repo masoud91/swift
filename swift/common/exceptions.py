@@ -215,6 +215,10 @@ class ReplicationLockTimeout(LockTimeout):
     pass
 
 
+class PartitionLockTimeout(LockTimeout):
+    pass
+
+
 class MimeInvalid(SwiftException):
     pass
 
@@ -228,6 +232,10 @@ class EncryptionException(SwiftException):
 
 
 class UnknownSecretIdError(EncryptionException):
+    pass
+
+
+class QuarantineRequest(SwiftException):
     pass
 
 

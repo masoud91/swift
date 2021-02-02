@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from argparse import Namespace
 import itertools
 import json
 from collections import defaultdict
@@ -21,27 +22,26 @@ import mock
 
 import six
 
+from swift.proxy import server as proxy_server
 from swift.proxy.controllers.base import headers_to_container_info, \
     headers_to_account_info, headers_to_object_info, get_container_info, \
     get_cache_key, get_account_info, get_info, get_object_info, \
-    Controller, GetOrHeadHandler, bytes_to_skip
+    Controller, GetOrHeadHandler, bytes_to_skip, clear_info_cache, \
+    set_info_cache, NodeIter, headers_from_container_info
 from swift.common.swob import Request, HTTPException, RESPONSE_REASONS, \
     bytes_to_wsgi
 from swift.common import exceptions
-from swift.common.utils import split_path, ShardRange, Timestamp
+from swift.common.utils import split_path, ShardRange, Timestamp, \
+    GreenthreadSafeIterator, GreenAsyncPile
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
 from swift.common.storage_policy import StoragePolicy, StoragePolicyCollection
 from test.unit import (
-    fake_http_connect, FakeRing, FakeMemcache, PatchPolicies, FakeLogger,
-    make_timestamp_iter,
-    mocked_http_conn)
-from swift.proxy import server as proxy_server
+    fake_http_connect, FakeRing, FakeMemcache, PatchPolicies,
+    make_timestamp_iter, mocked_http_conn, patch_policies, debug_logger)
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
 )
-
-from test.unit import patch_policies
 
 
 class FakeResponse(object):
@@ -178,13 +178,22 @@ class FakeCache(FakeMemcache):
         return self.stub or self.store.get(key)
 
 
-@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
-class TestFuncs(unittest.TestCase):
+class BaseTest(unittest.TestCase):
+
     def setUp(self):
-        self.app = proxy_server.Application(None, FakeMemcache(),
-                                            account_ring=FakeRing(),
-                                            container_ring=FakeRing(),
-                                            logger=FakeLogger())
+        self.logger = debug_logger()
+        self.cache = FakeCache()
+        self.conf = {}
+        self.account_ring = FakeRing()
+        self.container_ring = FakeRing()
+        self.app = proxy_server.Application(self.conf,
+                                            logger=self.logger,
+                                            account_ring=self.account_ring,
+                                            container_ring=self.container_ring)
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestFuncs(BaseTest):
 
     def test_get_info_zero_recheck(self):
         mock_cache = mock.Mock()
@@ -461,6 +470,16 @@ class TestFuncs(unittest.TestCase):
                                        u"\U0001F334".encode('utf8')),
                          expected)
 
+        self.assertEqual(get_cache_key("account", "cont", shard="listing"),
+                         'shard-listing/account/cont')
+        self.assertEqual(get_cache_key("account", "cont", shard="updating"),
+                         'shard-updating/account/cont')
+        self.assertRaises(ValueError,
+                          get_cache_key, "account", shard="listing")
+        self.assertRaises(ValueError,
+                          get_cache_key, "account", "cont", "obj",
+                          shard="listing")
+
     def test_get_container_info_env(self):
         cache_key = get_cache_key("account", "cont")
         req = Request.blank(
@@ -469,6 +488,46 @@ class TestFuncs(unittest.TestCase):
                      'swift.cache': FakeCache({})})
         resp = get_container_info(req.environ, 'xxx')
         self.assertEqual(resp['bytes'], 3867)
+
+    def test_info_clearing(self):
+        def check_in_cache(req, cache_key):
+            self.assertIn(cache_key, req.environ['swift.infocache'])
+            self.assertIn(cache_key, req.environ['swift.cache'].store)
+
+        def check_not_in_cache(req, cache_key):
+            self.assertNotIn(cache_key, req.environ['swift.infocache'])
+            self.assertNotIn(cache_key, req.environ['swift.cache'].store)
+
+        app = FakeApp(statuses=[200, 200])
+        acct_cache_key = get_cache_key("account")
+        cont_cache_key = get_cache_key("account", "cont")
+        req = Request.blank(
+            "/v1/account/cont", environ={"swift.cache": FakeCache()})
+        # populate caches
+        info = get_container_info(req.environ, app)
+        self.assertEqual(info['status'], 200)
+
+        check_in_cache(req, acct_cache_key)
+        check_in_cache(req, cont_cache_key)
+
+        clear_info_cache('app-is-unused', req.environ, 'account', 'cont')
+        check_in_cache(req, acct_cache_key)
+        check_not_in_cache(req, cont_cache_key)
+
+        # Can also use set_info_cache interface
+        set_info_cache('app-is-unused', req.environ, 'account', None, None)
+        check_not_in_cache(req, acct_cache_key)
+        check_not_in_cache(req, cont_cache_key)
+
+        # check shard cache-keys
+        shard_cache_key = get_cache_key('account', 'cont', shard='listing')
+        shard_data = [{'shard': 'ranges'}]
+        req.environ['swift.infocache'][shard_cache_key] = shard_data
+        req.environ['swift.cache'].set(shard_cache_key, shard_data, time=600)
+        check_in_cache(req, shard_cache_key)
+        clear_info_cache('app-is-unused', req.environ, 'account', 'cont',
+                         shard='listing')
+        check_not_in_cache(req, shard_cache_key)
 
     def test_get_account_info_swift_source(self):
         app = FakeApp()
@@ -679,14 +738,111 @@ class TestFuncs(unittest.TestCase):
             resp,
             headers_to_container_info(headers.items(), 200))
 
-    def test_container_info_without_req(self):
+    def test_headers_from_container_info(self):
+        self.assertIsNone(headers_from_container_info(None))
+        self.assertIsNone(headers_from_container_info({}))
+
+        meta = {'fruit': 'cake'}
+        sysmeta = {'green': 'land'}
+        info = {
+            'status': 200,
+            'read_acl': 'my-read-acl',
+            'write_acl': 'my-write-acl',
+            'sync_to': 'my-sync-to',
+            'sync_key': 'my-sync-key',
+            'object_count': 99,
+            'bytes': 999,
+            'versions': 'my-versions',
+            'storage_policy': '0',
+            'cors': {
+                'allow_origin': 'my-cors-origin',
+                'expose_headers': 'my-cors-hdrs',
+                'max_age': 'my-cors-age'},
+            'created_at': '123.456_12',
+            'put_timestamp': '234.567_34',
+            'delete_timestamp': '345_67',
+            'status_changed_at': '246.8_9',
+            'meta': meta,
+            'sysmeta': sysmeta,
+            'sharding_state': 'unsharded'
+        }
+
+        res = headers_from_container_info(info)
+
+        expected = {
+            'X-Backend-Delete-Timestamp': '345_67',
+            'X-Backend-Put-Timestamp': '234.567_34',
+            'X-Backend-Sharding-State': 'unsharded',
+            'X-Backend-Status-Changed-At': '246.8_9',
+            'X-Backend-Storage-Policy-Index': '0',
+            'X-Backend-Timestamp': '123.456_12',
+            'X-Container-Bytes-Used': '999',
+            'X-Container-Meta-Fruit': 'cake',
+            'X-Container-Object-Count': '99',
+            'X-Container-Read': 'my-read-acl',
+            'X-Container-Sync-Key': 'my-sync-key',
+            'X-Container-Sync-To': 'my-sync-to',
+            'X-Container-Sysmeta-Green': 'land',
+            'X-Container-Write': 'my-write-acl',
+            'X-Put-Timestamp': '0000000234.56700',
+            'X-Storage-Policy': 'zero',
+            'X-Timestamp': '0000000123.45600',
+            'X-Versions-Location': 'my-versions',
+            'X-Container-Meta-Access-Control-Allow-Origin': 'my-cors-origin',
+            'X-Container-Meta-Access-Control-Expose-Headers': 'my-cors-hdrs',
+            'X-Container-Meta-Access-Control-Max-Age': 'my-cors-age',
+        }
+
+        self.assertEqual(expected, res)
+
+        for required in (
+                'created_at', 'put_timestamp', 'delete_timestamp',
+                'status_changed_at', 'storage_policy', 'object_count', 'bytes',
+                'sharding_state'):
+            incomplete_info = dict(info)
+            incomplete_info.pop(required)
+            self.assertIsNone(headers_from_container_info(incomplete_info))
+
+        for hdr, optional in (
+                ('X-Container-Read', 'read_acl'),
+                ('X-Container-Write', 'write_acl'),
+                ('X-Container-Sync-Key', 'sync_key'),
+                ('X-Container-Sync-To', 'sync_to'),
+                ('X-Versions-Location', 'versions'),
+                ('X-Container-Meta-Fruit', 'meta'),
+                ('X-Container-Sysmeta-Green', 'sysmeta'),
+        ):
+            incomplete_info = dict(info)
+            incomplete_info.pop(optional)
+            incomplete_expected = dict(expected)
+            incomplete_expected.pop(hdr)
+            self.assertEqual(incomplete_expected,
+                             headers_from_container_info(incomplete_info))
+
+        for hdr, optional in (
+            ('Access-Control-Allow-Origin', 'allow_origin'),
+            ('Access-Control-Expose-Headers', 'expose_headers'),
+            ('Access-Control-Max-Age', 'max_age'),
+        ):
+            incomplete_info = dict(info)
+            incomplete_cors = dict(info['cors'])
+            incomplete_cors.pop(optional)
+            incomplete_info['cors'] = incomplete_cors
+            incomplete_expected = dict(expected)
+            incomplete_expected.pop('X-Container-Meta-' + hdr)
+            self.assertEqual(incomplete_expected,
+                             headers_from_container_info(incomplete_info))
+
+    def test_container_info_needs_req(self):
         base = Controller(self.app)
         base.account_name = 'a'
         base.container_name = 'c'
 
-        container_info = \
-            base.container_info(base.account_name,
-                                base.container_name)
+        with mock.patch('swift.proxy.controllers.base.'
+                        'http_connect', fake_http_connect(200)):
+            container_info = \
+                base.container_info(base.account_name,
+                                    base.container_name, Request.blank('/'))
         self.assertEqual(container_info['status'], 0)
 
     def test_headers_to_account_info_missing(self):
@@ -836,12 +992,15 @@ class TestFuncs(unittest.TestCase):
 
     def test_range_fast_forward(self):
         req = Request.blank('/')
-        handler = GetOrHeadHandler(None, req, None, None, None, None, {})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {})
         handler.fast_forward(50)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=50-')
 
-        handler = GetOrHeadHandler(None, req, None, None, None, None,
-                                   {'Range': 'bytes=23-50'})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-50'})
         handler.fast_forward(20)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=43-50')
         self.assertRaises(HTTPException,
@@ -849,13 +1008,15 @@ class TestFuncs(unittest.TestCase):
         self.assertRaises(exceptions.RangeAlreadyComplete,
                           handler.fast_forward, 8)
 
-        handler = GetOrHeadHandler(None, req, None, None, None, None,
-                                   {'Range': 'bytes=23-'})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-'})
         handler.fast_forward(20)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
 
-        handler = GetOrHeadHandler(None, req, None, None, None, None,
-                                   {'Range': 'bytes=-100'})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=-100'})
         handler.fast_forward(20)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=-80')
         self.assertRaises(HTTPException,
@@ -863,8 +1024,9 @@ class TestFuncs(unittest.TestCase):
         self.assertRaises(exceptions.RangeAlreadyComplete,
                           handler.fast_forward, 80)
 
-        handler = GetOrHeadHandler(None, req, None, None, None, None,
-                                   {'Range': 'bytes=0-0'})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=0-0'})
         self.assertRaises(exceptions.RangeAlreadyComplete,
                           handler.fast_forward, 1)
 
@@ -875,21 +1037,26 @@ class TestFuncs(unittest.TestCase):
         # bytes of data, so then we get a new node, fast_forward(0), and
         # send out a new request. That new request must be for all 1000
         # bytes.
-        handler = GetOrHeadHandler(None, req, None, None, None, None, {})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {})
         handler.learn_size_from_content_range(0, 999, 1000)
         handler.fast_forward(0)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=0-999')
 
         # Same story as above, but a 1-byte object so we can have our byte
         # indices be 0.
-        handler = GetOrHeadHandler(None, req, None, None, None, None, {})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {})
         handler.learn_size_from_content_range(0, 0, 1)
         handler.fast_forward(0)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=0-0')
 
         # last 100 bytes
-        handler = GetOrHeadHandler(None, req, None, None, None, None,
-                                   {'Range': 'bytes=-100'})
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=-100'})
         handler.learn_size_from_content_range(900, 999, 1000)
         handler.fast_forward(0)
         self.assertEqual(handler.backend_headers['Range'], 'bytes=900-999')
@@ -973,8 +1140,9 @@ class TestFuncs(unittest.TestCase):
             b'abcd', b'1234', b'abc', b'd1', b'234abcd1234abcd1', b'2'))
         req = Request.blank('/v1/a/c/o')
         node = {}
-        handler = GetOrHeadHandler(self.app, req, None, None, None, None, {},
-                                   client_chunk_size=8)
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {}, client_chunk_size=8)
 
         app_iter = handler._make_app_iter(req, node, source)
         client_chunks = list(app_iter)
@@ -1017,8 +1185,8 @@ class TestFuncs(unittest.TestCase):
         source3 = TestSource([b'lots', b'more', b'data'])
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
-            self.app, req, 'Object', None, None, None, {},
-            client_chunk_size=8)
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            None, {}, client_chunk_size=8)
 
         range_headers = []
         sources = [(source2, node), (source3, node)]
@@ -1066,8 +1234,8 @@ class TestFuncs(unittest.TestCase):
         source2 = TestChunkedSource([b'efgh5678'])
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
-            self.app, req, 'Object', None, None, None, {},
-            client_chunk_size=8)
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            None, {}, client_chunk_size=8)
 
         app_iter = handler._make_app_iter(req, node, source1)
         with mock.patch.object(handler, '_get_source_and_node',
@@ -1098,7 +1266,8 @@ class TestFuncs(unittest.TestCase):
 
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
         handler = GetOrHeadHandler(
-            self.app, req, 'Object', None, None, 'some-path', {})
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            'some-path', {})
         app_iter = handler._make_app_iter(req, node, source)
         app_iter.close()
         self.app.logger.warning.assert_called_once_with(
@@ -1107,7 +1276,8 @@ class TestFuncs(unittest.TestCase):
         self.app.logger = mock.Mock()
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
         handler = GetOrHeadHandler(
-            self.app, req, 'Object', None, None, None, {})
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            None, {})
         app_iter = handler._make_app_iter(req, node, source)
         next(app_iter)
         app_iter.close()
@@ -1292,3 +1462,76 @@ class TestFuncs(unittest.TestCase):
         self.assertIn('Failed to get container listing', warning_lines[0])
         self.assertIn('/a/c', warning_lines[0])
         self.assertFalse(warning_lines[1:])
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestNodeIter(BaseTest):
+
+    def test_iter_default_fake_ring(self):
+        for ring in (self.account_ring, self.container_ring):
+            self.assertEqual(ring.replica_count, 3.0)
+            node_iter = NodeIter(self.app, ring, 0)
+            self.assertEqual(6, node_iter.nodes_left)
+            self.assertEqual(3, node_iter.primaries_left)
+            count = 0
+            for node in node_iter:
+                count += 1
+            self.assertEqual(count, 3)
+            self.assertEqual(0, node_iter.primaries_left)
+            # default fake_ring has NO handoffs, so nodes_left is kind of a lie
+            self.assertEqual(3, node_iter.nodes_left)
+
+    def test_iter_with_handoffs(self):
+        ring = FakeRing(replicas=3, max_more_nodes=20)  # handoffs available
+        policy = StoragePolicy(0, 'zero', object_ring=ring)
+        node_iter = NodeIter(self.app, policy.object_ring, 0, policy=policy)
+        self.assertEqual(6, node_iter.nodes_left)
+        self.assertEqual(3, node_iter.primaries_left)
+        primary_indexes = set()
+        handoff_indexes = []
+        count = 0
+        for node in node_iter:
+            if 'index' in node:
+                primary_indexes.add(node['index'])
+            else:
+                handoff_indexes.append(node['handoff_index'])
+            count += 1
+        self.assertEqual(count, 6)
+        self.assertEqual(0, node_iter.primaries_left)
+        self.assertEqual(0, node_iter.nodes_left)
+        self.assertEqual({0, 1, 2}, primary_indexes)
+        self.assertEqual([0, 1, 2], handoff_indexes)
+
+    def test_multi_iteration(self):
+        ring = FakeRing(replicas=8, max_more_nodes=20)
+        policy = StoragePolicy(0, 'ec', object_ring=ring)
+
+        # sanity
+        node_iter = NodeIter(self.app, policy.object_ring, 0, policy=policy)
+        self.assertEqual(16, len([n for n in node_iter]))
+
+        node_iter = NodeIter(self.app, policy.object_ring, 0, policy=policy)
+        self.assertEqual(16, node_iter.nodes_left)
+        self.assertEqual(8, node_iter.primaries_left)
+        pile = GreenAsyncPile(5)
+
+        def eat_node(node_iter):
+            return next(node_iter)
+
+        safe_iter = GreenthreadSafeIterator(node_iter)
+        for i in range(5):
+            pile.spawn(eat_node, safe_iter)
+
+        nodes = []
+        for node in pile:
+            nodes.append(node)
+
+        primary_indexes = {n['index'] for n in nodes}
+        self.assertEqual(5, len(primary_indexes))
+        self.assertEqual(3, node_iter.primaries_left)
+
+        # it's problematic we don't decrement nodes_left until we resume
+        self.assertEqual(12, node_iter.nodes_left)
+        for node in node_iter:
+            nodes.append(node)
+        self.assertEqual(17, len(nodes))

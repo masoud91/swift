@@ -228,6 +228,42 @@ class SeamlessReloadMixin(object):
         self.manager.reload_seamless()
 
 
+class ChildReloadMixin(object):
+    def make_post_reload_pid_cb(self):
+        def _cb(post_reload_pids):
+            # We expect all orig server PIDs to STILL BE PRESENT, no new server
+            # present, and for there to be exactly 1 old worker PID plus
+            # all but one additional new worker PIDs.
+            num_workers = len(self.starting_pids['worker'])
+            same_servers = (self.starting_pids['server'] ==
+                            post_reload_pids['server'])
+            one_old_worker = 1 == len(self.starting_pids['worker'] &
+                                      post_reload_pids['worker'])
+            new_workers_present = (post_reload_pids['worker'] -
+                                   self.starting_pids['worker'])
+            return (post_reload_pids['server'] and same_servers and
+                    one_old_worker and
+                    len(new_workers_present) == num_workers - 1)
+        return _cb
+
+    def make_post_close_pid_cb(self):
+        def _cb(post_close_pids):
+            # We expect all orig server PIDs to STILL BE PRESENT, no new server
+            # present, no old worker PIDs, and all new worker PIDs.
+            same_servers = (self.starting_pids['server'] ==
+                            post_close_pids['server'])
+            old_workers_dead = not (self.starting_pids['worker'] &
+                                    post_close_pids['worker'])
+            new_workers_present = (post_close_pids['worker'] -
+                                   self.starting_pids['worker'])
+            return (post_close_pids['server'] and same_servers and
+                    old_workers_dead and new_workers_present)
+        return _cb
+
+    def do_reload(self):
+        self.manager.kill_child_pids(seamless=True)
+
+
 class TestObjectServerReloadBase(TestWSGIServerProcessHandling):
     SERVER_NAME = 'object'
     PID_TIMEOUT = 35
@@ -273,6 +309,14 @@ class TestObjectServerReloadSeamless(SeamlessReloadMixin,
         self._check_reload()
 
 
+class TestObjectServerReloadChild(ChildReloadMixin,
+                                  TestObjectServerReloadBase):
+    BODY = b'test-object' * 10
+
+    def test_object_reload_child(self):
+        self._check_reload()
+
+
 class TestProxyServerReloadBase(TestWSGIServerProcessHandling):
     SERVER_NAME = 'proxy-server'
     HAS_INFO = True
@@ -283,11 +327,19 @@ class TestProxyServerReloadBase(TestWSGIServerProcessHandling):
         self.new_swift_conf_path = self.swift_conf_path + '.new'
         self.saved_swift_conf_path = self.swift_conf_path + '.orig'
         shutil.copy(self.swift_conf_path, self.saved_swift_conf_path)
-        shutil.copy(self.swift_conf_path, self.new_swift_conf_path)
-        with open(self.new_swift_conf_path, 'a+') as fh:
-            fh.seek(0, os.SEEK_END)
-            fh.write('\n[swift-constraints]\nmax_header_size = 8191\n')
-            fh.flush()
+        with open(self.swift_conf_path, 'r') as rfh:
+            config = rfh.read()
+            section_header = '\n[swift-constraints]\n'
+        if section_header in config:
+            config = config.replace(
+                section_header,
+                section_header + 'max_header_size = 8191\n',
+                1)
+        else:
+            config += section_header + 'max_header_size = 8191\n'
+        with open(self.new_swift_conf_path, 'w') as wfh:
+            wfh.write(config)
+            wfh.flush()
 
     def tearDown(self):
         shutil.move(self.saved_swift_conf_path, self.swift_conf_path)
@@ -355,6 +407,16 @@ class TestProxyServerReloadSeamless(SeamlessReloadMixin,
     BODY = b'proxy-seamless' * 10
 
     def test_proxy_reload_seamless(self):
+        self._check_reload()
+
+
+class TestProxyServerReloadChild(ChildReloadMixin,
+                                 TestProxyServerReloadBase):
+    BODY = b'proxy-seamless' * 10
+    # A bit of a lie, but the respawned child won't pick up the updated config
+    HAS_INFO = False
+
+    def test_proxy_reload_child(self):
         self._check_reload()
 
 

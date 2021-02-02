@@ -16,7 +16,7 @@
 import binascii
 import unittest
 from datetime import datetime
-import hashlib
+from hashlib import sha256
 import os
 from os.path import join
 import time
@@ -26,15 +26,18 @@ import json
 
 from swift.common import swob
 from swift.common.swob import Request
+from swift.common.middleware.proxy_logging import ProxyLoggingMiddleware
 
 from test.unit.common.middleware.s3api import S3ApiTestCase
 from test.unit.common.middleware.s3api.test_s3_acl import s3acl
+from swift.common.middleware.s3api.s3request import SigV4Request
 from swift.common.middleware.s3api.subresource import ACL, User, encode_acl, \
     Owner, Grant
 from swift.common.middleware.s3api.etree import fromstring
 from swift.common.middleware.s3api.utils import mktime, S3Timestamp
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
+from swift.common.utils import md5
 
 
 class TestS3ApiObj(S3ApiTestCase):
@@ -43,7 +46,7 @@ class TestS3ApiObj(S3ApiTestCase):
         super(TestS3ApiObj, self).setUp()
 
         self.object_body = b'hello'
-        self.etag = hashlib.md5(self.object_body).hexdigest()
+        self.etag = md5(self.object_body, usedforsecurity=False).hexdigest()
         self.last_modified = 'Fri, 01 Apr 2014 12:00:00 GMT'
 
         self.response_headers = {'Content-Type': 'text/html',
@@ -77,6 +80,8 @@ class TestS3ApiObj(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+        # we'll want this for logging
+        self.assertEqual(req.headers['X-Backend-Storage-Policy-Index'], '2')
 
         unexpected_headers = []
         for key, val in self.response_headers.items():
@@ -172,6 +177,19 @@ class TestS3ApiObj(S3ApiTestCase):
 
     def test_object_HEAD(self):
         self._test_object_GETorHEAD('HEAD')
+
+    def test_object_policy_index_logging(self):
+        req = Request.blank('/bucket/object',
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        self.s3api = ProxyLoggingMiddleware(self.s3api, {}, logger=self.logger)
+        status, headers, body = self.call_s3api(req)
+        access_lines = self.logger.get_lines_for_level('info')
+        self.assertEqual(1, len(access_lines))
+        parts = access_lines[0].split()
+        self.assertEqual(' '.join(parts[3:7]),
+                         'GET /bucket/object HTTP/1.0 200')
+        self.assertEqual(parts[-1], '2')
 
     def _test_object_HEAD_Range(self, range_value):
         req = Request.blank('/bucket/object',
@@ -452,6 +470,26 @@ class TestS3ApiObj(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '404')
 
+    @s3acl(versioning_enabled=False)
+    def test_object_GET_with_version_id_but_not_enabled(self):
+        # Version not found
+        self.swift.register(
+            'HEAD', '/v1/AUTH_test/bucket',
+            swob.HTTPNoContent, {}, None)
+        req = Request.blank('/bucket/object?versionId=A',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '404')
+        elem = fromstring(body, 'Error')
+        self.assertEqual(elem.find('Code').text, 'NoSuchVersion')
+        self.assertEqual(elem.find('Key').text, 'object')
+        self.assertEqual(elem.find('VersionId').text, 'A')
+        expected_calls = []
+        # NB: No actual backend GET!
+        self.assertEqual(expected_calls, self.swift.calls)
+
     @s3acl
     def test_object_PUT_error(self):
         code = self._test_method_error('PUT', '/bucket/object',
@@ -581,8 +619,33 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertEqual(headers['etag'], etag)
 
     @s3acl
+    def test_object_PUT_quota_exceeded(self):
+        etag = self.response_headers['etag']
+        content_md5 = binascii.b2a_base64(binascii.a2b_hex(etag)).strip()
+        if not six.PY2:
+            content_md5 = content_md5.decode('ascii')
+
+        self.swift.register(
+            'PUT', '/v1/AUTH_test/bucket/object',
+            swob.HTTPRequestEntityTooLarge, {}, 'Upload exceeds quota.')
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'x-amz-storage-class': 'STANDARD',
+                     'Content-MD5': content_md5,
+                     'Date': self.get_date_header()},
+            body=self.object_body)
+        req.date = datetime.now()
+        req.content_type = 'text/plain'
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertIn(b'<Code>EntityTooLarge</Code>', body)
+        self.assertIn(b'<Message>Upload exceeds quota.</Message', body)
+
+    @s3acl
     def test_object_PUT_v4(self):
-        body_sha = hashlib.sha256(self.object_body).hexdigest()
+        body_sha = sha256(self.object_body).hexdigest()
         req = Request.blank(
             '/bucket/object',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -661,6 +724,8 @@ class TestS3ApiObj(S3ApiTestCase):
         _, _, headers = self.swift.calls_with_headers[-1]
         # No way to determine ETag to send
         self.assertNotIn('etag', headers)
+        self.assertIn(b'UNSIGNED-PAYLOAD', SigV4Request(
+            req.environ, self.s3api.conf)._canonical_request())
 
     def test_object_PUT_headers(self):
         content_md5 = binascii.b2a_base64(binascii.a2b_hex(self.etag)).strip()
@@ -1108,7 +1173,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1139,7 +1212,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1151,6 +1232,20 @@ class TestS3ApiObj(S3ApiTestCase):
             ('PUT', '/v1/AUTH_test/bucket/object'
              '?version-id=1574341899.21751'),
         ], self.swift.calls)
+
+    @s3acl(versioning_enabled=False)
+    def test_object_DELETE_with_version_id_but_not_enabled(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket',
+                            swob.HTTPNoContent, {}, None)
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        expected_calls = []
+        # NB: No actual backend DELETE!
+        self.assertEqual(expected_calls, self.swift.calls)
 
     def test_object_DELETE_version_id_not_implemented(self):
         req = Request.blank('/bucket/object?versionId=1574358170.12293',
@@ -1181,7 +1276,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1220,7 +1323,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1248,7 +1359,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '500')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1280,7 +1399,15 @@ class TestS3ApiObj(S3ApiTestCase):
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '500')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
@@ -1325,23 +1452,25 @@ class TestS3ApiObj(S3ApiTestCase):
             'X-Object-Version-Id': '1574701081.61553'}
         self.swift.register('DELETE', '/v1/AUTH_test/bucket/object',
                             swob.HTTPNoContent, resp_headers, None)
-        self.swift.register('HEAD', '/v1/AUTH_test/bucket',
-                            swob.HTTPNoContent, {
-                                'X-Container-Sysmeta-Versions-Enabled': True},
-                            None)
         self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
                             swob.HTTPNotFound, self.response_headers, None)
         req = Request.blank('/bucket/object?versionId=1574701081.61553',
                             method='DELETE', headers={
                                 'Authorization': 'AWS test:tester:hmac',
                                 'Date': self.get_date_header()})
-        status, headers, body = self.call_s3api(req)
+        fake_info = {
+            'status': 204,
+            'sysmeta': {
+                'versions-container': '\x00versions\x00bucket',
+            }
+        }
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info', return_value=fake_info):
+            status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/bucket/object'
              '?symlink=get&version-id=1574701081.61553'),
-            ('HEAD', '/v1/AUTH_test'),
-            ('HEAD', '/v1/AUTH_test/bucket'),
             ('DELETE', '/v1/AUTH_test/bucket/object'
              '?symlink=get&version-id=1574701081.61553'),
         ], self.swift.calls)
@@ -1410,6 +1539,41 @@ class TestS3ApiObj(S3ApiTestCase):
             key, arg = q.split('=')
             query[key] = arg
         self.assertEqual(query['multipart-manifest'], 'delete')
+        # HEAD did not indicate that it was an S3 MPU, so no async delete
+        self.assertNotIn('async', query)
+        self.assertNotIn('Content-Type', headers)
+
+    @s3acl
+    def test_slo_object_async_DELETE(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk,
+                            {'x-static-large-object': 'True',
+                             'x-object-sysmeta-s3api-etag': 's3-style-etag'},
+                            None)
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, {}, '<SLO delete results>')
+        req = Request.blank('/bucket/object',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header(),
+                                     'Content-Type': 'foo/bar'})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual(body, b'')
+
+        self.assertIn(('HEAD', '/v1/AUTH_test/bucket/object?symlink=get'),
+                      self.swift.calls)
+        self.assertIn(('DELETE', '/v1/AUTH_test/bucket/object'
+                                 '?async=on&multipart-manifest=delete'),
+                      self.swift.calls)
+        _, path, headers = self.swift.calls_with_headers[-1]
+        path, query_string = path.split('?', 1)
+        query = {}
+        for q in query_string.split('&'):
+            key, arg = q.split('=')
+            query[key] = arg
+        self.assertEqual(query['multipart-manifest'], 'delete')
+        self.assertEqual(query['async'], 'on')
         self.assertNotIn('Content-Type', headers)
 
     def _test_object_for_s3acl(self, method, account):

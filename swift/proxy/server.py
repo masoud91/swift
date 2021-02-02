@@ -32,16 +32,16 @@ from swift.common import constraints
 from swift.common.http import is_server_error
 from swift.common.storage_policy import POLICIES
 from swift.common.ring import Ring
-from swift.common.utils import Watchdog, cache_from_env, get_logger, \
+from swift.common.utils import Watchdog, get_logger, \
     get_remote_client, split_path, config_true_value, generate_trans_id, \
     affinity_key_function, affinity_locality_predicate, list_from_csv, \
-    register_swift_info, readconf, config_auto_int_value
+    register_swift_info, parse_prefixed_conf, config_auto_int_value
 from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
 from swift.proxy.controllers.base import get_container_info, NodeIter, \
     DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE, \
-    DEFAULT_RECHECK_UPDATING_SHARD_RANGES
+    DEFAULT_RECHECK_UPDATING_SHARD_RANGES, DEFAULT_RECHECK_LISTING_SHARD_RANGES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
     HTTPMethodNotAllowed, HTTPNotFound, HTTPPreconditionFailed, \
     HTTPServerError, HTTPException, Request, HTTPServiceUnavailable, \
@@ -101,7 +101,8 @@ class ProxyOverrideOptions(object):
     :param conf: the proxy-server config dict.
     :param override_conf: a dict of overriding configuration options.
     """
-    def __init__(self, base_conf, override_conf):
+    def __init__(self, base_conf, override_conf, app):
+
         def get(key, default):
             return override_conf.get(key, base_conf.get(key, default))
 
@@ -147,14 +148,28 @@ class ProxyOverrideOptions(object):
             get('write_affinity_handoff_delete_count', 'auto'), None
         )
 
+        self.rebalance_missing_suppression_count = int(get(
+            'rebalance_missing_suppression_count', 1))
+        self.concurrent_gets = config_true_value(get('concurrent_gets', False))
+        self.concurrency_timeout = float(get(
+            'concurrency_timeout', app.conn_timeout))
+        self.concurrent_ec_extra_requests = int(get(
+            'concurrent_ec_extra_requests', 0))
+
     def __repr__(self):
-        return '%s({}, {%s})' % (self.__class__.__name__, ', '.join(
-            '%r: %r' % (k, getattr(self, k)) for k in (
-                'sorting_method',
-                'read_affinity',
-                'write_affinity',
-                'write_affinity_node_count',
-                'write_affinity_handoff_delete_count')))
+        return '%s({}, {%s}, app)' % (
+            self.__class__.__name__, ', '.join(
+                '%r: %r' % (k, getattr(self, k)) for k in (
+                    'sorting_method',
+                    'read_affinity',
+                    'write_affinity',
+                    'write_affinity_node_count',
+                    'write_affinity_handoff_delete_count',
+                    'rebalance_missing_suppression_count',
+                    'concurrent_gets',
+                    'concurrency_timeout',
+                    'concurrent_ec_extra_requests',
+                )))
 
     def __eq__(self, other):
         if not isinstance(other, ProxyOverrideOptions):
@@ -164,13 +179,18 @@ class ProxyOverrideOptions(object):
             'read_affinity',
             'write_affinity',
             'write_affinity_node_count',
-            'write_affinity_handoff_delete_count'))
+            'write_affinity_handoff_delete_count',
+            'rebalance_missing_suppression_count',
+            'concurrent_gets',
+            'concurrency_timeout',
+            'concurrent_ec_extra_requests',
+        ))
 
 
 class Application(object):
     """WSGI application for the proxy server."""
 
-    def __init__(self, conf, memcache=None, logger=None, account_ring=None,
+    def __init__(self, conf, logger=None, account_ring=None,
                  container_ring=None):
         if conf is None:
             conf = {}
@@ -178,10 +198,6 @@ class Application(object):
             self.logger = get_logger(conf, log_route='proxy-server')
         else:
             self.logger = logger
-        self._override_options = self._load_per_policy_config(conf)
-        self.sorts_by_timing = any(pc.sorting_method == 'timing'
-                                   for pc in self._override_options.values())
-
         self._error_limiting = {}
 
         swift_dir = conf.get('swift_dir', '/etc/swift')
@@ -205,6 +221,9 @@ class Application(object):
         self.recheck_updating_shard_ranges = \
             int(conf.get('recheck_updating_shard_ranges',
                          DEFAULT_RECHECK_UPDATING_SHARD_RANGES))
+        self.recheck_listing_shard_ranges = \
+            int(conf.get('recheck_listing_shard_ranges',
+                         DEFAULT_RECHECK_LISTING_SHARD_RANGES))
         self.recheck_account_existence = \
             int(conf.get('recheck_account_existence',
                          DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
@@ -218,7 +237,6 @@ class Application(object):
         for policy in POLICIES:
             policy.load_ring(swift_dir)
         self.obj_controller_router = ObjectControllerRouter()
-        self.memcache = memcache
         mimetypes.init(mimetypes.knownfiles +
                        [os.path.join(swift_dir, 'mime.types')])
         self.account_autocreate = \
@@ -261,9 +279,6 @@ class Application(object):
             conf.get('strict_cors_mode', 't'))
         self.node_timings = {}
         self.timing_expiry = int(conf.get('timing_expiry', 300))
-        self.concurrent_gets = config_true_value(conf.get('concurrent_gets'))
-        self.concurrency_timeout = float(conf.get('concurrency_timeout',
-                                                  self.conn_timeout))
         value = conf.get('request_node_count', '2 * replicas').lower().split()
         if len(value) == 1:
             rnc_value = int(value[0])
@@ -287,6 +302,17 @@ class Application(object):
         self.swift_owner_headers = [
             name.strip().title()
             for name in swift_owner_headers.split(',') if name.strip()]
+
+        # When upgrading from liberasurecode<=1.5.0, you may want to continue
+        # writing legacy CRCs until all nodes are upgraded and capabale of
+        # reading fragments with zlib CRCs.
+        # See https://bugs.launchpad.net/liberasurecode/+bug/1886088 for more
+        # information.
+        if 'write_legacy_ec_crc' in conf:
+            os.environ['LIBERASURECODE_WRITE_LEGACY_CRC'] = \
+                '1' if config_true_value(conf['write_legacy_ec_crc']) else '0'
+        # else, assume operators know what they're doing and leave env alone
+
         # Initialization was successful, so now apply the client chunk size
         # parameter as the default read / write buffer size for the network
         # sockets.
@@ -310,6 +336,10 @@ class Application(object):
                 'swift.valid_api_versions',
             ])))
         self.admin_key = conf.get('admin_key', None)
+        self._override_options = self._load_per_policy_config(conf)
+        self.sorts_by_timing = any(pc.sorting_method == 'timing'
+                                   for pc in self._override_options.values())
+
         register_swift_info(
             version=swift_version,
             strict_cors_mode=self.strict_cors_mode,
@@ -323,7 +353,7 @@ class Application(object):
     def _make_policy_override(self, policy, conf, override_conf):
         label_for_policy = _label_for_policy(policy)
         try:
-            override = ProxyOverrideOptions(conf, override_conf)
+            override = ProxyOverrideOptions(conf, override_conf, self)
             self.logger.debug("Loaded override config for %s: %r" %
                               (label_for_policy, override))
             return override
@@ -454,8 +484,6 @@ class Application(object):
         :param start_response: WSGI callable
         """
         try:
-            if self.memcache is None:
-                self.memcache = cache_from_env(env, True)
             req = self.update_request(Request(env))
             return self.handle_request(req)(env, start_response)
         except UnicodeError:
@@ -748,15 +776,8 @@ def parse_per_policy_config(conf):
     :return: a dict mapping policy reference -> dict of policy options
     :raises ValueError: if a policy config section has an invalid name
     """
-    policy_config = {}
-    all_conf = readconf(conf['__file__'])
     policy_section_prefix = conf['__name__'] + ':policy:'
-    for section, options in all_conf.items():
-        if not section.startswith(policy_section_prefix):
-            continue
-        policy_ref = section[len(policy_section_prefix):]
-        policy_config[policy_ref] = options
-    return policy_config
+    return parse_prefixed_conf(conf['__file__'], policy_section_prefix)
 
 
 def app_factory(global_conf, **local_conf):

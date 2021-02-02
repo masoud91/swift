@@ -2380,15 +2380,17 @@ class TestContainerController(unittest.TestCase):
                    'X-Container-Sysmeta-Test': 'set',
                    'X-Container-Meta-Test': 'persisted'}
 
-        # PUT shard range to non-existent container with non-autocreate prefix
-        req = Request.blank('/sda1/p/a/c', method='PUT', headers=headers,
-                            body=json.dumps([dict(shard_range)]))
+        # PUT shard range to non-existent container without autocreate flag
+        req = Request.blank(
+            '/sda1/p/.shards_a/shard_c', method='PUT', headers=headers,
+            body=json.dumps([dict(shard_range)]))
         resp = req.get_response(self.controller)
         self.assertEqual(404, resp.status_int)
 
-        # PUT shard range to non-existent container with autocreate prefix,
+        # PUT shard range to non-existent container with autocreate flag,
         # missing storage policy
         headers['X-Timestamp'] = next(ts_iter).internal
+        headers['X-Backend-Auto-Create'] = 't'
         req = Request.blank(
             '/sda1/p/.shards_a/shard_c', method='PUT', headers=headers,
             body=json.dumps([dict(shard_range)]))
@@ -2397,7 +2399,7 @@ class TestContainerController(unittest.TestCase):
         self.assertIn(b'X-Backend-Storage-Policy-Index header is required',
                       resp.body)
 
-        # PUT shard range to non-existent container with autocreate prefix
+        # PUT shard range to non-existent container with autocreate flag
         headers['X-Timestamp'] = next(ts_iter).internal
         policy_index = random.choice(POLICIES).idx
         headers['X-Backend-Storage-Policy-Index'] = str(policy_index)
@@ -2407,7 +2409,7 @@ class TestContainerController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(201, resp.status_int)
 
-        # repeat PUT of shard range to autocreated container - 204 response
+        # repeat PUT of shard range to autocreated container - 202 response
         headers['X-Timestamp'] = next(ts_iter).internal
         headers.pop('X-Backend-Storage-Policy-Index')  # no longer required
         req = Request.blank(
@@ -2416,7 +2418,7 @@ class TestContainerController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(202, resp.status_int)
 
-        # regular PUT to autocreated container - 204 response
+        # regular PUT to autocreated container - 202 response
         headers['X-Timestamp'] = next(ts_iter).internal
         req = Request.blank(
             '/sda1/p/.shards_a/shard_c', method='PUT',
@@ -2641,7 +2643,8 @@ class TestContainerController(unittest.TestCase):
         # make a container
         ts_iter = make_timestamp_iter()
         ts_now = Timestamp.now()  # used when mocking Timestamp.now()
-        headers = {'X-Timestamp': next(ts_iter).normal}
+        ts_put = next(ts_iter)
+        headers = {'X-Timestamp': ts_put.normal}
         req = Request.blank('/sda1/p/a/c', method='PUT', headers=headers)
         self.assertEqual(201, req.get_response(self.controller).status_int)
         # PUT some objects
@@ -2710,6 +2713,25 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(expected, json.loads(resp.body))
             self.assertIn('X-Backend-Record-Type', resp.headers)
             self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
+
+        def check_shard_GET_override_filter(
+                expected_shard_ranges, path, state, params=''):
+            req_headers = {'X-Backend-Record-Type': 'shard',
+                           'X-Backend-Override-Shard-Name-Filter': state}
+            req = Request.blank('/sda1/p/%s?format=json%s' %
+                                (path, params), method='GET',
+                                headers=req_headers)
+            with mock_timestamp_now(ts_now):
+                resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_type, 'application/json')
+            expected = [
+                dict(sr, last_modified=Timestamp(sr.timestamp).isoformat)
+                for sr in expected_shard_ranges]
+            self.assertEqual(expected, json.loads(resp.body))
+            self.assertIn('X-Backend-Record-Type', resp.headers)
+            self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
+            return resp
 
         # all shards
         check_shard_GET(shard_ranges, 'a/c')
@@ -2859,6 +2881,72 @@ class TestContainerController(unittest.TestCase):
                         params='&marker=egg&end_marker=cheese')
         check_shard_GET([], 'a/c',
                         params='&marker=cheese&end_marker=egg&reverse=true')
+
+        # now vary the sharding state and check the consequences of sending the
+        # x-backend-override-shard-name-filter header:
+        # in unsharded & sharding state the header should be ignored
+        self.assertEqual('unsharded', broker.get_db_state())
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='unsharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertIsNone(
+            resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        ts_epoch = next(ts_iter)
+        broker.enable_sharding(ts_epoch)
+        self.assertTrue(broker.set_sharding_state())
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertIsNone(
+            resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        # in sharded state the server *will* override the marker and reverse
+        # params and return listing shard ranges for entire namespace if
+        # X-Backend-Override-Shard-Name-Filter == 'sharded'
+        self.assertTrue(broker.set_sharded_state())
+        ts_now = next(ts_iter)
+        with mock_timestamp_now(ts_now):
+            extra_shard_range = broker.get_own_shard_range()
+        extra_shard_range.lower = shard_ranges[2].upper
+        extra_shard_range.upper = ShardRange.MAX
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        expected = shard_ranges[:3] + [extra_shard_range]
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            expected, 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertEqual(
+            'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        # updating state excludes the first shard which has 'shrinking' state
+        # but includes the fourth which has 'created' state
+        extra_shard_range.lower = shard_ranges[3].upper
+        check_shard_GET(
+            shard_ranges[1:2], 'a/c',
+            params='&states=updating&includes=egg')
+        expected = shard_ranges[1:4] + [extra_shard_range]
+        resp = check_shard_GET_override_filter(
+            expected, 'a/c', state='sharded',
+            params='&states=updating&includes=egg')
+        self.assertEqual(
+            'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
 
         # delete a shard range
         shard_range = shard_ranges[1]
@@ -4649,61 +4737,53 @@ class TestContainerController(unittest.TestCase):
                              "%d on param %s" % (resp.status_int, param))
 
     def test_put_auto_create(self):
-        headers = {'x-timestamp': Timestamp(1).internal,
-                   'x-size': '0',
-                   'x-content-type': 'text/plain',
-                   'x-etag': 'd41d8cd98f00b204e9800998ecf8427e'}
+        def do_test(expected_status, path, extra_headers=None, body=None):
+            headers = {'x-timestamp': Timestamp(1).internal,
+                       'x-size': '0',
+                       'x-content-type': 'text/plain',
+                       'x-etag': 'd41d8cd98f00b204e9800998ecf8427e'}
+            if extra_headers:
+                headers.update(extra_headers)
+            req = Request.blank('/sda1/p/' + path,
+                                environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers, body=body)
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, expected_status)
 
-        req = Request.blank('/sda1/p/a/c/o',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
+        do_test(404, 'a/c/o')
+        do_test(404, '.a/c/o', {'X-Backend-Auto-Create': 'no'})
+        do_test(201, '.a/c/o')
+        do_test(404, 'a/.c/o')
+        do_test(404, 'a/c/.o')
+        do_test(201, 'a/c/o', {'X-Backend-Auto-Create': 'yes'})
 
-        req = Request.blank('/sda1/p/.a/c/o',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 201)
-
-        req = Request.blank('/sda1/p/a/.c/o',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
-
-        req = Request.blank('/sda1/p/a/c/.o',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
+        do_test(404, '.shards_a/c/o')
+        create_shard_headers = {
+            'X-Backend-Record-Type': 'shard',
+            'X-Backend-Storage-Policy-Index': '0'}
+        do_test(404, '.shards_a/c', create_shard_headers, '[]')
+        create_shard_headers['X-Backend-Auto-Create'] = 't'
+        do_test(201, '.shards_a/c', create_shard_headers, '[]')
 
     def test_delete_auto_create(self):
-        headers = {'x-timestamp': Timestamp(1).internal}
+        def do_test(expected_status, path, extra_headers=None):
+            headers = {'x-timestamp': Timestamp(1).internal}
+            if extra_headers:
+                headers.update(extra_headers)
+            req = Request.blank('/sda1/p/' + path,
+                                environ={'REQUEST_METHOD': 'DELETE'},
+                                headers=headers)
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, expected_status)
 
-        req = Request.blank('/sda1/p/a/c/o',
-                            environ={'REQUEST_METHOD': 'DELETE'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
-
-        req = Request.blank('/sda1/p/.a/c/o',
-                            environ={'REQUEST_METHOD': 'DELETE'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 204)
-
-        req = Request.blank('/sda1/p/a/.c/o',
-                            environ={'REQUEST_METHOD': 'DELETE'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
-
-        req = Request.blank('/sda1/p/a/.c/.o',
-                            environ={'REQUEST_METHOD': 'DELETE'},
-                            headers=dict(headers))
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 404)
+        do_test(404, 'a/c/o')
+        do_test(404, '.a/c/o', {'X-Backend-Auto-Create': 'false'})
+        do_test(204, '.a/c/o')
+        do_test(404, 'a/.c/o')
+        do_test(404, 'a/.c/.o')
+        do_test(404, '.shards_a/c/o')
+        do_test(204, 'a/c/o', {'X-Backend-Auto-Create': 'true'})
+        do_test(204, '.shards_a/c/o', {'X-Backend-Auto-Create': 'true'})
 
     def test_content_type_on_HEAD(self):
         Request.blank('/sda1/p/a/o',
@@ -4825,7 +4905,7 @@ class TestContainerController(unittest.TestCase):
         # Test replication_server flag was set from configuration file.
         container_controller = container_server.ContainerController
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertIsNone(container_controller(conf).replication_server)
+        self.assertTrue(container_controller(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(container_controller(conf).replication_server)
@@ -4923,7 +5003,7 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(response, answer)
             self.assertEqual(outbuf.getvalue()[:4], '405 ')
 
-    def test_call_incorrect_replication_method(self):
+    def test_replication_server_call_all_methods(self):
         inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
@@ -4935,7 +5015,7 @@ class TestContainerController(unittest.TestCase):
             """Sends args to outbuf"""
             outbuf.writelines(status)
 
-        obj_methods = ['DELETE', 'PUT', 'HEAD', 'GET', 'POST', 'OPTIONS']
+        obj_methods = ['PUT', 'HEAD', 'GET', 'POST', 'DELETE', 'OPTIONS']
         for method in obj_methods:
             env = {'REQUEST_METHOD': method,
                    'SCRIPT_NAME': '',
@@ -4943,6 +5023,7 @@ class TestContainerController(unittest.TestCase):
                    'SERVER_NAME': '127.0.0.1',
                    'SERVER_PORT': '8080',
                    'SERVER_PROTOCOL': 'HTTP/1.0',
+                   'HTTP_X_TIMESTAMP': next(self.ts).internal,
                    'CONTENT_LENGTH': '0',
                    'wsgi.version': (1, 0),
                    'wsgi.url_scheme': 'http',
@@ -4953,7 +5034,7 @@ class TestContainerController(unittest.TestCase):
                    'wsgi.run_once': False}
             self.controller(env, start_response)
             self.assertEqual(errbuf.getvalue(), '')
-            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+            self.assertIn(outbuf.getvalue()[:4], ('200 ', '201 ', '204 '))
 
     def test__call__raise_timeout(self):
         inbuf = WsgiBytesIO()

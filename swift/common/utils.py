@@ -40,7 +40,7 @@ import uuid
 import functools
 import platform
 import email.parser
-from hashlib import md5, sha1
+from hashlib import sha1
 from random import random, shuffle
 from contextlib import contextmanager, closing
 import ctypes
@@ -76,6 +76,7 @@ if not six.PY2:
     utf16_decoder = codecs.getdecoder('utf-16')
     utf16_encoder = codecs.getencoder('utf-16')
 from six.moves import cPickle as pickle
+from six.moves import configparser
 from six.moves.configparser import (ConfigParser, NoSectionError,
                                     NoOptionError, RawConfigParser)
 from six.moves import range, http_client
@@ -553,6 +554,9 @@ def eventlet_monkey_patch():
     #         if thread is monkey-patched.
     eventlet.patcher.monkey_patch(all=False, socket=True, select=True,
                                   thread=True)
+    # Trying to log threads while monkey-patched can lead to deadlocks; see
+    # https://bugs.launchpad.net/swift/+bug/1895739
+    logging.logThreads = 0
 
 
 def noop_libc_function(*args):
@@ -673,7 +677,10 @@ class StrAnonymizer(str):
         if not self:
             return self
         else:
-            h = getattr(hashlib, self.method)()
+            if self.method == 'md5':
+                h = md5(usedforsecurity=False)
+            else:
+                h = getattr(hashlib, self.method)()
             if self.salt:
                 h.update(six.b(self.salt))
             h.update(six.b(self))
@@ -1507,15 +1514,16 @@ def last_modified_date_to_timestamp(last_modified_date_str):
     return Timestamp(delta.total_seconds())
 
 
-def normalize_delete_at_timestamp(timestamp):
+def normalize_delete_at_timestamp(timestamp, high_precision=False):
     """
     Format a timestamp (string or numeric) into a standardized
-    xxxxxxxxxx (10) format.
+    xxxxxxxxxx (10) or xxxxxxxxxx.xxxxx (10.5) format.
 
     Note that timestamps less than 0000000000 are raised to
     0000000000 and values greater than November 20th, 2286 at
     17:46:39 UTC will be capped at that date and time, resulting in
-    no return value exceeding 9999999999.
+    no return value exceeding 9999999999.99999 (or 9999999999 if
+    using low-precision).
 
     This cap is because the expirer is already working through a
     sorted list of strings that were all a length of 10. Adding
@@ -1527,7 +1535,8 @@ def normalize_delete_at_timestamp(timestamp):
     :param timestamp: unix timestamp
     :returns: normalized timestamp as a string
     """
-    return '%010d' % min(max(0, float(timestamp)), 9999999999)
+    fmt = '%016.5f' if high_precision else '%010d'
+    return fmt % min(max(0, float(timestamp)), 9999999999.99999)
 
 
 def mkdirs(path):
@@ -2052,8 +2061,12 @@ class PrefixLoggerAdapter(SwiftLoggerAdapter):
     def set_prefix(self, prefix):
         self.extra['prefix'] = prefix
 
-    def exception(self, *a, **kw):
-        self.logger.exception(*a, **kw)
+    def exception(self, msg, *a, **kw):
+        if 'prefix' in self.extra:
+            msg = self.extra['prefix'] + msg
+        # We up-call to exception() where stdlib uses error() so we can get
+        # some of the traceback suppression from LogAdapter, below
+        self.logger.exception(msg, *a, **kw)
 
     def process(self, msg, kwargs):
         msg, kwargs = super(PrefixLoggerAdapter, self).process(msg, kwargs)
@@ -2732,10 +2745,10 @@ def hash_path(account, container=None, object=None, raw_digest=False):
                      else object.encode('utf8'))
     if raw_digest:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).digest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).digest()
     else:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).hexdigest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).hexdigest()
 
 
 def get_zero_indexed_base_string(base, index):
@@ -2985,6 +2998,17 @@ def read_conf_dir(parser, conf_dir):
     return parser.read(sorted(conf_files))
 
 
+if six.PY2:
+    NicerInterpolation = None  # just don't cause ImportErrors over in wsgi.py
+else:
+    class NicerInterpolation(configparser.BasicInterpolation):
+        def before_get(self, parser, section, option, value, defaults):
+            if '%(' not in value:
+                return value
+            return super(NicerInterpolation, self).before_get(
+                parser, section, option, value, defaults)
+
+
 def readconf(conf_path, section_name=None, log_name=None, defaults=None,
              raw=False):
     """
@@ -3006,7 +3030,19 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
     if raw:
         c = RawConfigParser(defaults)
     else:
-        c = ConfigParser(defaults)
+        if six.PY2:
+            c = ConfigParser(defaults)
+        else:
+            # In general, we haven't really thought much about interpolation
+            # in configs. Python's default ConfigParser has always supported
+            # it, though, so *we* got it "for free". Unfortunatley, since we
+            # "supported" interpolation, we have to assume there are
+            # deployments in the wild that use it, and try not to break them.
+            # So, do what we can to mimic the py2 behavior of passing through
+            # values like "1%" (which we want to support for
+            # fallocate_reserve).
+            c = ConfigParser(defaults, interpolation=NicerInterpolation())
+
     if hasattr(conf_path, 'readline'):
         if hasattr(conf_path, 'seek'):
             conf_path.seek(0)
@@ -3040,6 +3076,27 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
             conf['log_name'] = log_name
     conf['__file__'] = conf_path
     return conf
+
+
+def parse_prefixed_conf(conf_file, prefix):
+    """
+    Search the config file for any common-prefix sections and load those
+    sections to a dict mapping the after-prefix reference to options.
+
+    :param conf_file: the file name of the config to parse
+    :param prefix: the common prefix of the sections
+    :return: a dict mapping policy reference -> dict of policy options
+    :raises ValueError: if a policy config section has an invalid name
+    """
+
+    ret_config = {}
+    all_conf = readconf(conf_file)
+    for section, options in all_conf.items():
+        if not section.startswith(prefix):
+            continue
+        target_ref = section[len(prefix):]
+        ret_config[target_ref] = options
+    return ret_config
 
 
 def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
@@ -3152,10 +3209,25 @@ def remove_directory(path):
 
 
 def audit_location_generator(devices, datadir, suffix='',
-                             mount_check=True, logger=None):
+                             mount_check=True, logger=None,
+                             devices_filter=None, partitions_filter=None,
+                             suffixes_filter=None, hashes_filter=None,
+                             hook_pre_device=None, hook_post_device=None,
+                             hook_pre_partition=None, hook_post_partition=None,
+                             hook_pre_suffix=None, hook_post_suffix=None,
+                             hook_pre_hash=None, hook_post_hash=None):
     """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
+
+    (devices|partitions|suffixes|hashes)_filter are meant to modify the list of
+    elements that will be iterated. eg: they can be used to exclude some
+    elements based on a custom condition defined by the caller.
+
+    hook_pre_(device|partition|suffix|hash) are called before yielding the
+    element, hook_pos_(device|partition|suffix|hash) are called after the
+    element was yielded. They are meant to do some pre/post processing.
+    eg: saving a progress status.
 
     :param devices: parent directory of the devices to be audited
     :param datadir: a directory located under self.devices. This should be
@@ -3165,11 +3237,31 @@ def audit_location_generator(devices, datadir, suffix='',
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
+    :devices_filter: a callable taking (devices, [list of devices]) as
+                     parameters and returning a [list of devices]
+    :partitions_filter: a callable taking (datadir_path, [list of parts]) as
+                        parameters and returning a [list of parts]
+    :suffixes_filter: a callable taking (part_path, [list of suffixes]) as
+                      parameters and returning a [list of suffixes]
+    :hashes_filter: a callable taking (suff_path, [list of hashes]) as
+                    parameters and returning a [list of hashes]
+    :hook_pre_device: a callable taking device_path as parameter
+    :hook_post_device: a callable taking device_path as parameter
+    :hook_pre_partition: a callable taking part_path as parameter
+    :hook_post_partition: a callable taking part_path as parameter
+    :hook_pre_suffix: a callable taking suff_path as parameter
+    :hook_post_suffix: a callable taking suff_path as parameter
+    :hook_pre_hash: a callable taking hash_path as parameter
+    :hook_post_hash: a callable taking hash_path as parameter
     """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
+    if devices_filter:
+        device_dir = devices_filter(devices, device_dir)
     for device in device_dir:
+        if hook_pre_device:
+            hook_pre_device(os.path.join(devices, device))
         if mount_check and not ismount(os.path.join(devices, device)):
             if logger:
                 logger.warning(
@@ -3183,24 +3275,36 @@ def audit_location_generator(devices, datadir, suffix='',
                 logger.warning(_('Skipping %(datadir)s because %(err)s'),
                                {'datadir': datadir_path, 'err': e})
             continue
+        if partitions_filter:
+            partitions = partitions_filter(datadir_path, partitions)
         for partition in partitions:
             part_path = os.path.join(datadir_path, partition)
+            if hook_pre_partition:
+                hook_pre_partition(part_path)
             try:
                 suffixes = listdir(part_path)
             except OSError as e:
                 if e.errno != errno.ENOTDIR:
                     raise
                 continue
+            if suffixes_filter:
+                suffixes = suffixes_filter(part_path, suffixes)
             for asuffix in suffixes:
                 suff_path = os.path.join(part_path, asuffix)
+                if hook_pre_suffix:
+                    hook_pre_suffix(suff_path)
                 try:
                     hashes = listdir(suff_path)
                 except OSError as e:
                     if e.errno != errno.ENOTDIR:
                         raise
                     continue
+                if hashes_filter:
+                    hashes = hashes_filter(suff_path, hashes)
                 for hsh in hashes:
                     hash_path = os.path.join(suff_path, hsh)
+                    if hook_pre_hash:
+                        hook_pre_hash(hash_path)
                     try:
                         files = sorted(listdir(hash_path), reverse=True)
                     except OSError as e:
@@ -3212,6 +3316,14 @@ def audit_location_generator(devices, datadir, suffix='',
                             continue
                         path = os.path.join(hash_path, fname)
                         yield path, device, partition
+                    if hook_post_hash:
+                        hook_post_hash(hash_path)
+                if hook_post_suffix:
+                    hook_post_suffix(suff_path)
+            if hook_post_partition:
+                hook_post_partition(part_path)
+        if hook_post_device:
+            hook_post_device(os.path.join(devices, device))
 
 
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
@@ -3902,23 +4014,26 @@ class CloseableChain(object):
     """
     def __init__(self, *iterables):
         self.iterables = iterables
+        self.chained_iter = itertools.chain(*self.iterables)
 
     def __iter__(self):
-        return iter(itertools.chain(*(self.iterables)))
+        return self
+
+    def __next__(self):
+        return next(self.chained_iter)
+
+    next = __next__  # py2
 
     def close(self):
         for it in self.iterables:
-            close_method = getattr(it, 'close', None)
-            if close_method:
-                close_method()
+            close_if_possible(it)
 
 
 def reiterate(iterable):
     """
-    Consume the first item from an iterator, then re-chain it to the rest of
-    the iterator.  This is useful when you want to make sure the prologue to
-    downstream generators have been executed before continuing.
-
+    Consume the first truthy item from an iterator, then re-chain it to the
+    rest of the iterator.  This is useful when you want to make sure the
+    prologue to downstream generators have been executed before continuing.
     :param iterable: an iterable object
     """
     if isinstance(iterable, (list, tuple)):
@@ -3926,12 +4041,13 @@ def reiterate(iterable):
     else:
         iterator = iter(iterable)
         try:
-            chunk = ''
+            chunk = next(iterator)
             while not chunk:
                 chunk = next(iterator)
             return CloseableChain([chunk], iterator)
         except StopIteration:
-            return []
+            close_if_possible(iterable)
+            return iter([])
 
 
 class InputProxy(object):
@@ -4232,6 +4348,8 @@ def drain_and_close(response_or_app_iter):
     don't care about the body of an error.
     """
     app_iter = getattr(response_or_app_iter, 'app_iter', response_or_app_iter)
+    if app_iter is None:  # for example, if we used the Response.body property
+        return
     for _chunk in app_iter:
         pass
     close_if_possible(app_iter)
@@ -4343,11 +4461,11 @@ def quote(value, safe='/'):
 def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
     """
     Returns an expiring object container name for given X-Delete-At and
-    a/c/o.
+    (native string) a/c/o.
     """
     shard_int = int(hash_path(acc, cont, obj), 16) % 100
     return normalize_delete_at_timestamp(
-        int(x_delete_at) / expirer_divisor * expirer_divisor - shard_int)
+        int(x_delete_at) // expirer_divisor * expirer_divisor - shard_int)
 
 
 class _MultipartMimeFileLikeObject(object):
@@ -4452,7 +4570,7 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
 
     if got.strip() != boundary:
         raise swift.common.exceptions.MimeInvalid(
-            'invalid starting boundary: wanted %r, got %r', (boundary, got))
+            'invalid starting boundary: wanted %r, got %r' % (boundary, got))
     boundary = b'\r\n' + boundary
     input_buffer = b''
     done = False
@@ -4771,6 +4889,27 @@ def get_md5_socket():
     return md5_sockfd
 
 
+try:
+    _test_md5 = hashlib.md5(usedforsecurity=False)  # nosec
+
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object using usedforsecurity parameter
+
+        For python distributions that support the usedforsecurity keyword
+        parameter, this passes the parameter through as expected.
+        See https://bugs.python.org/issue9216
+        """
+        return hashlib.md5(string, usedforsecurity=usedforsecurity)  # nosec
+except TypeError:
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object without usedforsecurity parameter
+
+        For python distributions that do not yet support this keyword
+        parameter, we drop the parameter
+        """
+        return hashlib.md5(string)  # nosec
+
+
 class ShardRange(object):
     """
     A ShardRange encapsulates sharding state related to a container including
@@ -4814,6 +4953,8 @@ class ShardRange(object):
         value.
     :param epoch: optional epoch timestamp which represents the time at which
         sharding was enabled for a container.
+    :param reported: optional indicator that this shard and its stats have
+        been reported to the root container.
     """
     FOUND = 10
     CREATED = 20
@@ -4822,13 +4963,15 @@ class ShardRange(object):
     SHRINKING = 50
     SHARDING = 60
     SHARDED = 70
+    SHRUNK = 80
     STATES = {FOUND: 'found',
               CREATED: 'created',
               CLEAVED: 'cleaved',
               ACTIVE: 'active',
               SHRINKING: 'shrinking',
               SHARDING: 'sharding',
-              SHARDED: 'sharded'}
+              SHARDED: 'sharded',
+              SHRUNK: 'shrunk'}
     STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
 
     class OuterBound(object):
@@ -4864,7 +5007,8 @@ class ShardRange(object):
 
     def __init__(self, name, timestamp, lower=MIN, upper=MAX,
                  object_count=0, bytes_used=0, meta_timestamp=None,
-                 deleted=False, state=None, state_timestamp=None, epoch=None):
+                 deleted=False, state=None, state_timestamp=None, epoch=None,
+                 reported=False):
         self.account = self.container = self._timestamp = \
             self._meta_timestamp = self._state_timestamp = self._epoch = None
         self._lower = ShardRange.MIN
@@ -4883,6 +5027,14 @@ class ShardRange(object):
         self.state = self.FOUND if state is None else state
         self.state_timestamp = state_timestamp
         self.epoch = epoch
+        self.reported = reported
+
+    @classmethod
+    def sort_key(cls, sr):
+        # defines the sort order for shard ranges
+        # note if this ever changes to *not* sort by upper first then it breaks
+        # a key assumption for bisect, which is used by utils.find_shard_range
+        return sr.upper, sr.state, sr.lower, sr.name
 
     @classmethod
     def _encode(cls, value):
@@ -4908,7 +5060,8 @@ class ShardRange(object):
         if not isinstance(parent_container, bytes):
             parent_container = parent_container.encode('utf-8')
         return "%s-%s-%s-%s" % (root_container,
-                                hashlib.md5(parent_container).hexdigest(),
+                                md5(parent_container,
+                                    usedforsecurity=False).hexdigest(),
                                 cls._to_timestamp(timestamp).internal,
                                 index)
 
@@ -5063,8 +5216,14 @@ class ShardRange(object):
             cast to an int, or if meta_timestamp is neither None nor can be
             cast to a :class:`~swift.common.utils.Timestamp`.
         """
-        self.object_count = int(object_count)
-        self.bytes_used = int(bytes_used)
+        if self.object_count != int(object_count):
+            self.object_count = int(object_count)
+            self.reported = False
+
+        if self.bytes_used != int(bytes_used):
+            self.bytes_used = int(bytes_used)
+            self.reported = False
+
         if meta_timestamp is None:
             self.meta_timestamp = Timestamp.now()
         else:
@@ -5145,6 +5304,14 @@ class ShardRange(object):
     def epoch(self, epoch):
         self._epoch = self._to_timestamp(epoch)
 
+    @property
+    def reported(self):
+        return self._reported
+
+    @reported.setter
+    def reported(self, value):
+        self._reported = bool(value)
+
     def update_state(self, state, state_timestamp=None):
         """
         Set state to the given value and optionally update the state_timestamp
@@ -5161,6 +5328,7 @@ class ShardRange(object):
         self.state = state
         if state_timestamp is not None:
             self.state_timestamp = state_timestamp
+        self.reported = False
         return True
 
     @property
@@ -5283,6 +5451,7 @@ class ShardRange(object):
         yield 'state', self.state
         yield 'state_timestamp', self.state_timestamp.internal
         yield 'epoch', self.epoch.internal if self.epoch is not None else None
+        yield 'reported', 1 if self.reported else 0
 
     def copy(self, timestamp=None, **kwargs):
         """
@@ -5314,7 +5483,8 @@ class ShardRange(object):
             params['name'], params['timestamp'], params['lower'],
             params['upper'], params['object_count'], params['bytes_used'],
             params['meta_timestamp'], params['deleted'], params['state'],
-            params['state_timestamp'], params['epoch'])
+            params['state_timestamp'], params['epoch'],
+            params.get('reported', 0))
 
 
 def find_shard_range(item, ranges):
@@ -5331,6 +5501,25 @@ def find_shard_range(item, ranges):
     if index != len(ranges) and item in ranges[index]:
         return ranges[index]
     return None
+
+
+def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
+    if includes:
+        shard_range = find_shard_range(includes, shard_ranges)
+        return [shard_range] if shard_range else []
+
+    def shard_range_filter(sr):
+        end = start = True
+        if end_marker:
+            end = end_marker > sr.lower
+        if marker:
+            start = marker < sr.upper
+        return start and end
+
+    if marker or end_marker:
+        return list(filter(shard_range_filter, shard_ranges))
+
+    return shard_ranges
 
 
 def modify_priority(conf, logger):
@@ -5409,7 +5598,7 @@ def o_tmpfile_in_path_supported(dirpath):
             return False
         else:
             raise Exception("Error on '%(path)s' while checking "
-                            "O_TMPFILE: '%(ex)s'",
+                            "O_TMPFILE: '%(ex)s'" %
                             {'path': dirpath, 'ex': e})
     finally:
         if fd is not None:
@@ -5475,7 +5664,7 @@ def md5_hash_for_file(fname):
     :returns: MD5 checksum, hex encoded
     """
     with open(fname, 'rb') as f:
-        md5sum = md5()
+        md5sum = md5(usedforsecurity=False)
         for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), b''):
             md5sum.update(block)
     return md5sum.hexdigest()

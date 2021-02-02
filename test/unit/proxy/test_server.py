@@ -30,7 +30,6 @@ from shutil import rmtree, copyfile, move
 import gc
 import time
 from textwrap import dedent
-from hashlib import md5
 import collections
 from pyeclib.ec_iface import ECDriverError
 from tempfile import mkdtemp, NamedTemporaryFile
@@ -71,7 +70,7 @@ from swift.common.exceptions import ChunkReadTimeout, DiskFileNotExist, \
 from swift.common import utils, constraints
 from swift.common.utils import hash_path, storage_directory, \
     parse_content_type, parse_mime_headers, \
-    iter_multipart_mime_documents, public, mkdirs, NullLogger
+    iter_multipart_mime_documents, public, mkdirs, NullLogger, md5
 from swift.common.wsgi import loadapp, ConfigString, SwiftHttpProtocol
 from swift.proxy.controllers import base as proxy_base
 from swift.proxy.controllers.base import get_cache_key, cors_validation, \
@@ -173,14 +172,6 @@ def set_node_errors(proxy_app, ring_node, value, last_error):
     stats['last_error'] = last_error
 
 
-class FakeMemcacheReturnsNone(FakeMemcache):
-
-    def get(self, key):
-        # Returns None as the timestamp of the container; assumes we're only
-        # using the FakeMemcache for container existence checks.
-        return None
-
-
 @contextmanager
 def save_globals():
     orig_http_connect = getattr(swift.proxy.controllers.base, 'http_connect',
@@ -248,25 +239,27 @@ class TestController(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.memcache = FakeMemcache()
-        app = proxy_server.Application(None, self.memcache,
+        app = proxy_server.Application(None,
                                        account_ring=self.account_ring,
                                        container_ring=self.container_ring)
         self.controller = swift.proxy.controllers.Controller(app)
 
         class FakeReq(object):
-            def __init__(self):
+            def __init__(self, memcache):
                 self.url = "/foo/bar"
                 self.method = "METHOD"
+                self.environ = {"swift.cache": memcache}
 
             def as_referer(self):
                 return self.method + ' ' + self.url
 
         self.account = 'some_account'
         self.container = 'some_container'
-        self.request = FakeReq()
+        self.request = FakeReq(self.memcache)
         self.read_acl = 'read_acl'
         self.write_acl = 'write_acl'
 
@@ -290,29 +283,31 @@ class TestController(unittest.TestCase):
         self.assertEqual(n, nodes)
 
     def test_account_info_container_count(self):
+        cache_key = get_cache_key(self.account)
         with save_globals():
             set_http_connect(200, count=123)
             partition, nodes, count = \
-                self.controller.account_info(self.account)
+                self.controller.account_info(self.account, self.request)
             self.assertEqual(count, 123)
         with save_globals():
             set_http_connect(200, count='123')
+            del self.request.environ['swift.infocache'][cache_key]
             partition, nodes, count = \
-                self.controller.account_info(self.account)
+                self.controller.account_info(self.account, self.request)
             self.assertEqual(count, 123)
         with save_globals():
-            cache_key = get_cache_key(self.account)
             account_info = {'status': 200, 'container_count': 1234}
             self.memcache.set(cache_key, account_info)
+            del self.request.environ['swift.infocache'][cache_key]
             partition, nodes, count = \
-                self.controller.account_info(self.account)
+                self.controller.account_info(self.account, self.request)
             self.assertEqual(count, 1234)
         with save_globals():
-            cache_key = get_cache_key(self.account)
             account_info = {'status': 200, 'container_count': '1234'}
             self.memcache.set(cache_key, account_info)
+            del self.request.environ['swift.infocache'][cache_key]
             partition, nodes, count = \
-                self.controller.account_info(self.account)
+                self.controller.account_info(self.account, self.request)
             self.assertEqual(count, 1234)
 
     def test_make_requests(self):
@@ -322,7 +317,7 @@ class TestController(unittest.TestCase):
                 self.controller.account_info(self.account, self.request)
             set_http_connect(201, raise_timeout_exc=True)
             self.controller._make_request(
-                nodes, partition, 'POST', '/', '', '', None,
+                nodes, partition, 'POST', '/', {}, '', None,
                 self.controller.app.logger.thread_locals)
 
     # tests if 200 is cached and used
@@ -407,7 +402,6 @@ class TestController(unittest.TestCase):
 
     def test_account_info_no_account(self):
         with save_globals():
-            self.memcache.store = {}
             set_http_connect(404, 404, 404)
             partition, nodes, count = \
                 self.controller.account_info(self.account, self.request)
@@ -514,13 +508,13 @@ class TestController(unittest.TestCase):
 
     def test_get_account_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app.memcache = mock.MagicMock()
-        app.memcache.get = mock.MagicMock()
-        app.memcache.get.return_value = {
+        memcache = mock.MagicMock()
+        memcache.get = mock.MagicMock()
+        memcache.get.return_value = {
             u'foo': u'\u2603',
             u'meta': {u'bar': u'\u2603'},
             u'sysmeta': {u'baz': u'\u2603'}}
-        env = {'PATH_INFO': '/v1/a'}
+        env = {'PATH_INFO': '/v1/a', 'swift.cache': memcache}
         ai = get_account_info(env, app)
 
         # Test info is returned as strings
@@ -539,14 +533,14 @@ class TestController(unittest.TestCase):
 
     def test_get_container_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app.memcache = mock.MagicMock()
-        app.memcache.get = mock.MagicMock()
-        app.memcache.get.return_value = {
+        memcache = mock.MagicMock()
+        memcache.get = mock.MagicMock()
+        memcache.get.return_value = {
             u'foo': u'\u2603',
             u'meta': {u'bar': u'\u2603'},
             u'sysmeta': {u'baz': u'\u2603'},
             u'cors': {u'expose_headers': u'\u2603'}}
-        env = {'PATH_INFO': '/v1/a/c'}
+        env = {'PATH_INFO': '/v1/a/c', 'swift.cache': memcache}
         ci = get_container_info(env, app)
 
         # Test info is returned as strings
@@ -578,7 +572,7 @@ class TestProxyServerConfiguration(unittest.TestCase):
     def _make_app(self, conf):
         self.logger.clear()
         # helper function to instantiate a proxy server instance
-        return proxy_server.Application(conf, FakeMemcache(),
+        return proxy_server.Application(conf,
                                         container_ring=FakeRing(),
                                         account_ring=FakeRing(),
                                         logger=self.logger)
@@ -628,13 +622,29 @@ class TestProxyServerConfiguration(unittest.TestCase):
                          set(app.cors_expose_headers))
         self.assertFalse(app.strict_cors_mode)
 
+    def test_memcache_recheck_options(self):
+        # check default options
+        app = self._make_app({})
+        self.assertEqual(app.recheck_account_existence, 60)
+        self.assertEqual(app.recheck_container_existence, 60)
+        self.assertEqual(app.recheck_updating_shard_ranges, 3600)
+        self.assertEqual(app.recheck_listing_shard_ranges, 600)
+        # check custom options
+        app = self._make_app({'recheck_account_existence': '30',
+                              'recheck_container_existence': '40',
+                              'recheck_updating_shard_ranges': '1800',
+                              'recheck_listing_shard_ranges': ' 900'})
+        self.assertEqual(app.recheck_account_existence, 30)
+        self.assertEqual(app.recheck_container_existence, 40)
+        self.assertEqual(app.recheck_updating_shard_ranges, 1800)
+        self.assertEqual(app.recheck_listing_shard_ranges, 900)
+
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
 class TestProxyServer(unittest.TestCase):
 
     def test_get_object_ring(self):
         baseapp = proxy_server.Application({},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         with patch_policies([
@@ -664,7 +674,7 @@ class TestProxyServer(unittest.TestCase):
             def get_controller(self, path):
                 raise Exception('this shouldn\'t be caught')
 
-        app = MyApp(None, FakeMemcache(), account_ring=FakeRing(),
+        app = MyApp(None, account_ring=FakeRing(),
                     container_ring=FakeRing())
         req = Request.blank('/v1/account', environ={'REQUEST_METHOD': 'HEAD'})
         app.update_request(req)
@@ -673,7 +683,6 @@ class TestProxyServer(unittest.TestCase):
 
     def test_internal_method_request(self):
         baseapp = proxy_server.Application({},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         resp = baseapp.handle_request(
@@ -682,7 +691,6 @@ class TestProxyServer(unittest.TestCase):
 
     def test_inexistent_method_request(self):
         baseapp = proxy_server.Application({},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         resp = baseapp.handle_request(
@@ -691,7 +699,6 @@ class TestProxyServer(unittest.TestCase):
 
     def test_private_method_request(self):
         baseapp = proxy_server.Application({},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         baseapp.logger = debug_logger()
@@ -722,12 +729,13 @@ class TestProxyServer(unittest.TestCase):
         # set account info
         fake_cache = FakeMemcache()
         fake_cache.store[get_cache_key('a')] = {'status': 200}
-        app = proxy_server.Application({}, fake_cache,
+        app = proxy_server.Application({},
                                        container_ring=FakeRing(),
                                        account_ring=FakeRing())
         # build internal container request
         container = get_reserved_name('c')
-        req = Request.blank('/v1/a/%s' % container)
+        req = Request.blank('/v1/a/%s' % container,
+                            {'swift.cache': fake_cache})
         app.update_request(req)
 
         # try client request to reserved name
@@ -748,7 +756,7 @@ class TestProxyServer(unittest.TestCase):
             called[0] = True
         with save_globals():
             set_http_connect(200)
-            app = proxy_server.Application(None, FakeMemcache(),
+            app = proxy_server.Application(None,
                                            account_ring=FakeRing(),
                                            container_ring=FakeRing())
             req = Request.blank('/v1/a')
@@ -763,7 +771,7 @@ class TestProxyServer(unittest.TestCase):
         def authorize(req):
             called[0] = True
             return HTTPUnauthorized(request=req)
-        app = proxy_server.Application(None, FakeMemcache(),
+        app = proxy_server.Application(None,
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
         req = Request.blank('/v1/a')
@@ -776,7 +784,7 @@ class TestProxyServer(unittest.TestCase):
         swift_dir = mkdtemp()
         try:
             baseapp = proxy_server.Application({'swift_dir': swift_dir},
-                                               FakeMemcache(), FakeLogger(),
+                                               FakeLogger(),
                                                FakeRing(), FakeRing())
             resp = baseapp.handle_request(
                 Request.blank('/', environ={'CONTENT_LENGTH': '-1'}))
@@ -794,7 +802,7 @@ class TestProxyServer(unittest.TestCase):
         try:
             logger = FakeLogger()
             baseapp = proxy_server.Application({'swift_dir': swift_dir},
-                                               FakeMemcache(), logger,
+                                               logger,
                                                container_ring=FakeLogger(),
                                                account_ring=FakeRing())
             baseapp.handle_request(
@@ -814,7 +822,7 @@ class TestProxyServer(unittest.TestCase):
         try:
             logger = FakeLogger()
             baseapp = proxy_server.Application({'swift_dir': swift_dir},
-                                               FakeMemcache(), logger,
+                                               logger,
                                                container_ring=FakeLogger(),
                                                account_ring=FakeRing())
             baseapp.handle_request(
@@ -832,7 +840,6 @@ class TestProxyServer(unittest.TestCase):
             baseapp = proxy_server.Application({'swift_dir': swift_dir,
                                                 'deny_host_headers':
                                                 'invalid_host.com'},
-                                               FakeMemcache(),
                                                container_ring=FakeLogger(),
                                                account_ring=FakeRing())
             resp = baseapp.handle_request(
@@ -844,7 +851,6 @@ class TestProxyServer(unittest.TestCase):
 
     def test_node_timing(self):
         baseapp = proxy_server.Application({'sorting_method': 'timing'},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         self.assertEqual(baseapp.node_timings, {})
@@ -876,7 +882,6 @@ class TestProxyServer(unittest.TestCase):
         nodes = list(nodes)
         conf = dict(conf, policy_config=policy_conf)
         baseapp = proxy_server.Application(conf,
-                                           FakeMemcache(),
                                            logger=FakeLogger(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
@@ -1031,7 +1036,13 @@ class TestProxyServer(unittest.TestCase):
         req = Request.blank('/v1/account', environ={'REQUEST_METHOD': 'GET'})
 
         def fake_iter_nodes(*arg, **karg):
-            return iter(nodes)
+            class FakeNodeIter(object):
+                num_primary_nodes = 3
+
+                def __iter__(self):
+                    return iter(nodes)
+
+            return FakeNodeIter()
 
         class FakeConn(object):
             def __init__(self, ip, *args, **kargs):
@@ -1070,11 +1081,12 @@ class TestProxyServer(unittest.TestCase):
                 app_conf = {'concurrent_gets': 'on',
                             'concurrency_timeout': 0}
                 baseapp = proxy_server.Application(app_conf,
-                                                   FakeMemcache(),
                                                    container_ring=FakeRing(),
                                                    account_ring=FakeRing())
-                self.assertTrue(baseapp.concurrent_gets)
-                self.assertEqual(baseapp.concurrency_timeout, 0)
+                policy_opts = baseapp.get_policy_options(None)
+                self.assertTrue(policy_opts.concurrent_gets)
+                self.assertEqual(policy_opts.concurrency_timeout, 0)
+
                 baseapp.update_request(req)
                 resp = baseapp.handle_request(req)
 
@@ -1095,10 +1107,10 @@ class TestProxyServer(unittest.TestCase):
                 # Now lets set the concurrency_timeout
                 app_conf['concurrency_timeout'] = 2
                 baseapp = proxy_server.Application(app_conf,
-                                                   FakeMemcache(),
                                                    container_ring=FakeRing(),
                                                    account_ring=FakeRing())
-                self.assertEqual(baseapp.concurrency_timeout, 2)
+                policy_opts = baseapp.get_policy_options(None)
+                self.assertEqual(policy_opts.concurrency_timeout, 2)
                 baseapp.update_request(req)
                 resp = baseapp.handle_request(req)
 
@@ -1106,7 +1118,7 @@ class TestProxyServer(unittest.TestCase):
                 self.assertEqual(resp.body, b'Response from 127.0.0.2')
 
     def test_info_defaults(self):
-        app = proxy_server.Application({}, FakeMemcache(),
+        app = proxy_server.Application({},
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
 
@@ -1121,7 +1133,7 @@ class TestProxyServer(unittest.TestCase):
 
     def test_get_info_controller(self):
         req = Request.blank('/info')
-        app = proxy_server.Application({}, FakeMemcache(),
+        app = proxy_server.Application({},
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
 
@@ -1138,7 +1150,7 @@ class TestProxyServer(unittest.TestCase):
     def test_exception_occurred(self):
         def do_test(additional_info):
             logger = debug_logger('test')
-            app = proxy_server.Application({}, FakeMemcache(),
+            app = proxy_server.Application({},
                                            account_ring=FakeRing(),
                                            container_ring=FakeRing(),
                                            logger=logger)
@@ -1172,7 +1184,7 @@ class TestProxyServer(unittest.TestCase):
     def test_error_occurred(self):
         def do_test(msg):
             logger = debug_logger('test')
-            app = proxy_server.Application({}, FakeMemcache(),
+            app = proxy_server.Application({},
                                            account_ring=FakeRing(),
                                            container_ring=FakeRing(),
                                            logger=logger)
@@ -1198,7 +1210,7 @@ class TestProxyServer(unittest.TestCase):
 
     def test_error_limit_methods(self):
         logger = debug_logger('test')
-        app = proxy_server.Application({}, FakeMemcache(),
+        app = proxy_server.Application({},
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing(),
                                        logger=logger)
@@ -1260,7 +1272,7 @@ class TestProxyServer(unittest.TestCase):
         self.assertEqual(4, node_error_count(app, node))
 
     def test_valid_api_version(self):
-        app = proxy_server.Application({}, FakeMemcache(),
+        app = proxy_server.Application({},
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
 
@@ -1341,14 +1353,31 @@ class TestProxyServerLoading(unittest.TestCase):
         }
         for policy in POLICIES:
             policy.object_ring = FakeRing()
-        app = proxy_server.Application(conf, FakeMemcache(), debug_logger(),
+        app = proxy_server.Application(conf, debug_logger(),
                                        FakeRing(), FakeRing())
         self.assertEqual(app.node_timeout, 2.3)
         self.assertEqual(app.recoverable_node_timeout, 1.4)
         self.assertEqual(app.conn_timeout, 0.7)
         self.assertEqual(app.client_timeout, 1.7)
         self.assertEqual(app.post_quorum_timeout, 0.3)
-        self.assertEqual(app.concurrency_timeout, 0.2)
+        self.assertEqual(app.get_policy_options(
+            None).concurrency_timeout, 0.2)
+
+    def test_concurrent_ec_options(self):
+        conf = {
+            'concurrent_gets': 'on',
+            'concurrency_timeout': '0.5',
+            'concurrent_ec_extra_requests': '4',
+        }
+        for policy in POLICIES:
+            policy.object_ring = FakeRing()
+        app = proxy_server.Application(conf, debug_logger(),
+                                       FakeRing(), FakeRing())
+        for policy in POLICIES:
+            policy_opts = app.get_policy_options(policy)
+            self.assertEqual(policy_opts.concurrent_ec_extra_requests, 4)
+            self.assertEqual(policy_opts.concurrent_gets, True)
+            self.assertEqual(policy_opts.concurrency_timeout, 0.5)
 
     def test_load_policy_rings(self):
         for policy in POLICIES:
@@ -1440,6 +1469,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         self.tempdir = mkdtemp()
         account_ring_path = os.path.join(self.tempdir, 'account.ring.gz')
         write_fake_ring(account_ring_path)
@@ -1527,18 +1557,21 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         write_affinity = r1
         write_affinity_node_count = 1 * replicas
         write_affinity_handoff_delete_count = 4
+        rebalance_missing_suppression_count = 2
         """
         expected_default = {"read_affinity": "",
                             "sorting_method": "shuffle",
                             "write_affinity": "",
                             "write_affinity_node_count_fn": 6,
-                            "write_affinity_handoff_delete_count": None}
+                            "write_affinity_handoff_delete_count": None,
+                            "rebalance_missing_suppression_count": 1}
         exp_options = {None: expected_default,
                        POLICIES[0]: {"read_affinity": "r1=100",
                                      "sorting_method": "affinity",
                                      "write_affinity": "r1",
                                      "write_affinity_node_count_fn": 3,
-                                     "write_affinity_handoff_delete_count": 4},
+                                     "write_affinity_handoff_delete_count": 4,
+                                     "rebalance_missing_suppression_count": 2},
                        POLICIES[1]: expected_default}
         exp_is_local = {POLICIES[0]: [({'region': 1, 'zone': 2}, True),
                                       ({'region': 2, 'zone': 1}, False)],
@@ -1551,24 +1584,52 @@ class TestProxyServerConfigLoading(unittest.TestCase):
             "ProxyOverrideOptions({}, {'sorting_method': 'shuffle', "
             "'read_affinity': '', 'write_affinity': '', "
             "'write_affinity_node_count': '2 * replicas', "
-            "'write_affinity_handoff_delete_count': None})",
+            "'write_affinity_handoff_delete_count': None, "
+            "'rebalance_missing_suppression_count': 1, "
+            "'concurrent_gets': False, 'concurrency_timeout': 0.5, "
+            "'concurrent_ec_extra_requests': 0"
+            "}, app)",
             repr(default_options))
         self.assertEqual(default_options, eval(repr(default_options), {
-            'ProxyOverrideOptions': default_options.__class__}))
+            'ProxyOverrideOptions': default_options.__class__, 'app': app}))
 
         policy_0_options = app.get_policy_options(POLICIES[0])
         self.assertEqual(
             "ProxyOverrideOptions({}, {'sorting_method': 'affinity', "
             "'read_affinity': 'r1=100', 'write_affinity': 'r1', "
             "'write_affinity_node_count': '1 * replicas', "
-            "'write_affinity_handoff_delete_count': 4})",
+            "'write_affinity_handoff_delete_count': 4, "
+            "'rebalance_missing_suppression_count': 2, "
+            "'concurrent_gets': False, 'concurrency_timeout': 0.5, "
+            "'concurrent_ec_extra_requests': 0"
+            "}, app)",
             repr(policy_0_options))
         self.assertEqual(policy_0_options, eval(repr(policy_0_options), {
-            'ProxyOverrideOptions': policy_0_options.__class__}))
+            'ProxyOverrideOptions': default_options.__class__, 'app': app}))
         self.assertNotEqual(default_options, policy_0_options)
 
         policy_1_options = app.get_policy_options(POLICIES[1])
         self.assertIs(default_options, policy_1_options)
+
+    def test_per_policy_conf_equality(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        """
+        app = self._write_conf_and_load_app(conf_sections)
+        self.assertIs(app.get_policy_options(None),
+                      app.get_policy_options(POLICIES[0]))
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+
+        [proxy-server:policy:0]
+        concurrent_ec_extra_requests = 1
+        """
+        app = self._write_conf_and_load_app(conf_sections)
+        self.assertNotEqual(app.get_policy_options(None),
+                            app.get_policy_options(POLICIES[0]))
 
     def test_per_policy_conf_inherits_defaults(self):
         conf_sections = """
@@ -1997,6 +2058,39 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         do_test('uno')
         do_test('0.0')
 
+    def test_per_policy_conf_overrides_default_concurrency_settings(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        concurrent_gets = True
+        concurrency_timeout = 0.5
+
+        [proxy-server:policy:0]
+        concurrent_gets = off
+        concurrency_timeout = 0.6
+
+        [proxy-server:policy:1]
+        concurrent_gets = True
+        concurrency_timeout = 0.3
+        concurrent_ec_extra_requests = 1
+        """
+        exp_options = {
+            None: {
+                "concurrent_gets": True,
+                "concurrency_timeout": 0.5,
+                "concurrent_ec_extra_requests": 0,
+            }, POLICIES[0]: {
+                "concurrent_gets": False,
+                "concurrency_timeout": 0.6,
+                "concurrent_ec_extra_requests": 0,
+            }, POLICIES[1]: {
+                "concurrent_gets": True,
+                "concurrency_timeout": 0.3,
+                "concurrent_ec_extra_requests": 1,
+            }}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+
 
 class TestProxyServerConfigStringLoading(TestProxyServerConfigLoading):
     # The proxy may be loaded from a conf string rather than a conf file, for
@@ -2023,7 +2117,6 @@ class BaseTestObjectController(object):
                 kwargs['raise_exc'] = raise_exc
 
             set_http_connect(*statuses, **kwargs)
-            self.app.memcache.store = {}
             req = Request.blank('/v1/a/c/o',
                                 headers={'Content-Length': '0',
                                          'Content-Type': 'text/plain'})
@@ -2036,7 +2129,6 @@ class BaseTestObjectController(object):
 
             # repeat test
             set_http_connect(*statuses, **kwargs)
-            self.app.memcache.store = {}
             req = Request.blank('/v1/a/c/o',
                                 headers={'Content-Length': '0',
                                          'Content-Type': 'text/plain'})
@@ -2076,8 +2168,8 @@ class BaseTestObjectController(object):
         self.put_container(policy.name, container_name)
 
         obj = b'this object has an etag and is otherwise unimportant'
-        etag = md5(obj).hexdigest()
-        not_etag = md5(obj + b"blahblah").hexdigest()
+        etag = md5(obj, usedforsecurity=False).hexdigest()
+        not_etag = md5(obj + b"blahblah", usedforsecurity=False).hexdigest()
 
         prolis = _test_sockets[0]
         prosrv = _test_servers[0]
@@ -2170,8 +2262,9 @@ class TestReplicatedObjectController(
     """
     def setUp(self):
         skip_if_no_xattrs()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         self.app = proxy_server.Application(
-            None, FakeMemcache(),
+            None,
             logger=debug_logger('proxy-ut'),
             account_ring=FakeRing(),
             container_ring=FakeRing())
@@ -3023,7 +3116,6 @@ class TestReplicatedObjectController(
             req = Request.blank('/v1/a/c/o.jpg', {})
             req.content_length = 0
             self.app.update_request(req)
-            self.app.memcache.store = {}
             res = controller.PUT(req)
             self.assertEqual(test_errors, [])
             self.assertTrue(res.status.startswith('201 '), res.status)
@@ -3052,7 +3144,6 @@ class TestReplicatedObjectController(
             req.content_length = 1
             req.body = 'a'
             self.app.update_request(req)
-            self.app.memcache.store = {}
             res = controller.PUT(req)
             self.assertEqual(test_errors, [])
             self.assertTrue(res.status.startswith('201 '))
@@ -3070,7 +3161,7 @@ class TestReplicatedObjectController(
         # not be used in ring order is if affinity is respected.
         with mock.patch('swift.proxy.server.shuffle', lambda x: x):
             app = proxy_server.Application(
-                conf, FakeMemcache(),
+                conf,
                 logger=debug_logger('proxy-ut'),
                 account_ring=FakeRing(),
                 container_ring=FakeRing())
@@ -3086,7 +3177,6 @@ class TestReplicatedObjectController(
                 req = Request.blank(
                     '/v1/a/c/o.jpg', method='PUT', body='a',
                     headers={'X-Backend-Storage-Policy-Index': str(policy)})
-                app.memcache.store = {}
                 res = controller.PUT(req)
         self.assertTrue(res.status.startswith('201 '))
         self.assertEqual(3, len(written_to))
@@ -3155,7 +3245,6 @@ class TestReplicatedObjectController(
             req = Request.blank('/v1/a/c/o.jpg', {})
             req.content_length = 1
             req.body = 'a'
-            self.app.memcache.store = {}
             res = controller.PUT(req)
             self.assertTrue(res.status.startswith('201 '))
 
@@ -3554,7 +3643,7 @@ class TestReplicatedObjectController(
             with open(os.path.join(swift_dir, 'mime.types'), 'w') as fp:
                 fp.write('foo/bar foo\n')
             proxy_server.Application({'swift_dir': swift_dir},
-                                     FakeMemcache(), FakeLogger(),
+                                     FakeLogger(),
                                      FakeRing(), FakeRing())
             self.assertEqual(proxy_server.mimetypes.guess_type('blah.foo')[0],
                              'foo/bar')
@@ -3573,7 +3662,6 @@ class TestReplicatedObjectController(
                 req = Request.blank('/v1/a/c/o.jpg', {})
                 req.content_length = 0
                 self.app.update_request(req)
-                self.app.memcache.store = {}
                 res = controller.PUT(req)
                 expected = str(expected)
                 self.assertEqual(res.status[:len(expected)], expected)
@@ -3590,7 +3678,6 @@ class TestReplicatedObjectController(
 
             def test_status_map(statuses, expected):
                 set_http_connect(*statuses)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o.jpg', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -3620,7 +3707,6 @@ class TestReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
 
             def test_status_map(statuses, expected):
-                self.app.memcache.store = {}
                 set_http_connect(*statuses)
                 req = Request.blank('/v1/a/c/o.jpg',
                                     environ={'REQUEST_METHOD': 'PUT'},
@@ -3666,7 +3752,6 @@ class TestReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
 
             def test_status_map(statuses, expected):
-                self.app.memcache.store = {}
                 set_http_connect(*statuses)
                 req = Request.blank('/v1/a/c/o.jpg', {})
                 req.content_length = 0
@@ -3686,7 +3771,6 @@ class TestReplicatedObjectController(
         with save_globals():
             def test_status_map(statuses, expected):
                 set_http_connect(*statuses)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {}, method='POST',
                                     headers={'Content-Type': 'foo/bar'})
                 self.app.update_request(req)
@@ -3711,7 +3795,6 @@ class TestReplicatedObjectController(
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
 
         def do_test(resp_headers):
-            self.app.memcache.store = {}
             backend_requests = []
 
             def capture_requests(ip, port, method, path, headers, *args,
@@ -3779,7 +3862,6 @@ class TestReplicatedObjectController(
             self.assertEqual(container_headers, expected)
 
             # and again with policy override
-            self.app.memcache.store = {}
             backend_requests = []
             req = Request.blank('/v1/a/c/o', {}, method='POST',
                                 headers={'X-Object-Meta-Color': 'Blue',
@@ -3823,7 +3905,6 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 0
 
         def do_test(method, sharding_state):
-            self.app.memcache.store = {}
             req = Request.blank('/v1/a/c/o', {}, method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
 
@@ -3918,9 +3999,9 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 3600
 
         def do_test(method, sharding_state):
-            self.app.memcache.store = {}
-            req = Request.blank('/v1/a/c/o', {}, method=method, body='',
-                                headers={'Content-Type': 'text/plain'})
+            req = Request.blank(
+                '/v1/a/c/o', {'swift.cache': FakeMemcache()},
+                method=method, body='', headers={'Content-Type': 'text/plain'})
 
             # we want the container_info response to say policy index of 1 and
             # sharding state
@@ -3977,8 +4058,8 @@ class TestReplicatedObjectController(
                 headers={'X-Backend-Record-Type': 'shard'})
 
             cache_key = 'shard-updating/a/c'
-            self.assertIn(cache_key, self.app.memcache.store)
-            self.assertEqual(self.app.memcache.store[cache_key],
+            self.assertIn(cache_key, req.environ['swift.cache'].store)
+            self.assertEqual(req.environ['swift.cache'].store[cache_key],
                              [dict(sr) for sr in shard_ranges])
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
             self.assertEqual(req.environ['swift.infocache'][cache_key],
@@ -4037,9 +4118,11 @@ class TestReplicatedObjectController(
                 utils.ShardRange(
                     '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
             ]
-            self.app.memcache.store = {'shard-updating/a/c': tuple(
-                dict(shard_range) for shard_range in shard_ranges)}
-            req = Request.blank('/v1/a/c/o', {}, method=method, body='',
+            cache = FakeMemcache()
+            cache.set('shard-updating/a/c', tuple(
+                dict(shard_range) for shard_range in shard_ranges))
+            req = Request.blank('/v1/a/c/o', {'swift.cache': cache},
+                                method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
 
             # we want the container_info response to say policy index of 1 and
@@ -4122,7 +4205,6 @@ class TestReplicatedObjectController(
         with save_globals():
             def test_status_map(statuses, expected):
                 set_http_connect(*statuses)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'DELETE'})
                 self.app.update_request(req)
                 res = req.get_response(self.app)
@@ -4139,7 +4221,6 @@ class TestReplicatedObjectController(
         with save_globals():
             def test_status_map(statuses, expected):
                 set_http_connect(*statuses)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'})
                 self.app.update_request(req)
                 res = req.get_response(self.app)
@@ -4170,7 +4251,6 @@ class TestReplicatedObjectController(
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
                 set_http_connect(*statuses, timestamps=timestamps)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'},
                                     headers={'x-newest': 'true'})
                 self.app.update_request(req)
@@ -4201,7 +4281,6 @@ class TestReplicatedObjectController(
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
                 set_http_connect(*statuses, timestamps=timestamps)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'GET'},
                                     headers={'x-newest': 'true'})
                 self.app.update_request(req)
@@ -4228,7 +4307,6 @@ class TestReplicatedObjectController(
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
                 set_http_connect(*statuses, timestamps=timestamps)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'})
                 self.app.update_request(req)
                 res = req.get_response(self.app)
@@ -4410,6 +4488,7 @@ class TestReplicatedObjectController(
 
             req = Request.blank('/v1/a/c/o',
                                 environ={'REQUEST_METHOD': 'PUT',
+                                         'swift.cache': FakeMemcache(),
                                          'wsgi.input': SlowBody()},
                                 headers={'Content-Length': '4',
                                          'Content-Type': 'text/plain'})
@@ -4419,11 +4498,8 @@ class TestReplicatedObjectController(
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 201)
             self.app.client_timeout = 0.05
-            req = Request.blank('/v1/a/c/o',
-                                environ={'REQUEST_METHOD': 'PUT',
-                                         'wsgi.input': SlowBody()},
-                                headers={'Content-Length': '4',
-                                         'Content-Type': 'text/plain'})
+
+            req.environ['wsgi.input'] = SlowBody()  # Need a fresh instance
             self.app.update_request(req)
             set_http_connect(201, 201, 201)
             #                obj  obj  obj
@@ -4537,7 +4613,8 @@ class TestReplicatedObjectController(
             for dev in object_ring.devs:
                 dev['ip'] = '127.0.0.1'
                 dev['port'] = 1
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            req = Request.blank('/v1/a/c/o', environ={
+                'REQUEST_METHOD': 'GET', 'swift.cache': FakeMemcache()})
             self.app.update_request(req)
 
             self.app.recoverable_node_timeout = 0.1
@@ -4561,7 +4638,6 @@ class TestReplicatedObjectController(
             resp = req.get_response(self.app)
             self.assertEqual(resp.body, b'lalala')
 
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
             set_http_connect(200, 200, 200, body=b'lalala',
                              slow=[1.0, 1.0], etags=['a', 'b', 'b'])
             resp = req.get_response(self.app)
@@ -4605,7 +4681,6 @@ class TestReplicatedObjectController(
 
     def test_node_request_setting(self):
         baseapp = proxy_server.Application({'request_node_count': '3'},
-                                           FakeMemcache(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
         self.assertEqual(baseapp.request_node_count(3), 3)
@@ -4718,12 +4793,21 @@ class TestReplicatedObjectController(
                 object_ring.max_more_nodes = 0
 
     def test_iter_nodes_calls_sort_nodes(self):
-        with mock.patch.object(self.app, 'sort_nodes') as sort_nodes:
+        called = []
+
+        def fake_sort_nodes(nodes, **kwargs):
+            # caller might mutate the list we return during iteration, we're
+            # interested in the value as of call time
+            called.append(mock.call(list(nodes), **kwargs))
+            return nodes
+        with mock.patch.object(self.app, 'sort_nodes',
+                               side_effect=fake_sort_nodes):
             object_ring = self.app.get_object_ring(None)
             for node in self.app.iter_nodes(object_ring, 0):
                 pass
-            sort_nodes.assert_called_once_with(
-                object_ring.get_part_nodes(0), policy=None)
+            self.assertEqual(called, [
+                mock.call(object_ring.get_part_nodes(0), policy=None)
+            ])
 
     def test_iter_nodes_skips_error_limited(self):
         with mock.patch.object(self.app, 'sort_nodes',
@@ -4939,7 +5023,6 @@ class TestReplicatedObjectController(
 
     def test_acc_or_con_missing_returns_404(self):
         with save_globals():
-            self.app.memcache = FakeMemcacheReturnsNone()
             self.app._error_limiting = {}
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
@@ -5036,7 +5119,6 @@ class TestReplicatedObjectController(
 
     def test_PUT_POST_requires_container_exist(self):
         with save_globals():
-            self.app.memcache = FakeMemcacheReturnsNone()
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
 
@@ -5194,17 +5276,21 @@ class TestReplicatedObjectController(
         with save_globals():
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
+            cache = FakeMemcache()
             set_http_connect(200, 200, 201, 201, 201)
             #                acct cont obj  obj  obj
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers={'Content-Length': '0'})
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers={'Content-Length': '0'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 201)
 
             set_http_connect(201, 201, 201)
             req = Request.blank(
-                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
                 headers={'Content-Length': '0',
                          'X-Object-Meta-' + (
                              'a' * constraints.MAX_META_NAME_LENGTH): 'v'})
@@ -5213,7 +5299,8 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 201)
             set_http_connect(201, 201, 201)
             req = Request.blank(
-                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
                 headers={
                     'Content-Length': '0',
                     'X-Object-Meta-' + (
@@ -5223,16 +5310,19 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 400)
 
             set_http_connect(201, 201, 201)
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers={'Content-Length': '0',
-                                         'X-Object-Meta-Too-Long': 'a' *
-                                         constraints.MAX_META_VALUE_LENGTH})
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers={'Content-Length': '0',
+                         'X-Object-Meta-Too-Long': 'a' *
+                         constraints.MAX_META_VALUE_LENGTH})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 201)
             set_http_connect(201, 201, 201)
             req = Request.blank(
-                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
                 headers={'Content-Length': '0',
                          'X-Object-Meta-Too-Long': 'a' *
                          (constraints.MAX_META_VALUE_LENGTH + 1)})
@@ -5244,8 +5334,10 @@ class TestReplicatedObjectController(
             headers = {'Content-Length': '0'}
             for x in range(constraints.MAX_META_COUNT):
                 headers['X-Object-Meta-%d' % x] = 'v'
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers=headers)
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers=headers)
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 201)
@@ -5253,8 +5345,10 @@ class TestReplicatedObjectController(
             headers = {'Content-Length': '0'}
             for x in range(constraints.MAX_META_COUNT + 1):
                 headers['X-Object-Meta-%d' % x] = 'v'
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers=headers)
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers=headers)
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 400)
@@ -5272,16 +5366,20 @@ class TestReplicatedObjectController(
             if constraints.MAX_META_OVERALL_SIZE - size > 1:
                 headers['X-Object-Meta-a'] = \
                     'a' * (constraints.MAX_META_OVERALL_SIZE - size - 1)
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers=headers)
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers=headers)
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 201)
             set_http_connect(201, 201, 201)
             headers['X-Object-Meta-a'] = \
                 'a' * (constraints.MAX_META_OVERALL_SIZE - size)
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                                headers=headers)
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.cache': cache},
+                headers=headers)
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEqual(resp.status_int, 400)
@@ -5292,7 +5390,6 @@ class TestReplicatedObjectController(
         controller = ReplicatedObjectController(
             self.app, account, container, obj)
         self.app.update_request(req)
-        self.app.memcache.store = {}
         with save_globals():
             new_connect = set_http_connect(*args, **kwargs)
             yield controller
@@ -5606,7 +5703,8 @@ class TestReplicatedObjectController(
         self.assertEqual(headers[:len(exp)], exp)
 
         # request with both If-None-Match and Range
-        etag = md5(b"abcdefghij").hexdigest().encode('ascii')
+        etag = md5(b"abcdefghij",
+                   usedforsecurity=False).hexdigest().encode('ascii')
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile('rwb')
         fd.write(b'GET /v1/a/con/o HTTP/1.1\r\n' +
@@ -5702,7 +5800,7 @@ class TestReplicatedObjectController(
         # not be used in ring order is if affinity is respected.
         with mock.patch('swift.proxy.server.shuffle', lambda x: x):
             app = proxy_server.Application(
-                conf, FakeMemcache(),
+                conf,
                 logger=debug_logger('proxy-ut'),
                 account_ring=FakeRing(),
                 container_ring=FakeRing())
@@ -5718,7 +5816,6 @@ class TestReplicatedObjectController(
                 req = Request.blank(
                     '/v1/a/c/o.jpg',
                     headers={'X-Backend-Storage-Policy-Index': str(policy)})
-                app.memcache.store = {}
                 res = controller.GET(req)
         self.assertTrue(res.status.startswith('200 '))
         self.assertEqual(3, len(actual_nodes))
@@ -5818,7 +5915,6 @@ class TestReplicatedObjectController(
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
             set_http_connect(200, 200, 202, 202, 202)
-            self.app.memcache.store = {}
             orig_time = time.time
             try:
                 t = time.time()
@@ -6483,7 +6579,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                   'Content-Length: %d\r\n'
                   'X-Storage-Token: t\r\n'
                   'Content-Type: application/octet-stream\r\n'
-                  '\r\n' % (self.ec_policy.name, md5(obj).hexdigest(),
+                  '\r\n' % (self.ec_policy.name,
+                            md5(obj, usedforsecurity=False).hexdigest(),
                             len(obj))).encode('ascii'))
         fd.write(obj)
         fd.flush()
@@ -6518,7 +6615,7 @@ class BaseTestECObjectController(BaseTestObjectController):
 
                 self.assertEqual(
                     lmeta['x-object-sysmeta-ec-etag'],
-                    md5(obj).hexdigest())
+                    md5(obj, usedforsecurity=False).hexdigest())
                 self.assertEqual(
                     lmeta['x-object-sysmeta-ec-content-length'],
                     str(len(obj)))
@@ -6530,7 +6627,7 @@ class BaseTestECObjectController(BaseTestObjectController):
                     '%s 2+1' % DEFAULT_TEST_EC_TYPE)
                 self.assertEqual(
                     lmeta['etag'],
-                    md5(contents).hexdigest())
+                    md5(contents, usedforsecurity=False).hexdigest())
 
                 # check presence for a durable data file for the timestamp
                 durable_file = (
@@ -6659,7 +6756,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                   'X-Storage-Token: t\r\n'
                   'Content-Type: application/octet-stream\r\n'
                   '\r\n' % (self.ec_policy.name,
-                            md5(b'something else').hexdigest(),
+                            md5(b'something else',
+                                usedforsecurity=False).hexdigest(),
                             len(obj))).encode('ascii'))
         fd.write(obj)
         fd.flush()
@@ -6690,8 +6788,8 @@ class BaseTestECObjectController(BaseTestObjectController):
             self.ec_policy.object_ring.replica_count - self.ec_policy.ec_ndata)
         countdown = [count]
 
-        def busted_md5_constructor(initial_str=b""):
-            hasher = md5(initial_str)
+        def busted_md5_constructor(initial_str=b"", usedforsecurity=True):
+            hasher = md5(initial_str, usedforsecurity=usedforsecurity)
             if countdown[0] > 0:
                 hasher.update(b'wrong')
             countdown[0] -= 1
@@ -6711,7 +6809,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                       'Content-Length: %d\r\n'
                       'X-Storage-Token: t\r\n'
                       'Content-Type: application/octet-stream\r\n'
-                      '\r\n' % (self.ec_policy.name, md5(obj).hexdigest(),
+                      '\r\n' % (self.ec_policy.name,
+                                md5(obj, usedforsecurity=False).hexdigest(),
                                 len(obj))).encode('ascii'))
             fd.write(obj)
             fd.flush()
@@ -6751,9 +6850,9 @@ class BaseTestECObjectController(BaseTestObjectController):
     def test_PUT_ec_fragment_quorum_archive_etag_mismatch(self):
         self.put_container("ec", "ec-con")
 
-        def busted_md5_constructor(initial_str=""):
-            hasher = md5(initial_str)
-            hasher.update('wrong')
+        def busted_md5_constructor(initial_str=b"", usedforsecurity=True):
+            hasher = md5(initial_str, usedforsecurity=usedforsecurity)
+            hasher.update(b'wrong')
             return hasher
 
         obj = b'uvarovite-esurience-cerated-symphysic'
@@ -6769,7 +6868,7 @@ class BaseTestECObjectController(BaseTestObjectController):
         commit_confirmation = \
             'swift.proxy.controllers.obj.MIMEPutter.send_commit_confirmation'
         diskfile_md5 = 'swift.obj.diskfile.md5'
-        mem_diskfile_md5 = 'swift.obj.mem_diskfile.hashlib.md5'
+        mem_diskfile_md5 = 'swift.obj.mem_diskfile.md5'
 
         with mock.patch(diskfile_md5, busted_md5_constructor), \
                 mock.patch(mem_diskfile_md5, busted_md5_constructor), \
@@ -6782,7 +6881,7 @@ class BaseTestECObjectController(BaseTestObjectController):
                       'Content-Length: %d\r\n'
                       'X-Storage-Token: t\r\n'
                       'Content-Type: application/octet-stream\r\n'
-                      '\r\n' % (md5(obj).hexdigest(),
+                      '\r\n' % (md5(obj, usedforsecurity=False).hexdigest(),
                                 len(obj))).encode('ascii'))
             fd.write(obj)
             fd.flush()
@@ -6838,7 +6937,7 @@ class BaseTestECObjectController(BaseTestObjectController):
                       'Content-Length: %d\r\n'
                       'X-Storage-Token: t\r\n'
                       'Content-Type: application/octet-stream\r\n'
-                      '\r\n' % (md5(obj).hexdigest(),
+                      '\r\n' % (md5(obj, usedforsecurity=False).hexdigest(),
                                 len(obj))).encode('ascii'))
             fd.write(obj)
             fd.flush()
@@ -6879,7 +6978,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                   'Content-Length: %d\r\n'
                   'X-Storage-Token: t\r\n'
                   'Content-Type: application/octet-stream\r\n'
-                  '\r\n' % (self.ec_policy.name, md5(obj).hexdigest(),
+                  '\r\n' % (self.ec_policy.name,
+                            md5(obj, usedforsecurity=False).hexdigest(),
                             len(obj))).encode('ascii'))
         fd.write(obj)
         fd.flush()
@@ -6897,7 +6997,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                   'Content-Length: %d\r\n'
                   'X-Storage-Token: t\r\n'
                   'Content-Type: application/octet-stream\r\n'
-                  '\r\n' % (self.ec_policy.name, md5(obj).hexdigest(),
+                  '\r\n' % (self.ec_policy.name,
+                            md5(obj, usedforsecurity=False).hexdigest(),
                             len(obj))).encode('ascii'))
         fd.write(obj)
         fd.flush()
@@ -6943,7 +7044,9 @@ class BaseTestECObjectController(BaseTestObjectController):
 
         headers = parse_headers_string(headers)
         self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+        self.assertEqual(
+            md5(obj, usedforsecurity=False).hexdigest(),
+            headers['Etag'])
         self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
 
         gotten_obj = b''
@@ -7005,7 +7108,9 @@ class BaseTestECObjectController(BaseTestObjectController):
 
         headers = parse_headers_string(headers)
         self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+        self.assertEqual(
+            md5(obj, usedforsecurity=False).hexdigest(),
+            headers['Etag'])
 
         gotten_obj = b''
         while True:
@@ -7086,7 +7191,9 @@ class BaseTestECObjectController(BaseTestObjectController):
 
             headers = parse_headers_string(headers)
             self.assertEqual(str(len(obj)), headers['Content-Length'])
-            self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+            self.assertEqual(
+                md5(obj, usedforsecurity=False).hexdigest(),
+                headers['Etag'])
 
             gotten_obj = b''
             try:
@@ -7142,7 +7249,9 @@ class BaseTestECObjectController(BaseTestObjectController):
 
         headers = parse_headers_string(headers)
         self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+        self.assertEqual(
+            md5(obj, usedforsecurity=False).hexdigest(),
+            headers['Etag'])
         self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
 
         error_lines = prosrv.logger.get_lines_for_level('error')
@@ -7231,7 +7340,8 @@ class BaseTestECObjectController(BaseTestObjectController):
                     obj = b'abCD' * 10
 
                     extra_trans_data = [
-                        'Etag: "%s"\r\n' % md5(obj).hexdigest(),
+                        'Etag: "%s"\r\n' % md5(
+                            obj, usedforsecurity=False).hexdigest(),
                         'Content-Length: %d\r\n' % len(obj),
                         'Content-Type: application/octet-stream\r\n',
                         '\r\n%s' % obj.decode('ascii')
@@ -7317,7 +7427,7 @@ class BaseTestECObjectController(BaseTestObjectController):
                 return super(WrappedTimeout, self).__exit__(typ, value, tb)
 
         timeouts = {}
-        with mock.patch('swift.proxy.controllers.base.WatchdogTimeout',
+        with mock.patch('swift.proxy.controllers.obj.WatchdogTimeout',
                         WrappedTimeout):
             with mock.patch.object(_test_servers[0], 'client_timeout', new=5):
                 # get object
@@ -7727,7 +7837,8 @@ class TestECGets(unittest.TestCase):
                            for that node. Each desired state is a list of
                            dicts, with each dict describing object reference,
                            frag_index and whether the file moved to the node's
-                           hash_dir should be marked as durable or not.
+                           hash_dir should be marked as durable or not, or
+                           converted to a meta file.
         """
         (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
          obj2srv, obj3srv, _obj4srv, _obj5srv, _obj6srv) = _test_servers
@@ -7790,8 +7901,10 @@ class TestECGets(unittest.TestCase):
         # node state is in form:
         # {node_index: [{ref: object reference,
         #                frag_index: index,
-        #                durable: True or False}, ...],
+        #                durable: True or False,
+        #                meta: True or False}, ...],
         #  node_index: ...}
+        # meta takes precedence over durable
         for node_index, state in node_state.items():
             dest = node_hash_dirs[node_index]
             for frag_info in state:
@@ -7799,8 +7912,14 @@ class TestECGets(unittest.TestCase):
                 src_files = os.listdir(src)
                 # sanity check, expect just a single .data file
                 self.assertFalse(src_files[1:])
-                dest_file = src_files[0].replace(
-                    '#d', '#d' if frag_info['durable'] else '')
+                dest_file = src_files[0]
+                if frag_info.get('meta', False):
+                    # morph a data file into a meta file;
+                    # note: a real meta file would not have content
+                    dest_file = dest_file.replace(
+                        '#%d#d.data' % frag_info['frag_index'], '.meta')
+                elif not frag_info.get('durable', False):
+                    dest_file = dest_file.replace('#d', '')
                 move(os.path.join(src, src_files[0]),
                      os.path.join(dest, dest_file))
 
@@ -7900,6 +8019,7 @@ class TestECGets(unittest.TestCase):
         resp = self._setup_nodes_and_do_GET(objs, node_state)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.body, objs['obj1']['body'])
+        self.assertEqual(ts_1.normal, resp.headers['X-Timestamp'])
 
         # durable frags at two timestamps: in this scenario proxy is guaranteed
         # to see the durable at ts_2 with one of the first 2 responses, so will
@@ -7917,6 +8037,28 @@ class TestECGets(unittest.TestCase):
         resp = self._setup_nodes_and_do_GET(objs, node_state)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.body, objs['obj2']['body'])
+        self.assertEqual(ts_2.normal, resp.headers['X-Timestamp'])
+
+        # older durable, plus some newer non-durable, plus some even newer
+        # metadata files; in this scenario the fragment X-Timestamp's are
+        # determined by the metadata so we're checking that X-Timestamp or
+        # X-Backend-Timestamp do *not* interfere with the proxy EC getter
+        # response buckets, which should be based on X-Backend-Data-Timestamp
+        node_state = {
+            0: [dict(ref='obj3', frag_index=0, meta=True),
+                dict(ref='obj2', frag_index=0, durable=False),
+                dict(ref='obj1', frag_index=0, durable=True)],
+            1: [dict(ref='obj3', frag_index=1, meta=True),
+                dict(ref='obj1', frag_index=1, durable=True)],
+            2: [dict(ref='obj3', frag_index=2, meta=True),
+                dict(ref='obj2', frag_index=2, durable=False),
+                dict(ref='obj1', frag_index=2, durable=True)],
+        }
+
+        resp = self._setup_nodes_and_do_GET(objs, node_state)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body, objs['obj1']['body'])
+        self.assertEqual(ts_3.normal, resp.headers['X-Timestamp'])
 
     def test_GET_with_same_frag_index_on_multiple_nodes(self):
         ts_iter = make_timestamp_iter()
@@ -7982,7 +8124,7 @@ class TestObjectDisconnectCleanup(unittest.TestCase):
                 continue
             device_path = os.path.join(_testdir, dev)
             for datadir in os.listdir(device_path):
-                if 'object' not in datadir:
+                if any(p in datadir for p in ('account', 'container')):
                     continue
                 data_path = os.path.join(device_path, datadir)
                 rmtree(data_path, ignore_errors=True)
@@ -7992,10 +8134,12 @@ class TestObjectDisconnectCleanup(unittest.TestCase):
         skip_if_no_xattrs()
         debug.hub_exceptions(False)
         self._cleanup_devices()
+        _test_servers[0]._error_limiting = {}  # clear out errors
 
     def tearDown(self):
         debug.hub_exceptions(True)
         self._cleanup_devices()
+        _test_servers[0]._error_limiting = {}  # clear out errors
 
     def _check_disconnect_cleans_up(self, policy_name, is_chunked=False):
         proxy_port = _test_sockets[0].getsockname()[1]
@@ -8088,8 +8232,9 @@ class TestObjectDisconnectCleanup(unittest.TestCase):
 class TestObjectECRangedGET(unittest.TestCase):
     def setUp(self):
         _test_servers[0].logger._clear()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         self.app = proxy_server.Application(
-            None, FakeMemcache(),
+            None,
             logger=debug_logger('proxy-ut'),
             account_ring=FakeRing(),
             container_ring=FakeRing())
@@ -8098,6 +8243,7 @@ class TestObjectECRangedGET(unittest.TestCase):
         prosrv = _test_servers[0]
         self.assertFalse(prosrv.logger.get_lines_for_level('error'))
         self.assertFalse(prosrv.logger.get_lines_for_level('warning'))
+        prosrv._error_limiting = {}  # clear out errors
 
     @classmethod
     def setUpClass(cls):
@@ -8131,7 +8277,7 @@ class TestObjectECRangedGET(unittest.TestCase):
             str(s) for s in range(431)).encode('ascii')
         assert seg_size * 4 > len(cls.obj) > seg_size * 3, \
             "object is wrong number of segments"
-        cls.obj_etag = md5(cls.obj).hexdigest()
+        cls.obj_etag = md5(cls.obj, usedforsecurity=False).hexdigest()
         cls.tiny_obj = b'tiny, tiny object'
         assert len(cls.tiny_obj) < seg_size, "tiny_obj too large"
 
@@ -8674,7 +8820,7 @@ class TestContainerController(unittest.TestCase):
 
     def setUp(self):
         self.app = proxy_server.Application(
-            None, FakeMemcache(),
+            None,
             account_ring=FakeRing(),
             container_ring=FakeRing(base_port=2000),
             logger=debug_logger())
@@ -8774,14 +8920,12 @@ class TestContainerController(unittest.TestCase):
             if raise_exc:
                 kwargs['raise_exc'] = raise_exc
             set_http_connect(*statuses, **kwargs)
-            self.app.memcache.store = {}
             req = Request.blank('/v1/a/c', headers={'Content-Length': '0',
                                 'Content-Type': 'text/plain'})
             self.app.update_request(req)
             res = method(req)
             self.assertEqual(res.status_int, expected)
             set_http_connect(*statuses, **kwargs)
-            self.app.memcache.store = {}
             req = Request.blank('/v1/a/c/', headers={'Content-Length': '0',
                                 'Content-Type': 'text/plain'})
             self.app.update_request(req)
@@ -8795,7 +8939,6 @@ class TestContainerController(unittest.TestCase):
             def test_status_map(statuses, expected,
                                 c_expected=None, a_expected=None, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c', {})
                 self.app.update_request(req)
                 res = controller.HEAD(req)
@@ -8823,7 +8966,6 @@ class TestContainerController(unittest.TestCase):
                     self.assertNotIn('account/a', res.environ)
 
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c', {})
                 self.app.update_request(req)
                 res = controller.GET(req)
@@ -8882,7 +9024,6 @@ class TestContainerController(unittest.TestCase):
             with save_globals():
                 mock_conn = set_http_connect(200, 201, 201, 201,
                                              give_connect=capture_requests)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/test', method='PUT',
                                     headers={'Content-Length': 0})
                 if requested_policy:
@@ -8934,7 +9075,6 @@ class TestContainerController(unittest.TestCase):
 
             def test_status_map(statuses, expected, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -8994,7 +9134,6 @@ class TestContainerController(unittest.TestCase):
 
             def test_status_map(statuses, expected, headers=None, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c', {}, headers=headers)
                 req.content_length = 0
                 self.app.update_request(req)
@@ -9033,7 +9172,6 @@ class TestContainerController(unittest.TestCase):
 
             def test_status_map(statuses, expected, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -9126,7 +9264,6 @@ class TestContainerController(unittest.TestCase):
     def test_acc_missing_returns_404(self):
         for meth in ('DELETE', 'PUT'):
             with save_globals():
-                self.app.memcache = FakeMemcacheReturnsNone()
                 self.app._error_limiting = {}
                 controller = proxy_server.ContainerController(self.app,
                                                               'account',
@@ -9136,7 +9273,6 @@ class TestContainerController(unittest.TestCase):
                                      missing_container=True)
                 else:
                     set_http_connect(200, 200, 200, 200)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a/c',
                                     environ={'REQUEST_METHOD': meth})
                 self.app.update_request(req)
@@ -9251,7 +9387,6 @@ class TestContainerController(unittest.TestCase):
             self.assert_status_map(controller.DELETE,
                                    (200, 204, 503, 404), 503)
 
-            self.app.memcache = FakeMemcacheReturnsNone()
             # 200: Account check, 404x3: Container check
             self.assert_status_map(controller.DELETE,
                                    (200, 404, 404, 404), 404)
@@ -9556,7 +9691,7 @@ class TestContainerController(unittest.TestCase):
         def _do_test(method):
             with save_globals():
                 swift.proxy.controllers.Controller.account_info = account_info
-                app = proxy_server.Application(None, FakeMemcache(),
+                app = proxy_server.Application(None,
                                                account_ring=FakeRing(),
                                                container_ring=FakeRing())
                 set_http_connect(201, 201, 201)
@@ -9595,7 +9730,7 @@ class TestContainerController(unittest.TestCase):
         def _do_test(method):
             with save_globals():
                 swift.proxy.controllers.Controller.account_info = account_info
-                app = proxy_server.Application(None, FakeMemcache(),
+                app = proxy_server.Application(None,
                                                account_ring=FakeRing(),
                                                container_ring=FakeRing())
                 set_http_connect(201, 201, 201)
@@ -9982,7 +10117,7 @@ class TestAccountController(unittest.TestCase):
 
     def setUp(self):
         conf = {'error_suppression_interval': 0}
-        self.app = proxy_server.Application(conf, FakeMemcache(),
+        self.app = proxy_server.Application(conf,
                                             account_ring=FakeRing(),
                                             container_ring=FakeRing())
 
@@ -10065,13 +10200,11 @@ class TestAccountController(unittest.TestCase):
             self.assert_status_map(controller.GET, (404, 404, 503), 404, 404)
             self.assert_status_map(controller.GET, (404, 503, 503), 503)
 
-            self.app.memcache = FakeMemcacheReturnsNone()
             self.assert_status_map(controller.GET, (404, 404, 404), 404, 404)
 
     def test_GET_autocreate(self):
         with save_globals():
             controller = proxy_server.AccountController(self.app, 'a')
-            self.app.memcache = FakeMemcacheReturnsNone()
             self.assertFalse(self.app.account_autocreate)
             # Repeat the test for autocreate = False and 404 by all
             self.assert_status_map(controller.GET,
@@ -10138,7 +10271,6 @@ class TestAccountController(unittest.TestCase):
         # Same behaviour as GET
         with save_globals():
             controller = proxy_server.AccountController(self.app, 'a')
-            self.app.memcache = FakeMemcacheReturnsNone()
             self.assertFalse(self.app.account_autocreate)
             self.assert_status_map(controller.HEAD,
                                    (404, 404, 404), 404)
@@ -10154,7 +10286,6 @@ class TestAccountController(unittest.TestCase):
     def test_POST_autocreate(self):
         with save_globals():
             controller = proxy_server.AccountController(self.app, 'a')
-            self.app.memcache = FakeMemcacheReturnsNone()
             # first test with autocreate being False
             self.assertFalse(self.app.account_autocreate)
             self.assert_status_map(controller.POST,
@@ -10176,7 +10307,6 @@ class TestAccountController(unittest.TestCase):
     def test_POST_autocreate_with_sysmeta(self):
         with save_globals():
             controller = proxy_server.AccountController(self.app, 'a')
-            self.app.memcache = FakeMemcacheReturnsNone()
             # first test with autocreate being False
             self.assertFalse(self.app.account_autocreate)
             self.assert_status_map(controller.POST,
@@ -10249,7 +10379,6 @@ class TestAccountController(unittest.TestCase):
 
             def test_status_map(statuses, expected, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -10452,7 +10581,6 @@ class TestAccountController(unittest.TestCase):
 
             def test_status_map(statuses, expected, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a', {'REQUEST_METHOD': 'DELETE'})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -10475,7 +10603,6 @@ class TestAccountController(unittest.TestCase):
 
             def test_status_map(statuses, expected, **kwargs):
                 set_http_connect(*statuses, **kwargs)
-                self.app.memcache.store = {}
                 req = Request.blank('/v1/a?whoops',
                                     environ={'REQUEST_METHOD': 'DELETE'})
                 req.content_length = 0
@@ -10500,11 +10627,10 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
     def setUp(self):
         conf = {'account_autocreate': 'yes'}
         self.app = listing_formats.ListingFilter(
-            proxy_server.Application(conf, FakeMemcache(),
+            proxy_server.Application(conf,
                                      account_ring=FakeRing(),
                                      container_ring=FakeRing()),
             {})
-        self.app.app.memcache = FakeMemcacheReturnsNone()
 
     def test_GET_autocreate_accept_json(self):
         with save_globals():
@@ -10611,7 +10737,7 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
             version=2, acl_dict=acl)}
 
         app = proxy_server.Application(
-            None, FakeMemcache(), account_ring=FakeRing(),
+            None, account_ring=FakeRing(),
             container_ring=FakeRing())
 
         with save_globals():
@@ -10686,7 +10812,7 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
             resps_to_send.append(canned_resp)
 
         app = proxy_server.Application(
-            None, FakeMemcache(), account_ring=FakeRing(),
+            None, account_ring=FakeRing(),
             container_ring=FakeRing())
         app.allow_account_management = True
 
@@ -10790,6 +10916,7 @@ class TestProxyObjectPerformance(unittest.TestCase):
         # various data paths between the proxy server and the object
         # server. Used as a play ground to debug buffer sizes for sockets.
         skip_if_no_xattrs()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         prolis = _test_sockets[0]
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         # Client is transmitting in 2 MB chunks
@@ -10854,7 +10981,7 @@ class TestSwiftInfo(unittest.TestCase):
         utils._swift_admin_info = {}
 
     def test_registered_defaults(self):
-        app = proxy_server.Application({}, FakeMemcache(),
+        app = proxy_server.Application({},
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
         req = Request.blank('/info')
@@ -10910,6 +11037,7 @@ class TestSocketObjectVersions(unittest.TestCase):
     def setUp(self):
         global _test_sockets
         skip_if_no_xattrs()
+        _test_servers[0]._error_limiting = {}  # clear out errors
         self.prolis = prolis = listen_zero()
         self._orig_prolis = _test_sockets[0]
         allowed_headers = ', '.join([
@@ -10944,6 +11072,7 @@ class TestSocketObjectVersions(unittest.TestCase):
         global _test_sockets
         self.sockets[0] = self._orig_prolis
         _test_sockets = tuple(self.sockets)
+        _test_servers[0]._error_limiting = {}  # clear out errors
 
     def test_version_manifest(self, oc=b'versions', vc=b'vers', o=b'name'):
         versions_to_create = 3

@@ -19,7 +19,7 @@ from __future__ import print_function
 import hashlib
 
 from test.unit import temptree, debug_logger, make_timestamp_iter, \
-    with_tempdir, mock_timestamp_now
+    with_tempdir, mock_timestamp_now, FakeIterable
 
 import ctypes
 import contextlib
@@ -74,7 +74,7 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     MimeInvalid
 from swift.common import utils
 from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6, \
-    set_swift_dir
+    set_swift_dir, md5
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -1024,6 +1024,13 @@ class TestUtils(unittest.TestCase):
     def setUp(self):
         utils.HASH_PATH_SUFFIX = b'endcap'
         utils.HASH_PATH_PREFIX = b'startcap'
+        self.md5_test_data = "Openstack forever".encode('utf-8')
+        try:
+            self.md5_digest = hashlib.md5(self.md5_test_data).hexdigest()
+            self.fips_enabled = False
+        except ValueError:
+            self.md5_digest = '0d6dc3c588ae71a04ce9a6beebbbba06'
+            self.fips_enabled = True
 
     def test_get_zero_indexed_base_string(self):
         self.assertEqual(utils.get_zero_indexed_base_string('something', 0),
@@ -1216,8 +1223,56 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(
             utils.normalize_delete_at_timestamp('71253327593.67890'),
             '9999999999')
-        self.assertRaises(ValueError, utils.normalize_timestamp, '')
-        self.assertRaises(ValueError, utils.normalize_timestamp, 'abc')
+        with self.assertRaises(TypeError):
+            utils.normalize_delete_at_timestamp(None)
+        with self.assertRaises(ValueError):
+            utils.normalize_delete_at_timestamp('')
+        with self.assertRaises(ValueError):
+            utils.normalize_delete_at_timestamp('abc')
+
+    def test_normalize_delete_at_timestamp_high_precision(self):
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(1253327593, True),
+            '1253327593.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(1253327593.67890, True),
+            '1253327593.67890')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('1253327593', True),
+            '1253327593.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('1253327593.67890', True),
+            '1253327593.67890')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(-1253327593, True),
+            '0000000000.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(-1253327593.67890, True),
+            '0000000000.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('-1253327593', True),
+            '0000000000.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('-1253327593.67890', True),
+            '0000000000.00000')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(71253327593, True),
+            '9999999999.99999')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp(71253327593.67890, True),
+            '9999999999.99999')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('71253327593', True),
+            '9999999999.99999')
+        self.assertEqual(
+            utils.normalize_delete_at_timestamp('71253327593.67890', True),
+            '9999999999.99999')
+        with self.assertRaises(TypeError):
+            utils.normalize_delete_at_timestamp(None, True)
+        with self.assertRaises(ValueError):
+            utils.normalize_delete_at_timestamp('', True)
+        with self.assertRaises(ValueError):
+            utils.normalize_delete_at_timestamp('abc', True)
 
     def test_last_modified_date_to_timestamp(self):
         expectations = {
@@ -1246,6 +1301,23 @@ class TestUtils(unittest.TestCase):
                 os.environ['TZ'] = old_tz
             else:
                 os.environ.pop('TZ')
+
+    def test_drain_and_close(self):
+        utils.drain_and_close([])
+        utils.drain_and_close(iter([]))
+        drained = [False]
+
+        def gen():
+            yield 'x'
+            yield 'y'
+            drained[0] = True
+
+        utils.drain_and_close(gen())
+        self.assertTrue(drained[0])
+        utils.drain_and_close(Response(status=200, body=b'Some body'))
+        drained = [False]
+        utils.drain_and_close(Response(status=200, app_iter=gen()))
+        self.assertTrue(drained[0])
 
     def test_backwards(self):
         # Test swift.common.utils.backward
@@ -1966,6 +2038,56 @@ class TestUtils(unittest.TestCase):
             self.assertEqual(strip_value(sio), 'test 1.2.3.4 test 12345\n')
         finally:
             logger.logger.removeHandler(handler)
+
+    @reset_logger_state
+    def test_prefixlogger(self):
+        # setup stream logging
+        sio = StringIO()
+        base_logger = utils.get_logger(None)
+        handler = logging.StreamHandler(sio)
+        base_logger.logger.addHandler(handler)
+        logger = utils.PrefixLoggerAdapter(base_logger, {})
+        logger.set_prefix('some prefix: ')
+
+        def strip_value(sio):
+            sio.seek(0)
+            v = sio.getvalue()
+            sio.truncate(0)
+            return v
+
+        def log_exception(exc):
+            try:
+                raise exc
+            except (Exception, Timeout):
+                logger.exception('blah')
+        try:
+            # establish base case
+            self.assertEqual(strip_value(sio), '')
+            logger.info('test')
+            self.assertEqual(strip_value(sio), 'some prefix: test\n')
+            self.assertEqual(strip_value(sio), '')
+            logger.info('test')
+            logger.info('test')
+            self.assertEqual(
+                strip_value(sio),
+                'some prefix: test\nsome prefix: test\n')
+            self.assertEqual(strip_value(sio), '')
+
+            # test OSError
+            for en in (errno.EIO, errno.ENOSPC):
+                log_exception(OSError(en, 'my %s error message' % en))
+                log_msg = strip_value(sio)
+                self.assertNotIn('Traceback', log_msg)
+                self.assertEqual('some prefix: ', log_msg[:13])
+                self.assertIn('my %s error message' % en, log_msg)
+            # unfiltered
+            log_exception(OSError())
+            log_msg = strip_value(sio)
+            self.assertIn('Traceback', log_msg)
+            self.assertEqual('some prefix: ', log_msg[:13])
+
+        finally:
+            base_logger.logger.removeHandler(handler)
 
     def test_storage_directory(self):
         self.assertEqual(utils.storage_directory('objects', '1', 'ABCDEF'),
@@ -4436,6 +4558,79 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(msg, b'READY=1')
         self.assertNotIn('NOTIFY_SOCKET', os.environ)
 
+    def test_md5_with_data(self):
+        if not self.fips_enabled:
+            digest = md5(self.md5_test_data).hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            # on a FIPS enabled system, this throws a ValueError:
+            # [digital envelope routines: EVP_DigestInit_ex] disabled for FIPS
+            self.assertRaises(ValueError, md5, self.md5_test_data)
+
+        if not self.fips_enabled:
+            digest = md5(self.md5_test_data, usedforsecurity=True).hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(
+                ValueError, md5, self.md5_test_data, usedforsecurity=True)
+
+        digest = md5(self.md5_test_data, usedforsecurity=False).hexdigest()
+        self.assertEqual(digest, self.md5_digest)
+
+    def test_md5_without_data(self):
+        if not self.fips_enabled:
+            test_md5 = md5()
+            test_md5.update(self.md5_test_data)
+            digest = test_md5.hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(ValueError, md5)
+
+        if not self.fips_enabled:
+            test_md5 = md5(usedforsecurity=True)
+            test_md5.update(self.md5_test_data)
+            digest = test_md5.hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(ValueError, md5, usedforsecurity=True)
+
+        test_md5 = md5(usedforsecurity=False)
+        test_md5.update(self.md5_test_data)
+        digest = test_md5.hexdigest()
+        self.assertEqual(digest, self.md5_digest)
+
+    @unittest.skipIf(sys.version_info.major == 2,
+                     "hashlib.md5 does not raise TypeError here in py2")
+    def test_string_data_raises_type_error(self):
+        if not self.fips_enabled:
+            self.assertRaises(TypeError, hashlib.md5, u'foo')
+            self.assertRaises(TypeError, md5, u'foo')
+            self.assertRaises(
+                TypeError, md5, u'foo', usedforsecurity=True)
+        else:
+            self.assertRaises(ValueError, hashlib.md5, u'foo')
+            self.assertRaises(ValueError, md5, u'foo')
+            self.assertRaises(
+                ValueError, md5, u'foo', usedforsecurity=True)
+
+        self.assertRaises(
+            TypeError, md5, u'foo', usedforsecurity=False)
+
+    def test_none_data_raises_type_error(self):
+        if not self.fips_enabled:
+            self.assertRaises(TypeError, hashlib.md5, None)
+            self.assertRaises(TypeError, md5, None)
+            self.assertRaises(
+                TypeError, md5, None, usedforsecurity=True)
+        else:
+            self.assertRaises(ValueError, hashlib.md5, None)
+            self.assertRaises(ValueError, md5, None)
+            self.assertRaises(
+                ValueError, md5, None, usedforsecurity=True)
+
+        self.assertRaises(
+            TypeError, md5, None, usedforsecurity=False)
+
 
 class ResellerConfReader(unittest.TestCase):
 
@@ -6080,6 +6275,136 @@ class TestAuditLocationGenerator(unittest.TestCase):
             self.assertEqual(list(locations),
                              [(obj_path, "drive", "partition2")])
 
+    def test_hooks(self):
+        with temptree([]) as tmpdir:
+            logger = FakeLogger()
+            data = os.path.join(tmpdir, "drive", "data")
+            os.makedirs(data)
+            partition = os.path.join(data, "partition1")
+            os.makedirs(partition)
+            suffix = os.path.join(partition, "suffix1")
+            os.makedirs(suffix)
+            hash_path = os.path.join(suffix, "hash1")
+            os.makedirs(hash_path)
+            obj_path = os.path.join(hash_path, "obj1.dat")
+            with open(obj_path, "w"):
+                pass
+            meta_path = os.path.join(hash_path, "obj1.meta")
+            with open(meta_path, "w"):
+                pass
+            hook_pre_device = MagicMock()
+            hook_post_device = MagicMock()
+            hook_pre_partition = MagicMock()
+            hook_post_partition = MagicMock()
+            hook_pre_suffix = MagicMock()
+            hook_post_suffix = MagicMock()
+            hook_pre_hash = MagicMock()
+            hook_post_hash = MagicMock()
+            locations = utils.audit_location_generator(
+                tmpdir, "data", ".dat", mount_check=False, logger=logger,
+                hook_pre_device=hook_pre_device,
+                hook_post_device=hook_post_device,
+                hook_pre_partition=hook_pre_partition,
+                hook_post_partition=hook_post_partition,
+                hook_pre_suffix=hook_pre_suffix,
+                hook_post_suffix=hook_post_suffix,
+                hook_pre_hash=hook_pre_hash,
+                hook_post_hash=hook_post_hash
+            )
+            list(locations)
+            hook_pre_device.assert_called_once_with(os.path.join(tmpdir,
+                                                                 "drive"))
+            hook_post_device.assert_called_once_with(os.path.join(tmpdir,
+                                                                  "drive"))
+            hook_pre_partition.assert_called_once_with(partition)
+            hook_post_partition.assert_called_once_with(partition)
+            hook_pre_suffix.assert_called_once_with(suffix)
+            hook_post_suffix.assert_called_once_with(suffix)
+            hook_pre_hash.assert_called_once_with(hash_path)
+            hook_post_hash.assert_called_once_with(hash_path)
+
+    def test_filters(self):
+        with temptree([]) as tmpdir:
+            logger = FakeLogger()
+            data = os.path.join(tmpdir, "drive", "data")
+            os.makedirs(data)
+            partition = os.path.join(data, "partition1")
+            os.makedirs(partition)
+            suffix = os.path.join(partition, "suffix1")
+            os.makedirs(suffix)
+            hash_path = os.path.join(suffix, "hash1")
+            os.makedirs(hash_path)
+            obj_path = os.path.join(hash_path, "obj1.dat")
+            with open(obj_path, "w"):
+                pass
+            meta_path = os.path.join(hash_path, "obj1.meta")
+            with open(meta_path, "w"):
+                pass
+
+            def audit_location_generator(**kwargs):
+                return utils.audit_location_generator(
+                    tmpdir, "data", ".dat", mount_check=False, logger=logger,
+                    **kwargs)
+
+            # Return the list of devices
+
+            with patch('os.listdir', side_effect=os.listdir) as m_listdir:
+                # devices_filter
+                m_listdir.reset_mock()
+                devices_filter = MagicMock(return_value=["drive"])
+                list(audit_location_generator(devices_filter=devices_filter))
+                devices_filter.assert_called_once_with(tmpdir, ["drive"])
+                self.assertIn(((data,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                devices_filter = MagicMock(return_value=[])
+                list(audit_location_generator(devices_filter=devices_filter))
+                devices_filter.assert_called_once_with(tmpdir, ["drive"])
+                self.assertNotIn(((data,),), m_listdir.call_args_list)
+
+                # partitions_filter
+                m_listdir.reset_mock()
+                partitions_filter = MagicMock(return_value=["partition1"])
+                list(audit_location_generator(
+                    partitions_filter=partitions_filter))
+                partitions_filter.assert_called_once_with(data,
+                                                          ["partition1"])
+                self.assertIn(((partition,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                partitions_filter = MagicMock(return_value=[])
+                list(audit_location_generator(
+                    partitions_filter=partitions_filter))
+                partitions_filter.assert_called_once_with(data,
+                                                          ["partition1"])
+                self.assertNotIn(((partition,),), m_listdir.call_args_list)
+
+                # suffixes_filter
+                m_listdir.reset_mock()
+                suffixes_filter = MagicMock(return_value=["suffix1"])
+                list(audit_location_generator(suffixes_filter=suffixes_filter))
+                suffixes_filter.assert_called_once_with(partition, ["suffix1"])
+                self.assertIn(((suffix,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                suffixes_filter = MagicMock(return_value=[])
+                list(audit_location_generator(suffixes_filter=suffixes_filter))
+                suffixes_filter.assert_called_once_with(partition, ["suffix1"])
+                self.assertNotIn(((suffix,),), m_listdir.call_args_list)
+
+                # hashes_filter
+                m_listdir.reset_mock()
+                hashes_filter = MagicMock(return_value=["hash1"])
+                list(audit_location_generator(hashes_filter=hashes_filter))
+                hashes_filter.assert_called_once_with(suffix, ["hash1"])
+                self.assertIn(((hash_path,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                hashes_filter = MagicMock(return_value=[])
+                list(audit_location_generator(hashes_filter=hashes_filter))
+                hashes_filter.assert_called_once_with(suffix, ["hash1"])
+                self.assertNotIn(((hash_path,),), m_listdir.call_args_list)
+
 
 class TestGreenAsyncPile(unittest.TestCase):
 
@@ -6475,6 +6800,16 @@ class TestParseContentDisposition(unittest.TestCase):
             'form-data;name="somefile";filename="test.html"')
         self.assertEqual(name, 'form-data')
         self.assertEqual(attrs, {'name': 'somefile', 'filename': 'test.html'})
+
+
+class TestGetExpirerContainer(unittest.TestCase):
+
+    @mock.patch.object(utils, 'hash_path', return_value=hex(101)[2:])
+    def test_get_expirer_container(self, mock_hash_path):
+        container = utils.get_expirer_container(1234, 20, 'a', 'c', 'o')
+        self.assertEqual(container, '0000001219')
+        container = utils.get_expirer_container(1234, 200, 'a', 'c', 'o')
+        self.assertEqual(container, '0000001199')
 
 
 class TestIterMultipartMimeDocuments(unittest.TestCase):
@@ -7224,7 +7559,8 @@ class TestShardRange(unittest.TestCase):
                       upper='', object_count=0, bytes_used=0,
                       meta_timestamp=ts_1.internal, deleted=0,
                       state=utils.ShardRange.FOUND,
-                      state_timestamp=ts_1.internal, epoch=None)
+                      state_timestamp=ts_1.internal, epoch=None,
+                      reported=0)
         assert_initialisation_ok(dict(empty_run, name='a/c', timestamp=ts_1),
                                  expect)
         assert_initialisation_ok(dict(name='a/c', timestamp=ts_1), expect)
@@ -7233,11 +7569,13 @@ class TestShardRange(unittest.TestCase):
                         upper='u', object_count=2, bytes_used=10,
                         meta_timestamp=ts_2, deleted=0,
                         state=utils.ShardRange.CREATED,
-                        state_timestamp=ts_3.internal, epoch=ts_4)
+                        state_timestamp=ts_3.internal, epoch=ts_4,
+                        reported=0)
         expect.update({'lower': 'l', 'upper': 'u', 'object_count': 2,
                        'bytes_used': 10, 'meta_timestamp': ts_2.internal,
                        'state': utils.ShardRange.CREATED,
-                       'state_timestamp': ts_3.internal, 'epoch': ts_4})
+                       'state_timestamp': ts_3.internal, 'epoch': ts_4,
+                       'reported': 0})
         assert_initialisation_ok(good_run.copy(), expect)
 
         # obj count and bytes used as int strings
@@ -7254,6 +7592,11 @@ class TestShardRange(unittest.TestCase):
         good_deleted['deleted'] = 1
         assert_initialisation_ok(good_deleted,
                                  dict(expect, deleted=1))
+
+        good_reported = good_run.copy()
+        good_reported['reported'] = 1
+        assert_initialisation_ok(good_reported,
+                                 dict(expect, reported=1))
 
         assert_initialisation_fails(dict(good_run, timestamp='water balloon'))
 
@@ -7293,7 +7636,7 @@ class TestShardRange(unittest.TestCase):
             'upper': upper, 'object_count': 10, 'bytes_used': 100,
             'meta_timestamp': ts_2.internal, 'deleted': 0,
             'state': utils.ShardRange.FOUND, 'state_timestamp': ts_3.internal,
-            'epoch': ts_4}
+            'epoch': ts_4, 'reported': 0}
         self.assertEqual(expected, sr_dict)
         self.assertIsInstance(sr_dict['lower'], six.string_types)
         self.assertIsInstance(sr_dict['upper'], six.string_types)
@@ -7308,6 +7651,14 @@ class TestShardRange(unittest.TestCase):
         for key in sr_dict:
             bad_dict = dict(sr_dict)
             bad_dict.pop(key)
+            if key == 'reported':
+                # This was added after the fact, and we need to be able to eat
+                # data from old servers
+                utils.ShardRange.from_dict(bad_dict)
+                utils.ShardRange(**bad_dict)
+                continue
+
+            # The rest were present from the beginning
             with self.assertRaises(KeyError):
                 utils.ShardRange.from_dict(bad_dict)
             # But __init__ still (generally) works!
@@ -7959,7 +8310,7 @@ class TestShardRange(unittest.TestCase):
     def test_make_path(self):
         ts = utils.Timestamp.now()
         actual = utils.ShardRange.make_path('a', 'root', 'parent', ts, 0)
-        parent_hash = hashlib.md5(b'parent').hexdigest()
+        parent_hash = md5(b'parent', usedforsecurity=False).hexdigest()
         self.assertEqual('a/root-%s-%s-0' % (parent_hash, ts.internal), actual)
         actual = utils.ShardRange.make_path('a', 'root', 'parent', ts, 3)
         self.assertEqual('a/root-%s-%s-3' % (parent_hash, ts.internal), actual)
@@ -8470,3 +8821,97 @@ class TestWatchdog(unittest.TestCase):
                 self.assertEqual(exc.seconds, 5.0)
                 self.assertEqual(None, w._next_expiration)
                 w._evt.wait.assert_called_once_with(None)
+
+
+class TestReiterate(unittest.TestCase):
+    def test_reiterate_consumes_first(self):
+        test_iter = FakeIterable([1, 2, 3])
+        reiterated = utils.reiterate(test_iter)
+        self.assertEqual(1, test_iter.next_call_count)
+        self.assertEqual(1, next(reiterated))
+        self.assertEqual(1, test_iter.next_call_count)
+        self.assertEqual(2, next(reiterated))
+        self.assertEqual(2, test_iter.next_call_count)
+        self.assertEqual(3, next(reiterated))
+        self.assertEqual(3, test_iter.next_call_count)
+
+    def test_reiterate_closes(self):
+        test_iter = FakeIterable([1, 2, 3])
+        self.assertEqual(0, test_iter.close_call_count)
+        reiterated = utils.reiterate(test_iter)
+        self.assertEqual(0, test_iter.close_call_count)
+        self.assertTrue(hasattr(reiterated, 'close'))
+        self.assertTrue(callable(reiterated.close))
+        reiterated.close()
+        self.assertEqual(1, test_iter.close_call_count)
+
+        # empty iter gets closed when reiterated
+        test_iter = FakeIterable([])
+        self.assertEqual(0, test_iter.close_call_count)
+        reiterated = utils.reiterate(test_iter)
+        self.assertFalse(hasattr(reiterated, 'close'))
+        self.assertEqual(1, test_iter.close_call_count)
+
+    def test_reiterate_list_or_tuple(self):
+        test_list = [1, 2]
+        reiterated = utils.reiterate(test_list)
+        self.assertIs(test_list, reiterated)
+        test_tuple = (1, 2)
+        reiterated = utils.reiterate(test_tuple)
+        self.assertIs(test_tuple, reiterated)
+
+
+class TestCloseableChain(unittest.TestCase):
+    def test_closeable_chain_iterates(self):
+        test_iter1 = FakeIterable([1])
+        test_iter2 = FakeIterable([2, 3])
+        chain = utils.CloseableChain(test_iter1, test_iter2)
+        self.assertEqual([1, 2, 3], [x for x in chain])
+
+        chain = utils.CloseableChain([1, 2], [3])
+        self.assertEqual([1, 2, 3], [x for x in chain])
+
+    def test_closeable_chain_closes(self):
+        test_iter1 = FakeIterable([1])
+        test_iter2 = FakeIterable([2, 3])
+        chain = utils.CloseableChain(test_iter1, test_iter2)
+        self.assertEqual(0, test_iter1.close_call_count)
+        self.assertEqual(0, test_iter2.close_call_count)
+        chain.close()
+        self.assertEqual(1, test_iter1.close_call_count)
+        self.assertEqual(1, test_iter2.close_call_count)
+
+        # check that close is safe to call even when component iters have no
+        # close
+        chain = utils.CloseableChain([1, 2], [3])
+        chain.close()
+        self.assertEqual([1, 2, 3], [x for x in chain])
+
+        # check with generator in the chain
+        generator_closed = [False]
+
+        def gen():
+            try:
+                yield 2
+                yield 3
+            except GeneratorExit:
+                generator_closed[0] = True
+                raise
+
+        test_iter1 = FakeIterable([1])
+        chain = utils.CloseableChain(test_iter1, gen())
+        self.assertEqual(0, test_iter1.close_call_count)
+        self.assertFalse(generator_closed[0])
+        chain.close()
+        self.assertEqual(1, test_iter1.close_call_count)
+        # Generator never kicked off, so there's no GeneratorExit
+        self.assertFalse(generator_closed[0])
+
+        test_iter1 = FakeIterable([1])
+        chain = utils.CloseableChain(gen(), test_iter1)
+        self.assertEqual(2, next(chain))  # Kick off the generator
+        self.assertEqual(0, test_iter1.close_call_count)
+        self.assertFalse(generator_closed[0])
+        chain.close()
+        self.assertEqual(1, test_iter1.close_call_count)
+        self.assertTrue(generator_closed[0])

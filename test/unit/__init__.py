@@ -23,7 +23,6 @@ import logging.handlers
 import sys
 from contextlib import contextmanager, closing
 from collections import defaultdict, Iterable
-from hashlib import md5
 import itertools
 from numbers import Number
 from tempfile import NamedTemporaryFile
@@ -48,8 +47,10 @@ from six.moves.http_client import HTTPException
 from swift.common import storage_policy, swob, utils
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
-from swift.common.utils import Timestamp, NOTICE
+from swift.common.utils import Timestamp, md5
 from test import get_config
+# import to namespace for backward compat
+from test.debug_logger import debug_logger, DebugLogger, FakeLogger  # noqa
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.ring import Ring, RingData, RingBuilder
 from swift.obj import server
@@ -65,7 +66,7 @@ class SkipTest(unittest.SkipTest):
     pass
 
 
-EMPTY_ETAG = md5().hexdigest()
+EMPTY_ETAG = md5(usedforsecurity=False).hexdigest()
 
 # try not to import this module from swift
 if not os.path.basename(sys.argv[0]).startswith('swift'):
@@ -178,7 +179,7 @@ class PatchPolicies(object):
 
         def unpatch_cleanup(cls_self):
             if cls_self._policies_patched:
-                self.__exit__()
+                self.__exit__(None, None, None)
                 cls_self._policies_patched = False
 
         def setUp(cls_self):
@@ -205,7 +206,7 @@ class PatchPolicies(object):
         try:
             self._setup_rings()
         except:  # noqa
-            self.__exit__()
+            self.__exit__(None, None, None)
             raise
 
     def __exit__(self, *args):
@@ -215,12 +216,13 @@ class PatchPolicies(object):
 class FakeRing(Ring):
 
     def __init__(self, replicas=3, max_more_nodes=0, part_power=0,
-                 base_port=1000):
+                 base_port=1000, separate_replication=False):
         self.serialized_path = '/foo/bar/object.ring.gz'
         self._base_port = base_port
         self.max_more_nodes = max_more_nodes
         self._part_shift = 32 - part_power
         self._init_device_char()
+        self.separate_replication = separate_replication
         # 9 total nodes (6 more past the initial 3) is the cap, no matter if
         # this is set higher, or R^2 for R replicas
         self.set_replicas(replicas)
@@ -256,11 +258,16 @@ class FakeRing(Ring):
         for x in range(self.replicas):
             ip = '10.0.0.%s' % x
             port = self._base_port + x
+            if self.separate_replication:
+                repl_ip = '10.0.1.%s' % x
+                repl_port = port + 100
+            else:
+                repl_ip, repl_port = ip, port
             dev = {
                 'ip': ip,
-                'replication_ip': ip,
+                'replication_ip': repl_ip,
                 'port': port,
-                'replication_port': port,
+                'replication_port': repl_port,
                 'device': self.device_char,
                 'zone': x % 3,
                 'region': x % 2,
@@ -278,10 +285,17 @@ class FakeRing(Ring):
     def get_more_nodes(self, part):
         index_counter = itertools.count()
         for x in range(self.replicas, (self.replicas + self.max_more_nodes)):
-            yield {'ip': '10.0.0.%s' % x,
-                   'replication_ip': '10.0.0.%s' % x,
-                   'port': self._base_port + x,
-                   'replication_port': self._base_port + x,
+            ip = '10.0.0.%s' % x
+            port = self._base_port + x
+            if self.separate_replication:
+                repl_ip = '10.0.1.%s' % x
+                repl_port = port + 100
+            else:
+                repl_ip, repl_port = ip, port
+            yield {'ip': ip,
+                   'replication_ip': repl_ip,
+                   'port': port,
+                   'replication_port': repl_port,
                    'device': 'sda',
                    'zone': x % 3,
                    'region': x % 2,
@@ -384,18 +398,29 @@ class FakeMemcache(object):
 
     def __init__(self):
         self.store = {}
+        self.calls = []
+
+    def clear_calls(self):
+        del self.calls[:]
+
+    def _called(self, method, key=None, value=None, time=None):
+        self.calls.append((method, key, value, time))
 
     def get(self, key):
+        self._called('get', key)
         return self.store.get(key)
 
     def keys(self):
+        self._called('keys')
         return self.store.keys()
 
     def set(self, key, value, time=0):
+        self._called('set', key, value, time)
         self.store[key] = value
         return True
 
     def incr(self, key, time=0):
+        self._called('incr', key, time=time)
         self.store[key] = self.store.setdefault(key, 0) + 1
         return self.store[key]
 
@@ -404,11 +429,34 @@ class FakeMemcache(object):
         yield True
 
     def delete(self, key):
+        self._called('delete', key)
         try:
             del self.store[key]
         except Exception:
             pass
         return True
+
+    def delete_all(self):
+        self.store.clear()
+
+
+class FakeIterable(object):
+    def __init__(self, values):
+        self.next_call_count = 0
+        self.close_call_count = 0
+        self.values = iter(values)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.next_call_count += 1
+        return next(self.values)
+
+    next = __next__  # py2
+
+    def close(self):
+        self.close_call_count += 1
 
 
 def readuntil2crlfs(fd):
@@ -505,194 +553,6 @@ class UnmockTimeModule(object):
 
 # logging.LogRecord.__init__ calls time.time
 logging.time = UnmockTimeModule()
-
-
-class WARN_DEPRECATED(Exception):
-    def __init__(self, msg):
-        self.msg = msg
-        print(self.msg)
-
-
-class FakeLogger(logging.Logger, object):
-    # a thread safe fake logger
-
-    def __init__(self, *args, **kwargs):
-        self._clear()
-        self.name = 'swift.unit.fake_logger'
-        self.level = logging.NOTSET
-        if 'facility' in kwargs:
-            self.facility = kwargs['facility']
-        self.statsd_client = None
-        self.thread_locals = None
-        self.parent = None
-
-    store_in = {
-        logging.ERROR: 'error',
-        logging.WARNING: 'warning',
-        logging.INFO: 'info',
-        logging.DEBUG: 'debug',
-        logging.CRITICAL: 'critical',
-        NOTICE: 'notice',
-    }
-
-    def warn(self, *args, **kwargs):
-        raise WARN_DEPRECATED("Deprecated Method warn use warning instead")
-
-    def notice(self, msg, *args, **kwargs):
-        """
-        Convenience function for syslog priority LOG_NOTICE. The python
-        logging lvl is set to 25, just above info.  SysLogHandler is
-        monkey patched to map this log lvl to the LOG_NOTICE syslog
-        priority.
-        """
-        self.log(NOTICE, msg, *args, **kwargs)
-
-    def _log(self, level, msg, *args, **kwargs):
-        store_name = self.store_in[level]
-        cargs = [msg]
-        if any(args):
-            cargs.extend(args)
-        captured = dict(kwargs)
-        if 'exc_info' in kwargs and \
-                not isinstance(kwargs['exc_info'], tuple):
-            captured['exc_info'] = sys.exc_info()
-        self.log_dict[store_name].append((tuple(cargs), captured))
-        super(FakeLogger, self)._log(level, msg, *args, **kwargs)
-
-    def _clear(self):
-        self.log_dict = defaultdict(list)
-        self.lines_dict = {'critical': [], 'error': [], 'info': [],
-                           'warning': [], 'debug': [], 'notice': []}
-
-    clear = _clear  # this is a public interface
-
-    def get_lines_for_level(self, level):
-        if level not in self.lines_dict:
-            raise KeyError(
-                "Invalid log level '%s'; valid levels are %s" %
-                (level,
-                 ', '.join("'%s'" % lvl for lvl in sorted(self.lines_dict))))
-        return self.lines_dict[level]
-
-    def all_log_lines(self):
-        return dict((level, msgs) for level, msgs in self.lines_dict.items()
-                    if len(msgs) > 0)
-
-    def _store_in(store_name):
-        def stub_fn(self, *args, **kwargs):
-            self.log_dict[store_name].append((args, kwargs))
-        return stub_fn
-
-    # mock out the StatsD logging methods:
-    update_stats = _store_in('update_stats')
-    increment = _store_in('increment')
-    decrement = _store_in('decrement')
-    timing = _store_in('timing')
-    timing_since = _store_in('timing_since')
-    transfer_rate = _store_in('transfer_rate')
-    set_statsd_prefix = _store_in('set_statsd_prefix')
-
-    def get_increments(self):
-        return [call[0][0] for call in self.log_dict['increment']]
-
-    def get_increment_counts(self):
-        counts = {}
-        for metric in self.get_increments():
-            if metric not in counts:
-                counts[metric] = 0
-            counts[metric] += 1
-        return counts
-
-    def setFormatter(self, obj):
-        self.formatter = obj
-
-    def close(self):
-        self._clear()
-
-    def set_name(self, name):
-        # don't touch _handlers
-        self._name = name
-
-    def acquire(self):
-        pass
-
-    def release(self):
-        pass
-
-    def createLock(self):
-        pass
-
-    def emit(self, record):
-        pass
-
-    def _handle(self, record):
-        try:
-            line = record.getMessage()
-        except TypeError:
-            print('WARNING: unable to format log message %r %% %r' % (
-                record.msg, record.args))
-            raise
-        self.lines_dict[record.levelname.lower()].append(line)
-
-    def handle(self, record):
-        self._handle(record)
-
-    def flush(self):
-        pass
-
-    def handleError(self, record):
-        pass
-
-    def isEnabledFor(self, level):
-        return True
-
-
-class DebugSwiftLogFormatter(utils.SwiftLogFormatter):
-
-    def format(self, record):
-        msg = super(DebugSwiftLogFormatter, self).format(record)
-        return msg.replace('#012', '\n')
-
-
-class DebugLogger(FakeLogger):
-    """A simple stdout logging version of FakeLogger"""
-
-    def __init__(self, *args, **kwargs):
-        FakeLogger.__init__(self, *args, **kwargs)
-        self.formatter = DebugSwiftLogFormatter(
-            "%(server)s %(levelname)s: %(message)s")
-
-    def handle(self, record):
-        self._handle(record)
-        print(self.formatter.format(record))
-
-
-class DebugLogAdapter(utils.LogAdapter):
-
-    def _send_to_logger(name):
-        def stub_fn(self, *args, **kwargs):
-            return getattr(self.logger, name)(*args, **kwargs)
-        return stub_fn
-
-    # delegate to FakeLogger's mocks
-    update_stats = _send_to_logger('update_stats')
-    increment = _send_to_logger('increment')
-    decrement = _send_to_logger('decrement')
-    timing = _send_to_logger('timing')
-    timing_since = _send_to_logger('timing_since')
-    transfer_rate = _send_to_logger('transfer_rate')
-    set_statsd_prefix = _send_to_logger('set_statsd_prefix')
-
-    def __getattribute__(self, name):
-        try:
-            return object.__getattribute__(self, name)
-        except AttributeError:
-            return getattr(self.__dict__['logger'], name)
-
-
-def debug_logger(name='test'):
-    """get a named adapted debug logger"""
-    return DebugLogAdapter(DebugLogger(), name)
 
 
 original_syslog_handler = logging.handlers.SysLogHandler
@@ -822,6 +682,11 @@ class FakeStatus(object):
             self.expect_sleep_list.append(None)
         self.response_sleep = response_sleep
 
+    def __repr__(self):
+        return '%s(%s, expect_status=%r, response_sleep=%s)' % (
+            self.__class__.__name__, self.status,
+            self.expect_status, self.response_sleep)
+
     def get_response_status(self):
         if self.response_sleep is not None:
             eventlet.sleep(self.response_sleep)
@@ -949,7 +814,8 @@ def fake_http_connect(*code_iter, **kwargs):
             etag = self.etag
             if not etag:
                 if isinstance(self.body, bytes):
-                    etag = '"' + md5(self.body).hexdigest() + '"'
+                    etag = ('"' + md5(
+                        self.body, usedforsecurity=False).hexdigest() + '"')
                 else:
                     etag = '"68b329da9893e34099c7d8ad5cb9c940"'
 
@@ -1016,6 +882,10 @@ def fake_http_connect(*code_iter, **kwargs):
         def getheader(self, name, default=None):
             return HeaderKeyDict(self.getheaders()).get(name, default)
 
+        def nuke_from_orbit(self):
+            # wrapped connections from buffered_http have this helper
+            self.close()
+
         def close(self):
             self.closed = True
 
@@ -1058,7 +928,7 @@ def fake_http_connect(*code_iter, **kwargs):
             # the code under test may swallow the StopIteration, so by logging
             # unexpected requests here we allow the test framework to check for
             # them after the connect function has been used.
-            unexpected_requests.append((args, kwargs))
+            unexpected_requests.append((args, ckwargs))
             raise
 
         if 'give_connect' in kwargs:
@@ -1078,10 +948,13 @@ def fake_http_connect(*code_iter, **kwargs):
             body = static_body or b''
         else:
             body = next(body_iter)
-        return FakeConn(status, etag, body=body, timestamp=timestamp,
+        conn = FakeConn(status, etag, body=body, timestamp=timestamp,
                         headers=headers, expect_headers=expect_headers,
                         connection_id=i, give_send=kwargs.get('give_send'),
                         give_expect=kwargs.get('give_expect'))
+        if 'capture_connections' in kwargs:
+            kwargs['capture_connections'].append(conn)
+        return conn
 
     connect.unexpected_requests = unexpected_requests
     connect.code_iter = code_iter
@@ -1092,6 +965,7 @@ def fake_http_connect(*code_iter, **kwargs):
 @contextmanager
 def mocked_http_conn(*args, **kwargs):
     requests = []
+    responses = []
 
     def capture_requests(ip, port, method, path, headers, qs, ssl):
         if six.PY2 and not isinstance(ip, bytes):
@@ -1107,8 +981,10 @@ def mocked_http_conn(*args, **kwargs):
         }
         requests.append(req)
     kwargs.setdefault('give_connect', capture_requests)
+    kwargs['capture_connections'] = responses
     fake_conn = fake_http_connect(*args, **kwargs)
     fake_conn.requests = requests
+    fake_conn.responses = responses
     with mocklib.patch('swift.common.bufferedhttp.http_connect_raw',
                        new=fake_conn):
         yield fake_conn
@@ -1116,8 +992,8 @@ def mocked_http_conn(*args, **kwargs):
         if left_over_status:
             raise AssertionError('left over status %r' % left_over_status)
         if fake_conn.unexpected_requests:
-            raise AssertionError('unexpected requests %r' %
-                                 fake_conn.unexpected_requests)
+            raise AssertionError('unexpected requests:\n%s' % '\n  '.join(
+                '%r' % (req,) for req in fake_conn.unexpected_requests))
 
 
 def make_timestamp_iter(offset=0):
@@ -1171,6 +1047,10 @@ class StubResponse(object):
             self.headers['X-Object-Sysmeta-Ec-Frag-Index'] = frag_index
         fake_reason = ('Fake', 'This response is a lie.')
         self.reason = swob.RESPONSE_REASONS.get(status, fake_reason)[0]
+
+    def nuke_from_orbit(self):
+        if hasattr(self, 'swift_conn'):
+            self.swift_conn.close()
 
     def getheader(self, header_name, default=None):
         return self.headers.get(header_name, default)
@@ -1227,7 +1107,7 @@ def make_ec_object_stub(test_body, policy, timestamp):
     test_body = test_body or (
         b'test' * segment_size)[:-random.randint(1, 1000)]
     timestamp = timestamp or utils.Timestamp.now()
-    etag = md5(test_body).hexdigest()
+    etag = md5(test_body, usedforsecurity=False).hexdigest()
     ec_archive_bodies = encode_frag_archive_bodies(policy, test_body)
 
     return {
@@ -1265,12 +1145,11 @@ def fake_ec_node_response(node_frags, policy):
     call_count = {}  # maps node index to get_response call count for node
 
     def _build_node_map(req, policy):
-        node_key = lambda n: (n['ip'], n['port'])
         part = utils.split_path(req['path'], 5, 5, True)[1]
         all_nodes.extend(policy.object_ring.get_part_nodes(part))
         all_nodes.extend(policy.object_ring.get_more_nodes(part))
         for i, node in enumerate(all_nodes):
-            node_map[node_key(node)] = i
+            node_map[(node['ip'], node['port'])] = i
             call_count[i] = 0
 
     # normalize node_frags to a list of fragments for each node even

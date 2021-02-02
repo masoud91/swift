@@ -21,12 +21,12 @@ import time
 import six
 
 from copy import deepcopy
-from hashlib import md5
 from six.moves.urllib.parse import quote, unquote
 
 import test.functional as tf
 
-from swift.common.utils import MD5_OF_EMPTY_STRING, config_true_value
+from swift.common.swob import normalize_etag
+from swift.common.utils import MD5_OF_EMPTY_STRING, config_true_value, md5
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
 
@@ -331,6 +331,82 @@ class TestObjectVersioning(TestObjectVersioningBase):
         # listing, though, we'll only ever have the two entries.
         self.assertTotalVersions(container, 2)
 
+    def test_get_if_match(self):
+        body = b'data'
+        oname = Utils.create_name()
+        obj = self.env.unversioned_container.file(oname)
+        resp = obj.write(body, return_resp=True)
+        etag = resp.getheader('etag')
+        self.assertEqual(
+            md5(body, usedforsecurity=False).hexdigest(),
+            normalize_etag(etag))
+
+        # un-versioned object is cool with with if-match
+        self.assertEqual(body, obj.read(hdrs={'if-match': etag}))
+        with self.assertRaises(ResponseError) as cm:
+            obj.read(hdrs={'if-match': 'not-the-etag'})
+        self.assertEqual(412, cm.exception.status)
+
+        v_obj = self.env.container.file(oname)
+        resp = v_obj.write(body, return_resp=True)
+        self.assertEqual(resp.getheader('etag'), etag)
+
+        # versioned object is too with with if-match
+        self.assertEqual(body, v_obj.read(hdrs={
+            'if-match': normalize_etag(etag)}))
+        # works quoted, too
+        self.assertEqual(body, v_obj.read(hdrs={
+            'if-match': '"%s"' % normalize_etag(etag)}))
+        with self.assertRaises(ResponseError) as cm:
+            v_obj.read(hdrs={'if-match': 'not-the-etag'})
+        self.assertEqual(412, cm.exception.status)
+
+    def test_container_acls(self):
+        if tf.skip3:
+            raise SkipTest('Username3 not set')
+
+        obj = self.env.container.file(Utils.create_name())
+        resp = obj.write(b"data", return_resp=True)
+        version_id = resp.getheader('x-object-version-id')
+        self.assertIsNotNone(version_id)
+
+        with self.assertRaises(ResponseError) as cm:
+            obj.read(hdrs={'X-Auth-Token': self.env.conn3.storage_token})
+        self.assertEqual(403, cm.exception.status)
+
+        # Container ACLs work more or less like they always have
+        self.env.container.update_metadata(
+            hdrs={'X-Container-Read': self.env.conn3.user_acl})
+        self.assertEqual(b"data", obj.read(hdrs={
+            'X-Auth-Token': self.env.conn3.storage_token}))
+
+        # But the version-specifc GET still requires a swift owner
+        with self.assertRaises(ResponseError) as cm:
+            obj.read(hdrs={'X-Auth-Token': self.env.conn3.storage_token},
+                     parms={'version-id': version_id})
+        self.assertEqual(403, cm.exception.status)
+
+        # If it's pointing to a symlink that points elsewhere, that still needs
+        # to be authed
+        tgt_name = Utils.create_name()
+        self.env.unversioned_container.file(tgt_name).write(b'link')
+        sym_tgt_header = quote(unquote('%s/%s' % (
+            self.env.unversioned_container.name, tgt_name)))
+        obj.write(hdrs={'X-Symlink-Target': sym_tgt_header})
+
+        # So, user1's good...
+        self.assertEqual(b'link', obj.read())
+        # ...but user3 can't
+        with self.assertRaises(ResponseError) as cm:
+            obj.read(hdrs={'X-Auth-Token': self.env.conn3.storage_token})
+        self.assertEqual(403, cm.exception.status)
+
+        # unless we add the acl to the unversioned_container
+        self.env.unversioned_container.update_metadata(
+            hdrs={'X-Container-Read': self.env.conn3.user_acl})
+        self.assertEqual(b'link', obj.read(
+            hdrs={'X-Auth-Token': self.env.conn3.storage_token}))
+
     def _test_overwriting_setup(self, obj_name=None):
         # sanity
         container = self.env.container
@@ -494,7 +570,7 @@ class TestObjectVersioning(TestObjectVersioningBase):
             'name': obj_name,
             'content_type': version['content_type'],
             'version_id': version['version_id'],
-            'hash': md5(version['body']).hexdigest(),
+            'hash': md5(version['body'], usedforsecurity=False).hexdigest(),
             'bytes': len(version['body'],)
         } for version in reversed(versions)]
         for item, is_latest in zip(expected, (True, False, False)):
@@ -919,13 +995,13 @@ class TestObjectVersioning(TestObjectVersioningBase):
             'Content-Type': 'text/jibberish32'
         }, return_resp=True)
         v1_version_id = resp.getheader('x-object-version-id')
-        v1_etag = resp.getheader('etag')
+        v1_etag = normalize_etag(resp.getheader('etag'))
 
         resp = obj.write(b'version2', hdrs={
             'Content-Type': 'text/jibberish33'
         }, return_resp=True)
         v2_version_id = resp.getheader('x-object-version-id')
-        v2_etag = resp.getheader('etag')
+        v2_etag = normalize_etag(resp.getheader('etag'))
 
         # sanity
         self.assertEqual(b'version2', obj.read())
@@ -992,7 +1068,7 @@ class TestObjectVersioning(TestObjectVersioningBase):
         self.assertEqual(b'version1', obj.read())
         obj_info = obj.info()
         self.assertEqual('text/jibberish32', obj_info['content_type'])
-        self.assertEqual(v1_etag, obj_info['etag'])
+        self.assertEqual(v1_etag, normalize_etag(obj_info['etag']))
 
     def test_delete_with_version_api_old_object(self):
         versioned_obj_name = Utils.create_name()
@@ -1188,14 +1264,14 @@ class TestContainerOperations(TestObjectVersioningBase):
         # v1
         resp = obj.write(b'version1', hdrs={
             'Content-Type': 'text/jibberish11',
-            'ETag': md5(b'version1').hexdigest(),
+            'ETag': md5(b'version1', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj1_v1['id'] = resp.getheader('x-object-version-id')
 
         # v2
         resp = obj.write(b'version2', hdrs={
             'Content-Type': 'text/jibberish12',
-            'ETag': md5(b'version2').hexdigest(),
+            'ETag': md5(b'version2', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj1_v2 = {}
         obj1_v2['name'] = obj1_v1['name']
@@ -1204,7 +1280,7 @@ class TestContainerOperations(TestObjectVersioningBase):
         # v3
         resp = obj.write(b'version3', hdrs={
             'Content-Type': 'text/jibberish13',
-            'ETag': md5(b'version3').hexdigest(),
+            'ETag': md5(b'version3', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj1_v3 = {}
         obj1_v3['name'] = obj1_v1['name']
@@ -1258,20 +1334,20 @@ class TestContainerOperations(TestObjectVersioningBase):
         obj = self.env.unversioned_container.file(objs[0])
         obj.write(b'data', hdrs={
             'Content-Type': 'text/jibberish11',
-            'ETag': md5(b'data').hexdigest(),
+            'ETag': md5(b'data', usedforsecurity=False).hexdigest(),
         })
         obj.delete()
 
         obj = self.env.unversioned_container.file(objs[1])
         obj.write(b'first', hdrs={
             'Content-Type': 'text/blah-blah-blah',
-            'ETag': md5(b'first').hexdigest(),
+            'ETag': md5(b'first', usedforsecurity=False).hexdigest(),
         })
 
         obj = self.env.unversioned_container.file(objs[2])
         obj.write(b'second', hdrs={
             'Content-Type': 'text/plain',
-            'ETag': md5(b'second').hexdigest(),
+            'ETag': md5(b'second', usedforsecurity=False).hexdigest(),
         })
         return objs
 
@@ -1310,21 +1386,21 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v3['name'],
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v3['id'],
         }, {
             'name': obj1_v2['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }])
@@ -1343,21 +1419,21 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }, {
             'name': obj1_v2['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v3['name'],
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v3['id'],
         }, {
@@ -1406,21 +1482,21 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v3['name'],
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v3['id'],
         }, {
             'name': obj1_v2['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }])
@@ -1441,21 +1517,21 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v3['id'],
         }, {
@@ -1526,7 +1602,7 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v3['name'],
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v3['id'],
         }])
@@ -1548,14 +1624,14 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v2['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }])
@@ -1615,14 +1691,14 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj1_v2['name'],
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v2['id'],
         }, {
             'name': obj1_v1['name'],
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj1_v1['id'],
         }])
@@ -1977,7 +2053,7 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj2,
             'bytes': 5,
             'content_type': 'text/blah-blah-blah',
-            'hash': md5(b'first').hexdigest(),
+            'hash': md5(b'first', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null',
         }
@@ -1985,7 +2061,7 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj3,
             'bytes': 6,
             'content_type': 'text/plain',
-            'hash': md5(b'second').hexdigest(),
+            'hash': md5(b'second', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null',
         }
@@ -2037,14 +2113,14 @@ class TestContainerOperations(TestObjectVersioningBase):
         # v1
         resp = obj.write(b'version1', hdrs={
             'Content-Type': 'text/jibberish11',
-            'ETag': md5(b'version1').hexdigest(),
+            'ETag': md5(b'version1', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj_v1 = resp.getheader('x-object-version-id')
 
         # v2
         resp = obj.write(b'version2', hdrs={
             'Content-Type': 'text/jibberish12',
-            'ETag': md5(b'version2').hexdigest(),
+            'ETag': md5(b'version2', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj_v2 = resp.getheader('x-object-version-id')
 
@@ -2055,7 +2131,7 @@ class TestContainerOperations(TestObjectVersioningBase):
 
         resp = obj.write(b'version4', hdrs={
             'Content-Type': 'text/jibberish14',
-            'ETag': md5(b'version4').hexdigest(),
+            'ETag': md5(b'version4', usedforsecurity=False).hexdigest(),
         }, return_resp=True)
         obj_v4 = resp.getheader('x-object-version-id')
 
@@ -2068,7 +2144,7 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish14',
-            'hash': md5(b'version4').hexdigest(),
+            'hash': md5(b'version4', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': obj_v4,
         }, {
@@ -2082,14 +2158,14 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj_v2,
         }, {
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj_v1,
         }])
@@ -2100,7 +2176,7 @@ class TestContainerOperations(TestObjectVersioningBase):
         # v5 - non-versioned
         obj.write(b'version5', hdrs={
             'Content-Type': 'text/jibberish15',
-            'ETag': md5(b'version5').hexdigest(),
+            'ETag': md5(b'version5', usedforsecurity=False).hexdigest(),
         })
 
         listing_parms = {'format': 'json', 'versions': None}
@@ -2112,14 +2188,14 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish15',
-            'hash': md5(b'version5').hexdigest(),
+            'hash': md5(b'version5', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null',
         }, {
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish14',
-            'hash': md5(b'version4').hexdigest(),
+            'hash': md5(b'version4', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj_v4,
         }, {
@@ -2133,14 +2209,14 @@ class TestContainerOperations(TestObjectVersioningBase):
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj_v2,
         }, {
             'name': obj.name,
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': False,
             'version_id': obj_v1,
         }])
@@ -2308,7 +2384,7 @@ class TestSloWithVersioning(TestObjectVersioningBase):
         expected = {
             'bytes': file_info['content_length'],
             'content_type': 'application/octet-stream',
-            'hash': manifest_info['etag'],
+            'hash': normalize_etag(manifest_info['etag']),
             'name': 'my-slo-manifest',
             'slo_etag': file_info['etag'],
             'version_symlink': True,
@@ -2340,7 +2416,7 @@ class TestSloWithVersioning(TestObjectVersioningBase):
         expected = {
             'bytes': file_info['content_length'],
             'content_type': 'application/octet-stream',
-            'hash': manifest_info['etag'],
+            'hash': normalize_etag(manifest_info['etag']),
             'name': 'my-slo-manifest',
             'slo_etag': file_info['etag'],
             'version_symlink': True,
@@ -2421,19 +2497,19 @@ class TestVersionsLocationWithVersioning(TestObjectVersioningBase):
         # v1
         obj.write(b'version1', hdrs={
             'Content-Type': 'text/jibberish11',
-            'ETag': md5(b'version1').hexdigest(),
+            'ETag': md5(b'version1', usedforsecurity=False).hexdigest(),
         })
 
         # v2
         obj.write(b'version2', hdrs={
             'Content-Type': 'text/jibberish12',
-            'ETag': md5(b'version2').hexdigest(),
+            'ETag': md5(b'version2', usedforsecurity=False).hexdigest(),
         })
 
         # v3
         obj.write(b'version3', hdrs={
             'Content-Type': 'text/jibberish13',
-            'ETag': md5(b'version3').hexdigest(),
+            'ETag': md5(b'version3', usedforsecurity=False).hexdigest(),
         })
 
         return obj
@@ -2451,7 +2527,7 @@ class TestVersionsLocationWithVersioning(TestObjectVersioningBase):
             'name': obj_name,
             'bytes': 8,
             'content_type': 'text/jibberish13',
-            'hash': md5(b'version3').hexdigest(),
+            'hash': md5(b'version3', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null'
         }])
@@ -2468,13 +2544,13 @@ class TestVersionsLocationWithVersioning(TestObjectVersioningBase):
         self.assertEqual(prev_versions, [{
             'bytes': 8,
             'content_type': 'text/jibberish11',
-            'hash': md5(b'version1').hexdigest(),
+            'hash': md5(b'version1', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null',
         }, {
             'bytes': 8,
             'content_type': 'text/jibberish12',
-            'hash': md5(b'version2').hexdigest(),
+            'hash': md5(b'version2', usedforsecurity=False).hexdigest(),
             'is_latest': True,
             'version_id': 'null'
         }])
@@ -2688,16 +2764,11 @@ class TestVersioningContainerTempurl(TestObjectVersioningBase):
         obj.write(b"version2")
 
         # get v2 object (reading from versions container)
-        # cross container tempurl does not work for container tempurl key
-        try:
-            obj.read(parms=get_parms, cfg={'no_auth_token': True})
-        except ResponseError as e:
-            self.assertEqual(e.status, 401)
-        else:
-            self.fail('request did not error')
-        try:
-            obj.info(parms=get_parms, cfg={'no_auth_token': True})
-        except ResponseError as e:
-            self.assertEqual(e.status, 401)
-        else:
-            self.fail('request did not error')
+        # versioning symlink allows us to bypass the normal
+        # container-tempurl-key scoping
+        contents = obj.read(parms=get_parms, cfg={'no_auth_token': True})
+        self.assert_status([200])
+        self.assertEqual(contents, b"version2")
+        # HEAD works, too
+        obj.info(parms=get_parms, cfg={'no_auth_token': True})
+        self.assert_status([200])

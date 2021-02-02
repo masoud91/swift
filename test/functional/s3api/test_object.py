@@ -24,13 +24,13 @@ from distutils.version import StrictVersion
 import email.parser
 from email.utils import formatdate, parsedate
 from time import mktime
-from hashlib import md5
 import six
 from six.moves.urllib.parse import quote
 
 import test.functional as tf
 
 from swift.common.middleware.s3api.etree import fromstring
+from swift.common.utils import md5
 
 from test.functional.s3api import S3ApiBase
 from test.functional.s3api.s3_test_client import Connection
@@ -61,7 +61,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_object(self):
         obj = 'object name with %-sign'
         content = b'abc123'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
 
         # PUT Object
         status, headers, body = \
@@ -147,7 +147,7 @@ class TestS3ApiObject(S3ApiBase):
         self.assertCommonResponseHeaders(headers)
 
     def test_put_object_error(self):
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', self.bucket, 'object')
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -166,7 +166,7 @@ class TestS3ApiObject(S3ApiBase):
         dst_obj = 'dst_object'
 
         headers = {'x-amz-copy-source': '/%s/%s' % (self.bucket, obj)}
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', dst_bucket, dst_obj, headers)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -197,7 +197,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('GET', self.bucket, obj)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -216,7 +216,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('HEAD', self.bucket, obj)
         self.assertEqual(status, 403)
@@ -239,7 +239,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('DELETE', self.bucket, obj)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -252,7 +252,7 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_content_encoding(self):
         obj = 'object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         headers = {'Content-Encoding': 'gzip'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers)
@@ -267,7 +267,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_content_md5(self):
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Content-MD5': calculate_md5(content)}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -278,7 +278,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_content_type(self):
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Content-Type': 'text/plain'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -320,7 +320,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_expect(self):
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Expect': '100-continue'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -333,7 +333,7 @@ class TestS3ApiObject(S3ApiBase):
             expected_headers = req_headers
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj,
                                    req_headers, content)
@@ -389,7 +389,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_storage_class(self):
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'X-Amz-Storage-Class': 'STANDARD'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -435,7 +435,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_copy_source(self):
         obj = 'object'
         content = b'abcdefghij'
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj, body=content)
 
         dst_bucket = 'dst-bucket'
@@ -521,7 +521,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -541,7 +541,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -561,7 +561,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -580,7 +580,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 

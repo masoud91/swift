@@ -26,7 +26,6 @@ import traceback
 import socket
 import math
 from swift import gettext_ as _
-from hashlib import md5
 
 from eventlet import sleep, wsgi, Timeout, tpool
 from eventlet.greenthread import spawn
@@ -37,7 +36,7 @@ from swift.common.utils import public, get_logger, \
     get_expirer_container, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
     config_auto_int_value, split_path, get_redirect_data, \
-    normalize_timestamp
+    normalize_timestamp, md5
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
@@ -145,7 +144,7 @@ class ObjectController(BaseStorageServer):
         self.container_update_timeout = float(
             conf.get('container_update_timeout', 1))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
-        self.client_timeout = int(conf.get('client_timeout', 60))
+        self.client_timeout = float(conf.get('client_timeout', 60))
         self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
         self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
         self.log_requests = config_true_value(conf.get('log_requests', 'true'))
@@ -583,7 +582,7 @@ class ObjectController(BaseStorageServer):
         footer_md5 = footer_hdrs.get('Content-MD5')
         if not footer_md5:
             raise HTTPBadRequest(body="no Content-MD5 in footer")
-        if footer_md5 != md5(footer_body).hexdigest():
+        if footer_md5 != md5(footer_body, usedforsecurity=False).hexdigest():
             raise HTTPUnprocessableEntity(body="footer MD5 mismatch")
 
         try:
@@ -1049,7 +1048,9 @@ class ObjectController(BaseStorageServer):
             if multi_stage_mime_state:
                 self._send_multi_stage_continue_headers(
                     request, **multi_stage_mime_state)
-            writer.commit(request.timestamp)
+            if not config_true_value(
+                    request.headers.get('X-Backend-No-Commit', False)):
+                writer.commit(request.timestamp)
             if multi_stage_mime_state:
                 self._drain_mime_request(**multi_stage_mime_state)
         except (DiskFileXattrNotSupported, DiskFileNoSpace):
@@ -1298,7 +1299,8 @@ class ObjectController(BaseStorageServer):
         suffixes = suffix_parts.split('-') if suffix_parts else []
         try:
             hashes = self._diskfile_router[policy].get_hashes(
-                device, partition, suffixes, policy)
+                device, partition, suffixes, policy,
+                skip_rehash=bool(suffixes))
         except DiskFileDeviceUnavailable:
             resp = HTTPInsufficientStorage(drive=device, request=request)
         else:
@@ -1310,7 +1312,14 @@ class ObjectController(BaseStorageServer):
     @replication
     @timing_stats(sample_rate=0.1)
     def SSYNC(self, request):
-        return Response(app_iter=ssync_receiver.Receiver(self, request)())
+        # the ssync sender may want to send PUT subrequests for non-durable
+        # data that should not be committed; legacy behaviour has been to
+        # commit all PUTs (subject to EC footer metadata), so we need to
+        # indicate to the sender that this object server has been upgraded to
+        # understand the X-Backend-No-Commit header.
+        headers = {'X-Backend-Accept-No-Commit': True}
+        return Response(app_iter=ssync_receiver.Receiver(self, request)(),
+                        headers=headers)
 
     def __call__(self, env, start_response):
         """WSGI Application entry point for the Swift Object Server."""

@@ -12,7 +12,6 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
 import os
 import shutil
 import tempfile
@@ -20,7 +19,7 @@ import unittest
 
 from swift.common import utils
 from swift.common.storage_policy import POLICIES
-from swift.common.utils import Timestamp
+from swift.common.utils import Timestamp, md5
 
 
 def write_diskfile(df, timestamp, data=b'test data', frag_index=None,
@@ -31,7 +30,7 @@ def write_diskfile(df, timestamp, data=b'test data', frag_index=None,
     with df.create() as writer:
         writer.write(data)
         metadata = {
-            'ETag': hashlib.md5(data).hexdigest(),
+            'ETag': md5(data, usedforsecurity=False).hexdigest(),
             'X-Timestamp': timestamp.internal,
             'Content-Length': str(len(data)),
         }
@@ -71,10 +70,10 @@ class BaseTest(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _make_diskfile(self, device='dev', partition='9',
-                       account='a', container='c', obj='o', body='test',
+                       account='a', container='c', obj='o', body=b'test',
                        extra_metadata=None, policy=None,
                        frag_index=None, timestamp=None, df_mgr=None,
-                       commit=True, verify=True):
+                       commit=True, verify=True, **kwargs):
         policy = policy or POLICIES.legacy
         object_parts = account, container, obj
         timestamp = Timestamp.now() if timestamp is None else timestamp
@@ -82,7 +81,7 @@ class BaseTest(unittest.TestCase):
             df_mgr = self.daemon._df_router[policy]
         df = df_mgr.get_diskfile(
             device, partition, *object_parts, policy=policy,
-            frag_index=frag_index)
+            frag_index=frag_index, **kwargs)
         write_diskfile(df, timestamp, data=body, extra_metadata=extra_metadata,
                        commit=commit)
         if commit and verify:
@@ -100,9 +99,10 @@ class BaseTest(unittest.TestCase):
     def _make_open_diskfile(self, device='dev', partition='9',
                             account='a', container='c', obj='o', body=b'test',
                             extra_metadata=None, policy=None,
-                            frag_index=None, timestamp=None, df_mgr=None):
+                            frag_index=None, timestamp=None, df_mgr=None,
+                            commit=True, **kwargs):
         df = self._make_diskfile(device, partition, account, container, obj,
                                  body, extra_metadata, policy, frag_index,
-                                 timestamp, df_mgr)
+                                 timestamp, df_mgr, commit, **kwargs)
         df.open()
         return df

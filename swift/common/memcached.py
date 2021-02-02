@@ -50,13 +50,13 @@ import json
 import logging
 import time
 from bisect import bisect
-from hashlib import md5
 
 from eventlet.green import socket
 from eventlet.pools import Pool
 from eventlet import Timeout
 from six.moves import range
 from swift.common import utils
+from swift.common.utils import md5
 
 DEFAULT_MEMCACHED_PORT = 11211
 
@@ -72,8 +72,7 @@ TRY_COUNT = 3
 # if ERROR_LIMIT_COUNT errors occur in ERROR_LIMIT_TIME seconds, the server
 # will be considered failed for ERROR_LIMIT_DURATION seconds.
 ERROR_LIMIT_COUNT = 10
-ERROR_LIMIT_TIME = 60
-ERROR_LIMIT_DURATION = 60
+ERROR_LIMIT_TIME = ERROR_LIMIT_DURATION = 60
 
 
 def md5hash(key):
@@ -82,7 +81,7 @@ def md5hash(key):
             key = key.encode('utf-8')
         else:
             key = key.encode('utf-8', errors='surrogateescape')
-    return md5(key).hexdigest().encode('ascii')
+    return md5(key, usedforsecurity=False).hexdigest().encode('ascii')
 
 
 def sanitize_timeout(timeout):
@@ -128,11 +127,12 @@ class MemcacheConnPool(Pool):
     :func:`swift.common.utils.parse_socket_string` for details.
     """
 
-    def __init__(self, server, size, connect_timeout):
+    def __init__(self, server, size, connect_timeout, tls_context=None):
         Pool.__init__(self, max_size=size)
         self.host, self.port = utils.parse_socket_string(
             server, DEFAULT_MEMCACHED_PORT)
         self._connect_timeout = connect_timeout
+        self._tls_context = tls_context
 
     def create(self):
         addrs = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC,
@@ -142,6 +142,9 @@ class MemcacheConnPool(Pool):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with Timeout(self._connect_timeout):
             sock.connect(sockaddr)
+        if self._tls_context:
+            sock = self._tls_context.wrap_socket(sock,
+                                                 server_hostname=self.host)
         return (sock.makefile('rwb'), sock)
 
     def get(self):
@@ -160,36 +163,47 @@ class MemcacheRing(object):
     def __init__(self, servers, connect_timeout=CONN_TIMEOUT,
                  io_timeout=IO_TIMEOUT, pool_timeout=POOL_TIMEOUT,
                  tries=TRY_COUNT, allow_pickle=False, allow_unpickle=False,
-                 max_conns=2):
+                 max_conns=2, tls_context=None, logger=None,
+                 error_limit_count=ERROR_LIMIT_COUNT,
+                 error_limit_time=ERROR_LIMIT_TIME,
+                 error_limit_duration=ERROR_LIMIT_DURATION):
         self._ring = {}
         self._errors = dict(((serv, []) for serv in servers))
         self._error_limited = dict(((serv, 0) for serv in servers))
+        self._error_limit_count = error_limit_count
+        self._error_limit_time = error_limit_time
+        self._error_limit_duration = error_limit_duration
         for server in sorted(servers):
             for i in range(NODE_WEIGHT):
                 self._ring[md5hash('%s-%s' % (server, i))] = server
         self._tries = tries if tries <= len(servers) else len(servers)
         self._sorted = sorted(self._ring)
-        self._client_cache = dict(((server,
-                                    MemcacheConnPool(server, max_conns,
-                                                     connect_timeout))
-                                  for server in servers))
+        self._client_cache = dict((
+            (server, MemcacheConnPool(server, max_conns, connect_timeout,
+                                      tls_context=tls_context))
+            for server in servers))
         self._connect_timeout = connect_timeout
         self._io_timeout = io_timeout
         self._pool_timeout = pool_timeout
         self._allow_pickle = allow_pickle
         self._allow_unpickle = allow_unpickle or allow_pickle
+        if logger is None:
+            self.logger = logging.getLogger()
+        else:
+            self.logger = logger
 
     def _exception_occurred(self, server, e, action='talking',
                             sock=None, fp=None, got_connection=True):
         if isinstance(e, Timeout):
-            logging.error("Timeout %(action)s to memcached: %(server)s",
-                          {'action': action, 'server': server})
-        elif isinstance(e, (socket.error, MemcacheConnectionError)):
-            logging.error("Error %(action)s to memcached: %(server)s: %(err)s",
-                          {'action': action, 'server': server, 'err': e})
-        else:
-            logging.exception("Error %(action)s to memcached: %(server)s",
+            self.logger.error("Timeout %(action)s to memcached: %(server)s",
                               {'action': action, 'server': server})
+        elif isinstance(e, (socket.error, MemcacheConnectionError)):
+            self.logger.error(
+                "Error %(action)s to memcached: %(server)s: %(err)s",
+                {'action': action, 'server': server, 'err': e})
+        else:
+            self.logger.exception("Error %(action)s to memcached: %(server)s",
+                                  {'action': action, 'server': server})
         try:
             if fp:
                 fp.close()
@@ -206,14 +220,18 @@ class MemcacheRing(object):
             # We need to return something to the pool
             # A new connection will be created the next time it is retrieved
             self._return_conn(server, None, None)
+
+        if self._error_limit_time <= 0 or self._error_limit_duration <= 0:
+            return
+
         now = time.time()
-        self._errors[server].append(time.time())
-        if len(self._errors[server]) > ERROR_LIMIT_COUNT:
+        self._errors[server].append(now)
+        if len(self._errors[server]) > self._error_limit_count:
             self._errors[server] = [err for err in self._errors[server]
-                                    if err > now - ERROR_LIMIT_TIME]
-            if len(self._errors[server]) > ERROR_LIMIT_COUNT:
-                self._error_limited[server] = now + ERROR_LIMIT_DURATION
-                logging.error('Error limiting server %s', server)
+                                    if err > now - self._error_limit_time]
+            if len(self._errors[server]) > self._error_limit_count:
+                self._error_limited[server] = now + self._error_limit_duration
+                self.logger.error('Error limiting server %s', server)
 
     def _get_conns(self, key):
         """
@@ -285,7 +303,14 @@ class MemcacheRing(object):
                 with Timeout(self._io_timeout):
                     sock.sendall(set_msg(key, flags, timeout, value))
                     # Wait for the set to complete
-                    fp.readline()
+                    msg = fp.readline().strip()
+                    if msg != b'STORED':
+                        if not six.PY2:
+                            msg = msg.decode('ascii')
+                        self.logger.error(
+                            "Error setting value in memcached: "
+                            "%(server)s: %(msg)s",
+                            {'server': server, 'msg': msg})
                     self._return_conn(server, fp, sock)
                     return
             except (Exception, Timeout) as e:

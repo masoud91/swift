@@ -15,7 +15,7 @@ import itertools
 import json
 import os
 import sqlite3
-from hashlib import md5
+from collections import defaultdict
 
 from six.moves import urllib
 
@@ -31,6 +31,7 @@ from swift.obj.diskfile import get_data_dir, read_metadata, DATADIR_BASE, \
     extract_policy
 from swift.common.storage_policy import POLICIES
 from swift.common.middleware.crypto.crypto_utils import load_crypto_meta
+from swift.common.utils import md5
 
 
 class InfoSystemExit(Exception):
@@ -57,6 +58,8 @@ def parse_get_node_args(options, args):
         else:
             raise InfoSystemExit('Ring file does not exist')
 
+    if options.quoted:
+        args = [urllib.parse.unquote(arg) for arg in args]
     if len(args) == 1:
         args = args[0].strip('/').split('/', 2)
 
@@ -90,7 +93,7 @@ def curl_head_command(ip, port, device, part, target, policy_index):
     else:
         formatted_ip = ip
 
-    cmd = 'curl -g -I -XHEAD "http://%s:%s/%s/%s/%s"' % (
+    cmd = 'curl --path-as-is -g -I -XHEAD "http://%s:%s/%s/%s/%s"' % (
         formatted_ip, port, device, part, urllib.parse.quote(target))
     if policy_index is not None:
         cmd += ' -H "%s: %s"' % ('X-Backend-Storage-Policy-Index',
@@ -193,7 +196,8 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
           'real value is set in the config file on each storage node.')
 
 
-def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False):
+def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False,
+                           verbose=False):
     """
     print out data base info/metadata based on its type
 
@@ -307,20 +311,31 @@ def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False):
         print('  Type: %s' % shard_type)
         print('  State: %s' % info['db_state'])
     if info.get('shard_ranges'):
-        print('Shard Ranges (%d):' % len(info['shard_ranges']))
+        num_shards = len(info['shard_ranges'])
+        print('Shard Ranges (%d):' % num_shards)
+        count_by_state = defaultdict(int)
         for srange in info['shard_ranges']:
-            srange = dict(srange, state_text=srange.state_text)
-            print('  Name: %(name)s' % srange)
-            print('    lower: %(lower)r, upper: %(upper)r' % srange)
-            print('    Object Count: %(object_count)d, Bytes Used: '
-                  '%(bytes_used)d, State: %(state_text)s (%(state)d)'
-                  % srange)
-            print('    Created at: %s (%s)'
-                  % (Timestamp(srange['timestamp']).isoformat,
-                     srange['timestamp']))
-            print('    Meta Timestamp: %s (%s)'
-                  % (Timestamp(srange['meta_timestamp']).isoformat,
-                     srange['meta_timestamp']))
+            count_by_state[(srange.state, srange.state_text)] += 1
+        print('  States:')
+        for key_state, count in sorted(count_by_state.items()):
+            key, state = key_state
+            print('    %9s: %s' % (state, count))
+        if verbose:
+            for srange in info['shard_ranges']:
+                srange = dict(srange, state_text=srange.state_text)
+                print('  Name: %(name)s' % srange)
+                print('    lower: %(lower)r, upper: %(upper)r' % srange)
+                print('    Object Count: %(object_count)d, Bytes Used: '
+                      '%(bytes_used)d, State: %(state_text)s (%(state)d)'
+                      % srange)
+                print('    Created at: %s (%s)'
+                      % (Timestamp(srange['timestamp']).isoformat,
+                         srange['timestamp']))
+                print('    Meta Timestamp: %s (%s)'
+                      % (Timestamp(srange['meta_timestamp']).isoformat,
+                         srange['meta_timestamp']))
+        else:
+            print('(Use -v/--verbose to show more Shard Ranges details)')
 
 
 def print_obj_metadata(metadata, drop_prefixes=False):
@@ -418,7 +433,7 @@ def print_obj_metadata(metadata, drop_prefixes=False):
 
 
 def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False,
-               drop_prefixes=False):
+               drop_prefixes=False, verbose=False):
     if db_type not in ('account', 'container'):
         print("Unrecognized DB type: internal error")
         raise InfoSystemExit()
@@ -450,7 +465,8 @@ def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False,
         sranges = broker.get_shard_ranges()
         if sranges:
             info['shard_ranges'] = sranges
-    print_db_info_metadata(db_type, info, broker.metadata, drop_prefixes)
+    print_db_info_metadata(
+        db_type, info, broker.metadata, drop_prefixes, verbose)
     try:
         ring = Ring(swift_dir, ring_name=db_type)
     except Exception:
@@ -529,7 +545,7 @@ def print_obj(datafile, check_etag=True, swift_dir='/etc/swift',
         # Optional integrity check; it's useful, but slow.
         file_len = None
         if check_etag:
-            h = md5()
+            h = md5(usedforsecurity=False)
             file_len = 0
             while True:
                 data = fp.read(64 * 1024)
@@ -614,15 +630,15 @@ def print_item_locations(ring, ring_name=None, account=None, container=None,
         ring = POLICIES.get_object_ring(policy_index, swift_dir)
         ring_name = (POLICIES.get_by_name(policy_name)).ring_name
 
-    if account is None and (container is not None or obj is not None):
+    if (container or obj) and not account:
         print('No account specified')
         raise InfoSystemExit()
 
-    if container is None and obj is not None:
+    if obj and not container:
         print('No container specified')
         raise InfoSystemExit()
 
-    if account is None and part is None:
+    if not account and not part:
         print('No target specified')
         raise InfoSystemExit()
 
@@ -654,8 +670,11 @@ def print_item_locations(ring, ring_name=None, account=None, container=None,
                 print('Warning: account specified ' +
                       'but ring not named "account"')
 
-    print('\nAccount  \t%s' % account)
-    print('Container\t%s' % container)
-    print('Object   \t%s\n\n' % obj)
+    if account:
+        print('\nAccount  \t%s' % urllib.parse.quote(account))
+    if container:
+        print('Container\t%s' % urllib.parse.quote(container))
+    if obj:
+        print('Object   \t%s\n\n' % urllib.parse.quote(obj))
     print_ring_locations(ring, loc, account, container, obj, part, all_nodes,
                          policy_index=policy_index)

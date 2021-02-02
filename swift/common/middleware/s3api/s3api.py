@@ -242,53 +242,50 @@ class ListingEtagMiddleware(object):
 
 class S3ApiMiddleware(object):
     """S3Api: S3 compatibility middleware"""
-    def __init__(self, app, conf, *args, **kwargs):
+    def __init__(self, app, wsgi_conf, *args, **kwargs):
         self.app = app
         self.conf = Config()
 
         # Set default values if they are not configured
         self.conf.allow_no_owner = config_true_value(
-            conf.get('allow_no_owner', False))
-        self.conf.location = conf.get('location', 'us-east-1')
+            wsgi_conf.get('allow_no_owner', False))
+        self.conf.location = wsgi_conf.get('location', 'us-east-1')
         self.conf.dns_compliant_bucket_names = config_true_value(
-            conf.get('dns_compliant_bucket_names', True))
+            wsgi_conf.get('dns_compliant_bucket_names', True))
         self.conf.max_bucket_listing = config_positive_int_value(
-            conf.get('max_bucket_listing', 1000))
+            wsgi_conf.get('max_bucket_listing', 1000))
         self.conf.max_parts_listing = config_positive_int_value(
-            conf.get('max_parts_listing', 1000))
+            wsgi_conf.get('max_parts_listing', 1000))
         self.conf.max_multi_delete_objects = config_positive_int_value(
-            conf.get('max_multi_delete_objects', 1000))
+            wsgi_conf.get('max_multi_delete_objects', 1000))
         self.conf.multi_delete_concurrency = config_positive_int_value(
-            conf.get('multi_delete_concurrency', 2))
+            wsgi_conf.get('multi_delete_concurrency', 2))
         self.conf.s3_acl = config_true_value(
-            conf.get('s3_acl', False))
-        self.conf.storage_domain = conf.get('storage_domain', '')
+            wsgi_conf.get('s3_acl', False))
+        self.conf.storage_domain = wsgi_conf.get('storage_domain', '')
         self.conf.auth_pipeline_check = config_true_value(
-            conf.get('auth_pipeline_check', True))
+            wsgi_conf.get('auth_pipeline_check', True))
         self.conf.max_upload_part_num = config_positive_int_value(
-            conf.get('max_upload_part_num', 1000))
+            wsgi_conf.get('max_upload_part_num', 1000))
         self.conf.check_bucket_owner = config_true_value(
-            conf.get('check_bucket_owner', False))
+            wsgi_conf.get('check_bucket_owner', False))
         self.conf.force_swift_request_proxy_log = config_true_value(
-            conf.get('force_swift_request_proxy_log', False))
+            wsgi_conf.get('force_swift_request_proxy_log', False))
         self.conf.allow_multipart_uploads = config_true_value(
-            conf.get('allow_multipart_uploads', True))
+            wsgi_conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
-            conf.get('min_segment_size', 5242880))
+            wsgi_conf.get('min_segment_size', 5242880))
+        self.conf.allowable_clock_skew = config_positive_int_value(
+            wsgi_conf.get('allowable_clock_skew', 15 * 60))
 
         self.logger = get_logger(
-            conf, log_route=conf.get('log_name', 's3api'))
-        self.slo_enabled = self.conf.allow_multipart_uploads
-        self.check_pipeline(self.conf)
+            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'))
+        self.check_pipeline(wsgi_conf)
 
     def __call__(self, env, start_response):
         try:
             req_class = get_request_class(env, self.conf.s3_acl)
-            req = req_class(
-                env, self.app, self.slo_enabled, self.conf.storage_domain,
-                self.conf.location, self.conf.force_swift_request_proxy_log,
-                self.conf.dns_compliant_bucket_names,
-                self.conf.allow_multipart_uploads, self.conf.allow_no_owner)
+            req = req_class(env, self.app, self.conf)
             resp = self.handle_request(req)
         except NotS3Request:
             resp = self.app
@@ -306,6 +303,8 @@ class S3ApiMiddleware(object):
             resp.headers['x-amz-id-2'] = env['swift.trans_id']
             resp.headers['x-amz-request-id'] = env['swift.trans_id']
 
+        if 's3api.backend_path' in env and 'swift.backend_path' not in env:
+            env['swift.backend_path'] = env['s3api.backend_path']
         return resp(env, start_response)
 
     def handle_request(self, req):
@@ -332,14 +331,14 @@ class S3ApiMiddleware(object):
 
         return res
 
-    def check_pipeline(self, conf):
+    def check_pipeline(self, wsgi_conf):
         """
         Check that proxy-server.conf has an appropriate pipeline for s3api.
         """
-        if conf.get('__file__', None) is None:
+        if wsgi_conf.get('__file__', None) is None:
             return
 
-        ctx = loadcontext(loadwsgi.APP, conf.__file__)
+        ctx = loadcontext(loadwsgi.APP, wsgi_conf['__file__'])
         pipeline = str(PipelineWrapper(ctx)).split(' ')
 
         # Add compatible with 3rd party middleware.
@@ -349,13 +348,13 @@ class S3ApiMiddleware(object):
                                  pipeline.index('proxy-server')]
 
         # Check SLO middleware
-        if self.slo_enabled and 'slo' not in auth_pipeline:
-            self.slo_enabled = False
+        if self.conf.allow_multipart_uploads and 'slo' not in auth_pipeline:
+            self.conf.allow_multipart_uploads = False
             self.logger.warning('s3api middleware requires SLO middleware '
                                 'to support multi-part upload, please add it '
                                 'in pipeline')
 
-        if not conf.auth_pipeline_check:
+        if not self.conf.auth_pipeline_check:
             self.logger.debug('Skip pipeline auth check.')
             return
 

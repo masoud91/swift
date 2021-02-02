@@ -20,7 +20,6 @@ Why not swift.common.utils, you ask? Because this way we can import things
 from swob in here without creating circular imports.
 """
 
-import hashlib
 import itertools
 import sys
 import time
@@ -29,10 +28,11 @@ import six
 from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
-from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
+from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX, \
+    CONTAINER_LISTING_LIMIT
 from swift.common.storage_policy import POLICIES
 from swift.common.exceptions import ListingIterError, SegmentError
-from swift.common.http import is_success
+from swift.common.http import is_success, is_server_error
 from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
     HTTPPreconditionFailed, wsgi_to_bytes, wsgi_unquote, wsgi_to_str
@@ -40,14 +40,15 @@ from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
     parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
-    RESERVED
+    RESERVED, config_true_value, md5, CloseableChain
 from swift.common.wsgi import make_subrequest
-from swift.container.reconciler import MISPLACED_OBJECTS_ACCOUNT
 
 
 OBJECT_TRANSIENT_SYSMETA_PREFIX = 'x-object-transient-sysmeta-'
 OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX = \
     'x-object-sysmeta-container-update-override-'
+USE_REPLICATION_NETWORK_HEADER = 'x-backend-use-replication-network'
+MISPLACED_OBJECTS_ACCOUNT = '.misplaced_objects'
 
 
 if six.PY2:
@@ -61,7 +62,7 @@ else:
 
 def get_param(req, name, default=None):
     """
-    Get parameters from an HTTP request ensuring proper handling UTF-8
+    Get a parameter from an HTTP request ensuring proper handling UTF-8
     encoding.
 
     :param req: request object
@@ -94,6 +95,27 @@ def get_param(req, name, default=None):
     return value
 
 
+def validate_params(req, names):
+    """
+    Get list of parameters from an HTTP request, validating the encoding of
+    each parameter.
+
+    :param req: request object
+    :param names: parameter names
+    :returns: a dict mapping parameter names to values for each name that
+              appears in the request parameters
+    :raises HTTPBadRequest: if any parameter value is not a valid UTF-8 byte
+            sequence
+    """
+    params = {}
+    for name in names:
+        value = get_param(req, name)
+        if value is None:
+            continue
+        params[name] = value
+    return params
+
+
 def constrain_req_limit(req, constrained_limit):
     given_limit = get_param(req, 'limit')
     limit = constrained_limit
@@ -103,6 +125,14 @@ def constrain_req_limit(req, constrained_limit):
             raise HTTPPreconditionFailed(
                 request=req, body='Maximum limit is %d' % constrained_limit)
     return limit
+
+
+def validate_container_params(req):
+    params = validate_params(req, ('marker', 'end_marker', 'prefix',
+                                   'delimiter', 'path', 'format', 'reverse',
+                                   'states', 'includes'))
+    params['limit'] = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
+    return params
 
 
 def _validate_internal_name(name, type_='name'):
@@ -357,7 +387,7 @@ def get_reserved_name(*parts):
 
 def split_reserved_name(name):
     """
-    Seperate a valid reserved name into the component parts.
+    Separate a valid reserved name into the component parts.
 
     :returns: a list of strings
     """
@@ -563,12 +593,20 @@ class SegmentedIterable(object):
             seg_req = data_or_req
             seg_resp = seg_req.get_response(self.app)
             if not is_success(seg_resp.status_int):
-                close_if_possible(seg_resp.app_iter)
-                raise SegmentError(
-                    'While processing manifest %s, '
-                    'got %d while retrieving %s' %
-                    (self.name, seg_resp.status_int, seg_req.path))
-
+                # Error body should be short
+                body = seg_resp.body
+                if not six.PY2:
+                    body = body.decode('utf8')
+                msg = 'While processing manifest %s, got %d (%s) ' \
+                    'while retrieving %s' % (
+                        self.name, seg_resp.status_int,
+                        body if len(body) <= 60 else body[:57] + '...',
+                        seg_req.path)
+                if is_server_error(seg_resp.status_int):
+                    self.logger.error(msg)
+                    raise HTTPServiceUnavailable(
+                        request=seg_req, content_type='text/plain')
+                raise SegmentError(msg)
             elif ((seg_etag and (seg_resp.etag != seg_etag)) or
                     (seg_size and (seg_resp.content_length != seg_size) and
                      not seg_req.range)):
@@ -591,10 +629,11 @@ class SegmentedIterable(object):
             else:
                 self.current_resp = seg_resp
 
+            resp_len = 0
             seg_hash = None
             if seg_resp.etag and not seg_req.headers.get('Range'):
                 # Only calculate the MD5 if it we can use it to validate
-                seg_hash = hashlib.md5()
+                seg_hash = md5(usedforsecurity=False)
 
             document_iters = maybe_multipart_byteranges_to_document_iters(
                 seg_resp.app_iter,
@@ -603,15 +642,26 @@ class SegmentedIterable(object):
             for chunk in itertools.chain.from_iterable(document_iters):
                 if seg_hash:
                     seg_hash.update(chunk)
+                    resp_len += len(chunk)
                 yield (seg_req.path, chunk)
             close_if_possible(seg_resp.app_iter)
 
-            if seg_hash and seg_hash.hexdigest() != seg_resp.etag:
-                raise SegmentError(
-                    "Bad MD5 checksum in %(name)s for %(seg)s: headers had"
-                    " %(etag)s, but object MD5 was actually %(actual)s" %
-                    {'seg': seg_req.path, 'etag': seg_resp.etag,
-                     'name': self.name, 'actual': seg_hash.hexdigest()})
+            if seg_hash:
+                if resp_len != seg_resp.content_length:
+                    raise SegmentError(
+                        "Bad response length for %(seg)s as part of %(name)s: "
+                        "headers had %(from_headers)s, but response length "
+                        "was actually %(actual)s" %
+                        {'seg': seg_req.path,
+                         'from_headers': seg_resp.content_length,
+                         'name': self.name, 'actual': resp_len})
+                if seg_hash.hexdigest() != seg_resp.etag:
+                    raise SegmentError(
+                        "Bad MD5 checksum for %(seg)s as part of %(name)s: "
+                        "headers had %(etag)s, but object MD5 was actually "
+                        "%(actual)s" %
+                        {'seg': seg_req.path, 'etag': seg_resp.etag,
+                         'name': self.name, 'actual': seg_hash.hexdigest()})
 
     def _byte_counting_iter(self):
         # Checks that we give the client the right number of bytes. Raises
@@ -716,7 +766,7 @@ class SegmentedIterable(object):
         if self.peeked_chunk is not None:
             pc = self.peeked_chunk
             self.peeked_chunk = None
-            return itertools.chain([pc], self.app_iter)
+            return CloseableChain([pc], self.app_iter)
         else:
             return self.app_iter
 
@@ -849,3 +899,15 @@ def update_ignore_range_header(req, name):
         raise ValueError('Header name must not contain commas')
     hdr = 'X-Backend-Ignore-Range-If-Metadata-Present'
     req.headers[hdr] = csv_append(req.headers.get(hdr), name)
+
+
+def get_ip_port(node, headers):
+    use_replication_network = False
+    for h, v in headers.items():
+        if h.lower() == USE_REPLICATION_NETWORK_HEADER:
+            use_replication_network = config_true_value(v)
+            break
+    if use_replication_network:
+        return node['replication_ip'], node['replication_port']
+    else:
+        return node['ip'], node['port']

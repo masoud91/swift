@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import print_function
+
 import unittest
 from test.unit import temptree
 
@@ -137,19 +138,25 @@ class TestManagerModule(unittest.TestCase):
             os.environ = _orig_environ
 
     def test_command_wrapper(self):
-        @manager.command
-        def myfunc(arg1):
-            """test doc
-            """
-            return arg1
 
-        self.assertEqual(myfunc.__doc__.strip(), 'test doc')
-        self.assertEqual(myfunc(1), 1)
-        self.assertEqual(myfunc(0), 0)
-        self.assertEqual(myfunc(True), 1)
-        self.assertEqual(myfunc(False), 0)
-        self.assertTrue(hasattr(myfunc, 'publicly_accessible'))
-        self.assertTrue(myfunc.publicly_accessible)
+        class MockManager(object):
+            def __init__(self, servers_):
+                self.servers = [manager.Server(server) for server in servers_]
+
+            @manager.command
+            def myfunc(self, arg1):
+                """test doc
+                """
+                return arg1
+
+        m = MockManager(['test'])
+        self.assertEqual(m.myfunc.__doc__.strip(), 'test doc')
+        self.assertEqual(m.myfunc(1), 1)
+        self.assertEqual(m.myfunc(0), 0)
+        self.assertEqual(m.myfunc(True), 1)
+        self.assertEqual(m.myfunc(False), 0)
+        self.assertTrue(hasattr(m.myfunc, 'publicly_accessible'))
+        self.assertTrue(m.myfunc.publicly_accessible)
 
     def test_watch_server_pids(self):
         class MockOs(object):
@@ -284,6 +291,38 @@ class TestManagerModule(unittest.TestCase):
 
     def test_exc(self):
         self.assertTrue(issubclass(manager.UnknownCommandError, Exception))
+
+    def test_format_server_name(self):
+        self.assertEqual(
+            manager.format_server_name('proxy'),
+            ("proxy-server", "swift-proxy-server"))
+        self.assertEqual(
+            manager.format_server_name('Proxy'),
+            ("Proxy-server", "swift-Proxy-server"))
+        self.assertEqual(
+            manager.format_server_name(''),
+            ("-server", "swift--server"))
+
+    def test_verify_server(self):
+        def mock_find_exe(f):
+            # pretend that swift-object-server is the only file on path
+            return f if f == 'swift-object-server' else None
+
+        with mock.patch('swift.common.manager.find_executable',
+                        side_effect=mock_find_exe):
+            # test valid servers
+            self.assertTrue(manager.verify_server('object'))
+            self.assertTrue(manager.verify_server('object-server'))
+            self.assertTrue(manager.verify_server('object.replication'))
+            self.assertTrue(manager.verify_server('object-server.1'))
+            # test invalid servers
+            self.assertFalse(manager.verify_server('test'))
+            self.assertFalse(manager.verify_server('test-server'))
+            self.assertFalse(manager.verify_server('ls'))
+            self.assertFalse(manager.verify_server(''))
+            self.assertFalse(manager.verify_server('Object'))
+            self.assertFalse(manager.verify_server('object1'))
+            self.assertFalse(manager.verify_server(None))
 
 
 class TestServer(unittest.TestCase):
@@ -1305,7 +1344,7 @@ class TestServer(unittest.TestCase):
                 return self
 
             def __exit__(self, *args):
-                if self.isAlive():
+                if self.is_alive():
                     self.join()
 
             def close_stdout(self):
@@ -1343,55 +1382,46 @@ class TestServer(unittest.TestCase):
             def sleep(self, *args, **kwargs):
                 pass
 
-        with temptree([]) as t:
-            old_stdout = sys.stdout
-            old_wait = manager.WARNING_WAIT
-            old_time = manager.time
-            try:
-                manager.WARNING_WAIT = 0.01
-                manager.time = MockTime()
-                with open(os.path.join(t, 'output'), 'w+') as f:
-                    # actually capture the read stdout (for prints)
-                    sys.stdout = f
-                    # test closing pipe in subprocess unblocks read
-                    with MockProcess() as proc:
-                        server.procs = [proc]
-                        status = server.wait()
-                        self.assertEqual(status, 0)
-                        # wait should return before process exits
-                        self.assertTrue(proc.isAlive())
-                        self.assertFalse(proc.finished)
-                    self.assertTrue(proc.finished)  # make sure it did finish
-                    # test output kwarg prints subprocess output
-                    with MockProcess() as proc:
-                        server.procs = [proc]
-                        status = server.wait(output=True)
-                    output = pop_stream(f)
-                    self.assertIn('mock process started', output)
-                    self.assertIn('setup complete', output)
-                    # make sure we don't get prints after stdout was closed
-                    self.assertNotIn('mock process finished', output)
-                    # test process which fails to start
-                    with MockProcess(fail_to_start=True) as proc:
-                        server.procs = [proc]
-                        status = server.wait()
-                        self.assertEqual(status, 1)
-                    self.assertIn('failed', pop_stream(f))
-                    # test multiple procs
-                    procs = [MockProcess(delay=.5) for i in range(3)]
-                    for proc in procs:
-                        proc.start()
-                    server.procs = procs
-                    status = server.wait()
-                    self.assertEqual(status, 0)
-                    for proc in procs:
-                        self.assertTrue(proc.isAlive())
-                    for proc in procs:
-                        proc.join()
-            finally:
-                sys.stdout = old_stdout
-                manager.WARNING_WAIT = old_wait
-                manager.time = old_time
+        with temptree([]) as t, open(os.path.join(t, 'output'), 'w+') as f, \
+                mock.patch.object(sys, 'stdout', f), \
+                mock.patch.object(manager, 'WARNING_WAIT', 0.01), \
+                mock.patch.object(manager, 'time', MockTime()):
+            # Note that we actually capture the read stdout (for prints)
+            # test closing pipe in subprocess unblocks read
+            with MockProcess() as proc:
+                server.procs = [proc]
+                status = server.wait()
+                self.assertEqual(status, 0)
+                # wait should return before process exits
+                self.assertTrue(proc.is_alive())
+                self.assertFalse(proc.finished)
+            self.assertTrue(proc.finished)  # make sure it did finish
+            # test output kwarg prints subprocess output
+            with MockProcess() as proc:
+                server.procs = [proc]
+                status = server.wait(output=True)
+            output = pop_stream(f)
+            self.assertIn('mock process started', output)
+            self.assertIn('setup complete', output)
+            # make sure we don't get prints after stdout was closed
+            self.assertNotIn('mock process finished', output)
+            # test process which fails to start
+            with MockProcess(fail_to_start=True) as proc:
+                server.procs = [proc]
+                status = server.wait()
+                self.assertEqual(status, 1)
+            self.assertIn('failed', pop_stream(f))
+            # test multiple procs
+            procs = [MockProcess(delay=.5) for i in range(3)]
+            for proc in procs:
+                proc.start()
+            server.procs = procs
+            status = server.wait()
+            self.assertEqual(status, 0)
+            for proc in procs:
+                self.assertTrue(proc.is_alive())
+            for proc in procs:
+                proc.join()
 
     def test_interact(self):
         class MockProcess(object):
@@ -1624,14 +1654,17 @@ class TestServer(unittest.TestCase):
 
 class TestManager(unittest.TestCase):
 
-    def test_create(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_create(self, mock_verify):
         m = manager.Manager(['test'])
         self.assertEqual(len(m.servers), 1)
         server = m.servers.pop()
         self.assertTrue(isinstance(server, manager.Server))
         self.assertEqual(server.server, 'test-server')
         # test multi-server and simple dedupe
-        servers = ['object-replicator', 'object-auditor', 'object-replicator']
+        servers = ['object-replicator', 'object-auditor',
+                   'object-replicator']
         m = manager.Manager(servers)
         self.assertEqual(len(m.servers), 2)
         for server in m.servers:
@@ -1675,6 +1708,22 @@ class TestManager(unittest.TestCase):
         for s in m.servers:
             self.assertTrue(str(s) in replicators)
 
+        # test invalid server
+        m = manager.Manager(['error'])
+        self.assertEqual(len(m.servers), 0)
+        # test valid + invalid server
+        servers = ['object-server']
+        m = manager.Manager(['object', 'error'])
+        self.assertEqual(len(m.servers), 1)
+        for server in m.servers:
+            self.assertTrue(server.server in servers)
+        # test multi-server and invalid server together
+        servers = ['object-replicator', 'object-auditor', 'error']
+        m = manager.Manager(servers)
+        self.assertEqual(len(m.servers), 2)
+        for server in m.servers:
+            self.assertTrue(server.server in servers[:2])
+
     def test_iter(self):
         m = manager.Manager(['all'])
         self.assertEqual(len(list(m)), len(manager.ALL_SERVERS))
@@ -1705,8 +1754,16 @@ class TestManager(unittest.TestCase):
                 else:
                     return 0
 
+        def mock_verify_server(server):
+            if 'error' in server:
+                return False
+            return True
+
+        old_verify_server = manager.verify_server
         old_server_class = manager.Server
+
         try:
+            manager.verify_server = mock_verify_server
             manager.Server = MockServer
             m = manager.Manager(['test'])
             status = m.status()
@@ -1718,15 +1775,21 @@ class TestManager(unittest.TestCase):
             m = manager.Manager(['test', 'error'])
             kwargs = {'key': 'value'}
             status = m.status(**kwargs)
-            self.assertEqual(status, 1)
+            self.assertEqual(status, 0)
             for server in m.servers:
                 self.assertEqual(server.called_kwargs, [kwargs])
         finally:
+            manager.verify_server = old_verify_server
             manager.Server = old_server_class
 
     def test_start(self):
         def mock_setup_env():
             getattr(mock_setup_env, 'called', []).append(True)
+
+        def mock_verify_server(server):
+            if 'none' in server:
+                return False
+            return True
 
         class MockServer(object):
             def __init__(self, server, run_dir=manager.RUN_DIR):
@@ -1759,9 +1822,11 @@ class TestManager(unittest.TestCase):
                     return 0
 
         old_setup_env = manager.setup_env
+        old_verify_server = manager.verify_server
         old_swift_server = manager.Server
         try:
             manager.setup_env = mock_setup_env
+            manager.verify_server = mock_verify_server
             manager.Server = MockServer
 
             # test no errors on launch
@@ -1778,6 +1843,15 @@ class TestManager(unittest.TestCase):
             for server in m.servers:
                 self.assertEqual(server.called['launch'], [{}])
                 self.assertEqual(server.called['wait'], [{}])
+
+            # test missing (on launch, as it happens)
+            # We only throw a bad error code if nothing good was run.
+            m = manager.Manager(['none'])
+            status = m.start()
+            self.assertEqual(status, 1)
+            m = manager.Manager(['proxy', 'none'])
+            status = m.start()
+            self.assertEqual(status, 0)
 
             # test interact
             m = manager.Manager(['proxy', 'error'])
@@ -1889,9 +1963,15 @@ class TestManager(unittest.TestCase):
 
         finally:
             manager.setup_env = old_setup_env
+            manager.verify_server = old_verify_server
             manager.Server = old_swift_server
 
     def test_no_wait(self):
+        def mock_verify_server(server):
+            if 'error' in server:
+                return False
+            return True
+
         class MockServer(object):
             def __init__(self, server, run_dir=manager.RUN_DIR):
                 self.server = server
@@ -1906,8 +1986,10 @@ class TestManager(unittest.TestCase):
                 self.called['wait'].append(kwargs)
                 return int('error' in self.server)
 
+        orig_verify_server = manager.verify_server
         orig_swift_server = manager.Server
         try:
+            manager.verify_server = mock_verify_server
             manager.Server = MockServer
             # test success
             init = manager.Manager(['proxy'])
@@ -1918,8 +2000,8 @@ class TestManager(unittest.TestCase):
                 called_kwargs = server.called['launch'][0]
                 self.assertFalse(called_kwargs['wait'])
                 self.assertFalse(server.called['wait'])
-            # test no errocode status even on error
-            init = manager.Manager(['error'])
+            # test no errocode status even on invalid
+            init = manager.Manager(['invalid'])
             status = init.no_wait()
             self.assertEqual(status, 0)
             for server in init.servers:
@@ -1929,7 +2011,7 @@ class TestManager(unittest.TestCase):
                 self.assertFalse(called_kwargs['wait'])
                 self.assertFalse(server.called['wait'])
             # test wait with once option
-            init = manager.Manager(['updater', 'replicator-error'])
+            init = manager.Manager(['updater', 'replicator-invalid'])
             status = init.no_wait(once=True)
             self.assertEqual(status, 0)
             for server in init.servers:
@@ -1941,9 +2023,13 @@ class TestManager(unittest.TestCase):
                 self.assertTrue(called_kwargs['once'])
                 self.assertFalse(server.called['wait'])
         finally:
+            manager.verify_server = orig_verify_server
             manager.Server = orig_swift_server
 
     def test_no_daemon(self):
+        def mock_verify_server(server):
+            return True
+
         class MockServer(object):
 
             def __init__(self, server, run_dir=manager.RUN_DIR):
@@ -1959,9 +2045,11 @@ class TestManager(unittest.TestCase):
                 self.called['interact'].append(kwargs)
                 return int('error' in self.server)
 
+        orig_verify_server = manager.verify_server
         orig_swift_server = manager.Server
         try:
             manager.Server = MockServer
+            manager.verify_server = mock_verify_server
             # test success
             init = manager.Manager(['proxy'])
             stats = init.no_daemon()
@@ -1978,9 +2066,15 @@ class TestManager(unittest.TestCase):
                 self.assertEqual(len(server.called['wait']), 0)
                 self.assertEqual(len(server.called['interact']), 1)
         finally:
+            manager.verify_server = orig_verify_server
             manager.Server = orig_swift_server
 
     def test_once(self):
+        def mock_verify_server(server):
+            if 'error' in server:
+                return False
+            return True
+
         class MockServer(object):
 
             def __init__(self, server, run_dir=manager.RUN_DIR):
@@ -1998,15 +2092,17 @@ class TestManager(unittest.TestCase):
                 self.called['launch'].append(kwargs)
                 return {1: 'account-reaper'}
 
+        orig_verify_server = manager.verify_server
         orig_swift_server = manager.Server
         try:
             manager.Server = MockServer
+            manager.verify_server = mock_verify_server
             # test no errors
             init = manager.Manager(['account-reaper'])
             status = init.once()
             self.assertEqual(status, 0)
             # test error code on error
-            init = manager.Manager(['error-reaper'])
+            init = manager.Manager(['error'])
             status = init.once()
             self.assertEqual(status, 1)
             for server in init.servers:
@@ -2017,8 +2113,14 @@ class TestManager(unittest.TestCase):
                 self.assertEqual(len(server.called['interact']), 0)
         finally:
             manager.Server = orig_swift_server
+            manager.verify_server = orig_verify_server
 
     def test_stop(self):
+        def mock_verify_server(server):
+            if 'error' in server:
+                return False
+            return True
+
         class MockServerFactory(object):
             class MockServer(object):
                 def __init__(self, pids, run_dir=manager.RUN_DIR):
@@ -2046,12 +2148,14 @@ class TestManager(unittest.TestCase):
         def mock_kill_group(pid, sig):
             self.fail('kill_group should not be called')
 
+        _orig_verify_server = manager.verify_server
         _orig_server = manager.Server
         _orig_watch_server_pids = manager.watch_server_pids
         _orig_kill_group = manager.kill_group
         try:
             manager.watch_server_pids = mock_watch_server_pids
             manager.kill_group = mock_kill_group
+            manager.verify_server = mock_verify_server
             # test stop one server
             server_pids = {
                 'test': {1: "dummy.pid"}
@@ -2086,6 +2190,7 @@ class TestManager(unittest.TestCase):
             self.assertEqual(status, 1)
 
         finally:
+            manager.verify_server = _orig_verify_server
             manager.Server = _orig_server
             manager.watch_server_pids = _orig_watch_server_pids
             manager.kill_group = _orig_kill_group
@@ -2126,12 +2231,19 @@ class TestManager(unittest.TestCase):
         def mock_kill_group_oserr_ESRCH(*args):
             raise OSError(errno.ESRCH, 'No such process')
 
+        def mock_verify_server(server):
+            if 'error' in server:
+                return False
+            return True
+
         _orig_server = manager.Server
         _orig_watch_server_pids = manager.watch_server_pids
         _orig_kill_group = manager.kill_group
+        _orig_verify_server = manager.verify_server
         try:
             manager.watch_server_pids = mock_watch_server_pids
             manager.kill_group = mock_kill_group
+            manager.verify_server = mock_verify_server
             # test stop one server
             server_pids = {
                 'test': {None: None}
@@ -2165,8 +2277,11 @@ class TestManager(unittest.TestCase):
             manager.Server = _orig_server
             manager.watch_server_pids = _orig_watch_server_pids
             manager.kill_group = _orig_kill_group
+            manager.verify_server = _orig_verify_server
 
-    def test_shutdown(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_shutdown(self, mock_verify):
         m = manager.Manager(['test'])
         m.stop_was_called = False
 
@@ -2180,7 +2295,9 @@ class TestManager(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(m.stop_was_called, True)
 
-    def test_restart(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_restart(self, mock_verify):
         m = manager.Manager(['test'])
         m.stop_was_called = False
 
@@ -2233,7 +2350,9 @@ class TestManager(unittest.TestCase):
         do_test(graceful=True)
         do_test(graceful=False)  # graceful is forced regardless of the kwarg
 
-    def test_force_reload(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_force_reload(self, mock_verify):
         m = manager.Manager(['test'])
         m.reload_was_called = False
 
@@ -2245,7 +2364,9 @@ class TestManager(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(m.reload_was_called, True)
 
-    def test_get_command(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_get_command(self, mock_verify):
         m = manager.Manager(['test'])
         self.assertEqual(m.start, m.get_command('start'))
         self.assertEqual(m.force_reload, m.get_command('force-reload'))
@@ -2263,7 +2384,9 @@ class TestManager(unittest.TestCase):
             self.assertTrue(getattr(method, 'publicly_accessible', False))
             self.assertEqual(method.__doc__.strip(), help)
 
-    def test_run_command(self):
+    @mock.patch.object(manager, 'verify_server',
+                       side_effect=lambda server: 'error' not in server)
+    def test_run_command(self, mock_verify):
         m = manager.Manager(['test'])
         m.cmd_was_called = False
 

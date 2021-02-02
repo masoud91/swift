@@ -30,13 +30,11 @@ from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.exceptions import LockTimeout
 from swift.common.utils import Timestamp, encode_timestamps, \
     decode_timestamps, extract_swift_bytes, storage_directory, hash_path, \
-    ShardRange, renamer, find_shard_range, MD5_OF_EMPTY_STRING, mkdirs, \
-    get_db_files, parse_db_filename, make_db_file_path, split_path, \
-    RESERVED_BYTE
+    ShardRange, renamer, MD5_OF_EMPTY_STRING, mkdirs, get_db_files, \
+    parse_db_filename, make_db_file_path, split_path, RESERVED_BYTE, \
+    filter_shard_ranges
 from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT, \
-    zero_like, DatabaseAlreadyExists
-
-SQLITE_ARG_LIMIT = 999
+    zero_like, DatabaseAlreadyExists, SQLITE_ARG_LIMIT
 
 DATADIR = 'containers'
 
@@ -62,7 +60,7 @@ SHARD_UPDATE_STATES = [ShardRange.CREATED, ShardRange.CLEAVED,
 # tuples and vice-versa
 SHARD_RANGE_KEYS = ('name', 'timestamp', 'lower', 'upper', 'object_count',
                     'bytes_used', 'meta_timestamp', 'deleted', 'state',
-                    'state_timestamp', 'epoch')
+                    'state_timestamp', 'epoch', 'reported')
 
 POLICY_STAT_TABLE_CREATE = '''
     CREATE TABLE policy_stat (
@@ -269,6 +267,7 @@ def merge_shards(shard_data, existing):
     if existing['timestamp'] < shard_data['timestamp']:
         # note that currently we do not roll forward any meta or state from
         # an item that was created at older time, newer created time trumps
+        shard_data['reported'] = 0  # reset the latch
         return True
     elif existing['timestamp'] > shard_data['timestamp']:
         return False
@@ -284,6 +283,18 @@ def merge_shards(shard_data, existing):
             shard_data[k] = existing[k]
     else:
         new_content = True
+
+    # We can latch the reported flag
+    if existing['reported'] and \
+            existing['object_count'] == shard_data['object_count'] and \
+            existing['bytes_used'] == shard_data['bytes_used'] and \
+            existing['state'] == shard_data['state'] and \
+            existing['epoch'] == shard_data['epoch']:
+        shard_data['reported'] = 1
+    else:
+        shard_data.setdefault('reported', 0)
+        if shard_data['reported'] and not existing['reported']:
+            new_content = True
 
     if (existing['state_timestamp'] == shard_data['state_timestamp']
             and shard_data['state'] > existing['state']):
@@ -398,7 +409,8 @@ class ContainerBroker(DatabaseBroker):
         own_shard_range = self.get_own_shard_range()
         if own_shard_range.state in (ShardRange.SHARDING,
                                      ShardRange.SHRINKING,
-                                     ShardRange.SHARDED):
+                                     ShardRange.SHARDED,
+                                     ShardRange.SHRUNK):
             return bool(self.get_shard_ranges())
         return False
 
@@ -597,7 +609,8 @@ class ContainerBroker(DatabaseBroker):
                 deleted INTEGER DEFAULT 0,
                 state INTEGER,
                 state_timestamp TEXT,
-                epoch TEXT
+                epoch TEXT,
+                reported INTEGER DEFAULT 0
             );
         """ % SHARD_RANGE_TABLE)
 
@@ -799,16 +812,24 @@ class ContainerBroker(DatabaseBroker):
         info.update(self._get_alternate_object_stats()[1])
         return self._is_deleted_info(**info)
 
-    def is_reclaimable(self, now, reclaim_age):
+    def is_old_enough_to_reclaim(self, now, reclaim_age):
         with self.get() as conn:
             info = conn.execute('''
                 SELECT put_timestamp, delete_timestamp
                 FROM container_stat''').fetchone()
-        if (Timestamp(now - reclaim_age) >
-            Timestamp(info['delete_timestamp']) >
-                Timestamp(info['put_timestamp'])):
-            return self.empty()
-        return False
+        return (Timestamp(now - reclaim_age) >
+                Timestamp(info['delete_timestamp']) >
+                Timestamp(info['put_timestamp']))
+
+    def is_empty_enough_to_reclaim(self):
+        if self.is_root_container() and (self.get_shard_ranges() or
+                                         self.get_db_state() == SHARDING):
+            return False
+        return self.empty()
+
+    def is_reclaimable(self, now, reclaim_age):
+        return self.is_old_enough_to_reclaim(now, reclaim_age) and \
+            self.is_empty_enough_to_reclaim()
 
     def get_info_is_deleted(self):
         """
@@ -1430,10 +1451,13 @@ class ContainerBroker(DatabaseBroker):
                 #   sqlite3.OperationalError: cannot start a transaction
                 #   within a transaction
                 conn.rollback()
-                if ('no such table: %s' % SHARD_RANGE_TABLE) not in str(err):
-                    raise
-                self.create_shard_range_table(conn)
-                return _really_merge_items(conn)
+                if 'no such column: reported' in str(err):
+                    self._migrate_add_shard_range_reported(conn)
+                    return _really_merge_items(conn)
+                if ('no such table: %s' % SHARD_RANGE_TABLE) in str(err):
+                    self.create_shard_range_table(conn)
+                    return _really_merge_items(conn)
+                raise
 
     def get_reconciler_sync(self):
         with self.get() as conn:
@@ -1581,9 +1605,20 @@ class ContainerBroker(DatabaseBroker):
             CONTAINER_STAT_VIEW_SCRIPT +
             'COMMIT;')
 
-    def _reclaim(self, conn, age_timestamp, sync_timestamp):
-        super(ContainerBroker, self)._reclaim(conn, age_timestamp,
-                                              sync_timestamp)
+    def _migrate_add_shard_range_reported(self, conn):
+        """
+        Add the reported column to the 'shard_range' table.
+        """
+        conn.executescript('''
+            BEGIN;
+            ALTER TABLE %s
+            ADD COLUMN reported INTEGER DEFAULT 0;
+            COMMIT;
+        ''' % SHARD_RANGE_TABLE)
+
+    def _reclaim_other_stuff(self, conn, age_timestamp, sync_timestamp):
+        super(ContainerBroker, self)._reclaim_other_stuff(
+            conn, age_timestamp, sync_timestamp)
         # populate instance cache, but use existing conn to avoid deadlock
         # when it has a pending update
         self._populate_instance_cache(conn=conn)
@@ -1630,7 +1665,7 @@ class ContainerBroker(DatabaseBroker):
         elif states is not None:
             included_states.add(states)
 
-        def do_query(conn):
+        def do_query(conn, use_reported_column=True):
             condition = ''
             conditions = []
             params = []
@@ -1648,21 +1683,27 @@ class ContainerBroker(DatabaseBroker):
                 params.append(self.path)
             if conditions:
                 condition = ' WHERE ' + ' AND '.join(conditions)
+            if use_reported_column:
+                columns = SHARD_RANGE_KEYS
+            else:
+                columns = SHARD_RANGE_KEYS[:-1] + ('0 as reported', )
             sql = '''
             SELECT %s
             FROM %s%s;
-            ''' % (', '.join(SHARD_RANGE_KEYS), SHARD_RANGE_TABLE, condition)
+            ''' % (', '.join(columns), SHARD_RANGE_TABLE, condition)
             data = conn.execute(sql, params)
             data.row_factory = None
             return [row for row in data]
 
-        try:
-            with self.maybe_get(connection) as conn:
+        with self.maybe_get(connection) as conn:
+            try:
                 return do_query(conn)
-        except sqlite3.OperationalError as err:
-            if ('no such table: %s' % SHARD_RANGE_TABLE) not in str(err):
+            except sqlite3.OperationalError as err:
+                if ('no such table: %s' % SHARD_RANGE_TABLE) in str(err):
+                    return []
+                if 'no such column: reported' in str(err):
+                    return do_query(conn, use_reported_column=False)
                 raise
-            return []
 
     @classmethod
     def resolve_shard_range_states(cls, states):
@@ -1724,14 +1765,6 @@ class ContainerBroker(DatabaseBroker):
             at the tail of other shard ranges.
         :return: a list of instances of :class:`swift.common.utils.ShardRange`
         """
-        def shard_range_filter(sr):
-            end = start = True
-            if end_marker:
-                end = end_marker > sr.lower
-            if marker:
-                start = marker < sr.upper
-            return start and end
-
         if reverse:
             marker, end_marker = end_marker, marker
         if marker and end_marker and marker >= end_marker:
@@ -1743,16 +1776,13 @@ class ContainerBroker(DatabaseBroker):
                 include_deleted=include_deleted, states=states,
                 include_own=include_own,
                 exclude_others=exclude_others)]
-        # note if this ever changes to *not* sort by upper first then it breaks
-        # a key assumption for bisect, which is used by utils.find_shard_ranges
-        shard_ranges.sort(key=lambda sr: (sr.upper, sr.state, sr.lower))
-        if includes:
-            shard_range = find_shard_range(includes, shard_ranges)
-            return [shard_range] if shard_range else []
 
-        if marker or end_marker:
-            shard_ranges = list(filter(shard_range_filter, shard_ranges))
-        if fill_gaps:
+        shard_ranges.sort(key=ShardRange.sort_key)
+
+        shard_ranges = filter_shard_ranges(shard_ranges, includes,
+                                           marker, end_marker)
+
+        if not includes and fill_gaps:
             if shard_ranges:
                 last_upper = shard_ranges[-1].upper
             else:
@@ -2029,6 +2059,21 @@ class ContainerBroker(DatabaseBroker):
         else:
             return {k: v[0] for k, v in info.items()}
 
+    def _get_root_meta(self):
+        """
+        Get the (unquoted) root path, plus the header the info came from.
+        If no info available, returns ``(None, None)``
+        """
+        path = self.get_sharding_sysmeta('Quoted-Root')
+        if path:
+            return 'X-Container-Sysmeta-Shard-Quoted-Root', unquote(path)
+
+        path = self.get_sharding_sysmeta('Root')
+        if path:
+            return 'X-Container-Sysmeta-Shard-Root', path
+
+        return None, None
+
     def _load_root_info(self):
         """
         Load the root container name and account for the container represented
@@ -2041,13 +2086,7 @@ class ContainerBroker(DatabaseBroker):
         ``container`` attributes respectively.
 
         """
-        path = self.get_sharding_sysmeta('Quoted-Root')
-        hdr = 'X-Container-Sysmeta-Shard-Quoted-Root'
-        if path:
-            path = unquote(path)
-        else:
-            path = self.get_sharding_sysmeta('Root')
-            hdr = 'X-Container-Sysmeta-Shard-Root'
+        hdr, path = self._get_root_meta()
 
         if not path:
             # Ensure account/container get populated
@@ -2086,9 +2125,25 @@ class ContainerBroker(DatabaseBroker):
         A root container is a container that is not a shard of another
         container.
         """
-        self._populate_instance_cache()
-        return (self.root_account == self.account and
-                self.root_container == self.container)
+        _, path = self._get_root_meta()
+        if path is not None:
+            # We have metadata telling us where the root is; it's authoritative
+            return self.path == path
+
+        # Else, we're either a root or a deleted shard.
+
+        # Use internal method so we don't try to update stats.
+        own_shard_range = self._own_shard_range(no_default=True)
+        if not own_shard_range:
+            return True  # Never been sharded
+
+        if own_shard_range.deleted:
+            # When shard ranges shrink, they get marked deleted
+            return False
+        else:
+            # But even when a root collapses, empties, and gets deleted, its
+            # own_shard_range is left alive
+            return True
 
     def _get_next_shard_range_upper(self, shard_size, last_upper=None):
         """

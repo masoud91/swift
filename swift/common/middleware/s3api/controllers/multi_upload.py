@@ -61,15 +61,14 @@ Static Large Object when the multipart upload is completed.
 
 import binascii
 import copy
-from hashlib import md5
 import os
 import re
 import time
 
 import six
 
-from swift.common.swob import Range, bytes_to_wsgi, normalize_etag
-from swift.common.utils import json, public, reiterate
+from swift.common.swob import Range, bytes_to_wsgi, normalize_etag, wsgi_to_str
+from swift.common.utils import json, public, reiterate, md5
 from swift.common.db import utf8encode
 from swift.common.request_helpers import get_container_update_override_key
 
@@ -108,6 +107,13 @@ def _get_upload_info(req, app, upload_id):
     try:
         return req.get_response(app, 'HEAD', container=container, obj=obj)
     except NoSuchKey:
+        try:
+            resp = req.get_response(app, 'HEAD')
+            if resp.sysmeta_headers.get(sysmeta_header(
+                    'object', 'upload-id')) == upload_id:
+                return resp
+        except NoSuchKey:
+            pass
         raise NoSuchUpload(upload_id=upload_id)
     finally:
         # ...making sure to restore any copy-source before returning
@@ -115,9 +121,34 @@ def _get_upload_info(req, app, upload_id):
             req.headers['X-Amz-Copy-Source'] = copy_source
 
 
-def _check_upload_info(req, app, upload_id):
+def _make_complete_body(req, s3_etag, yielded_anything):
+    result_elem = Element('CompleteMultipartUploadResult')
 
-    _get_upload_info(req, app, upload_id)
+    # NOTE: boto with sig v4 appends port to HTTP_HOST value at
+    # the request header when the port is non default value and it
+    # makes req.host_url like as http://localhost:8080:8080/path
+    # that obviously invalid. Probably it should be resolved at
+    # swift.common.swob though, tentatively we are parsing and
+    # reconstructing the correct host_url info here.
+    # in detail, https://github.com/boto/boto/pull/3513
+    parsed_url = urlparse(req.host_url)
+    host_url = '%s://%s' % (parsed_url.scheme, parsed_url.hostname)
+    # Why are we doing our own port parsing? Because py3 decided
+    # to start raising ValueErrors on access after parsing such
+    # an invalid port
+    netloc = parsed_url.netloc.split('@')[-1].split(']')[-1]
+    if ':' in netloc:
+        port = netloc.split(':', 2)[1]
+        host_url += ':%s' % port
+
+    SubElement(result_elem, 'Location').text = host_url + req.path
+    SubElement(result_elem, 'Bucket').text = req.container_name
+    SubElement(result_elem, 'Key').text = req.object_name
+    SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
+    body = tostring(result_elem, xml_declaration=not yielded_anything)
+    if yielded_anything:
+        return b'\n' + body
+    return body
 
 
 class PartController(Controller):
@@ -152,7 +183,7 @@ class PartController(Controller):
                                   err_msg)
 
         upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        _get_upload_info(req, self.app, upload_id)
 
         req.container_name += MULTIUPLOAD_SUFFIX
         req.object_name = '%s/%s/%d' % (req.object_name, upload_id,
@@ -393,10 +424,14 @@ class UploadsController(Controller):
         except NoSuchBucket:
             try:
                 # multi-upload bucket doesn't exist, create one with
-                # same storage policy as the primary bucket
+                # same storage policy and acls as the primary bucket
                 info = req.get_container_info(self.app)
                 policy_name = POLICIES[info['storage_policy']].name
                 hdrs = {'X-Storage-Policy': policy_name}
+                if info.get('read_acl'):
+                    hdrs['X-Container-Read'] = info['read_acl']
+                if info.get('write_acl'):
+                    hdrs['X-Container-Write'] = info['write_acl']
                 seg_req.get_response(self.app, 'PUT', seg_container, '',
                                      headers=hdrs)
             except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
@@ -449,7 +484,7 @@ class UploadController(Controller):
             raise InvalidArgument('encoding-type', encoding_type, err_msg)
 
         upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        _get_upload_info(req, self.app, upload_id)
 
         maxparts = req.get_validated_param(
             'max-parts', DEFAULT_MAX_PARTS_LISTING,
@@ -536,7 +571,7 @@ class UploadController(Controller):
         Handles Abort Multipart Upload.
         """
         upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        _get_upload_info(req, self.app, upload_id)
 
         # First check to see if this multi-part upload was already
         # completed.  Look in the primary container, if the object exists,
@@ -580,7 +615,8 @@ class UploadController(Controller):
         """
         upload_id = req.params['uploadId']
         resp = _get_upload_info(req, self.app, upload_id)
-        headers = {'Accept': 'application/json'}
+        headers = {'Accept': 'application/json',
+                   sysmeta_header('object', 'upload-id'): upload_id}
         for key, val in resp.headers.items():
             _key = key.lower()
             if _key.startswith('x-amz-meta-'):
@@ -603,7 +639,7 @@ class UploadController(Controller):
             headers['Content-Type'] = content_type
 
         container = req.container_name + MULTIUPLOAD_SUFFIX
-        s3_etag_hasher = md5()
+        s3_etag_hasher = md5(usedforsecurity=False)
         manifest = []
         previous_number = 0
         try:
@@ -613,7 +649,8 @@ class UploadController(Controller):
             if 'content-md5' in req.headers:
                 # If an MD5 was provided, we need to verify it.
                 # Note that S3Request already took care of translating to ETag
-                if req.headers['etag'] != md5(xml).hexdigest():
+                if req.headers['etag'] != md5(
+                        xml, usedforsecurity=False).hexdigest():
                     raise BadDigest(content_md5=req.headers['content-md5'])
                 # We're only interested in the body here, in the
                 # multipart-upload controller -- *don't* let it get
@@ -637,7 +674,8 @@ class UploadController(Controller):
 
                 manifest.append({
                     'path': '/%s/%s/%s/%d' % (
-                        container, req.object_name, upload_id, part_number),
+                        wsgi_to_str(container), wsgi_to_str(req.object_name),
+                        upload_id, part_number),
                     'etag': etag})
                 s3_etag_hasher.update(binascii.a2b_hex(etag))
         except (XMLSyntaxError, DocumentInvalid):
@@ -650,7 +688,15 @@ class UploadController(Controller):
             raise
 
         s3_etag = '%s-%d' % (s3_etag_hasher.hexdigest(), len(manifest))
-        headers[sysmeta_header('object', 'etag')] = s3_etag
+        s3_etag_header = sysmeta_header('object', 'etag')
+        if resp.sysmeta_headers.get(s3_etag_header) == s3_etag:
+            # This header should only already be present if the upload marker
+            # has been cleaned up and the current target uses the same
+            # upload-id; assuming the segments to use haven't changed, the work
+            # is already done
+            return HTTPOk(body=_make_complete_body(req, s3_etag, False),
+                          content_type='application/xml')
+        headers[s3_etag_header] = s3_etag
         # Leave base header value blank; SLO will populate
         c_etag = '; s3_etag=%s' % s3_etag
         headers[get_container_update_override_key('etag')] = c_etag
@@ -730,37 +776,13 @@ class UploadController(Controller):
                 try:
                     req.get_response(self.app, 'DELETE', container, obj)
                 except NoSuchKey:
-                    # We know that this existed long enough for us to HEAD
+                    # The important thing is that we wrote out a tombstone to
+                    # make sure the marker got cleaned up. If it's already
+                    # gone (e.g., because of concurrent completes or a retried
+                    # complete), so much the better.
                     pass
 
-                result_elem = Element('CompleteMultipartUploadResult')
-
-                # NOTE: boto with sig v4 appends port to HTTP_HOST value at
-                # the request header when the port is non default value and it
-                # makes req.host_url like as http://localhost:8080:8080/path
-                # that obviously invalid. Probably it should be resolved at
-                # swift.common.swob though, tentatively we are parsing and
-                # reconstructing the correct host_url info here.
-                # in detail, https://github.com/boto/boto/pull/3513
-                parsed_url = urlparse(req.host_url)
-                host_url = '%s://%s' % (parsed_url.scheme, parsed_url.hostname)
-                # Why are we doing our own port parsing? Because py3 decided
-                # to start raising ValueErrors on access after parsing such
-                # an invalid port
-                netloc = parsed_url.netloc.split('@')[-1].split(']')[-1]
-                if ':' in netloc:
-                    port = netloc.split(':', 2)[1]
-                    host_url += ':%s' % port
-
-                SubElement(result_elem, 'Location').text = host_url + req.path
-                SubElement(result_elem, 'Bucket').text = req.container_name
-                SubElement(result_elem, 'Key').text = req.object_name
-                SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
-                resp.headers.pop('ETag', None)
-                if yielded_anything:
-                    yield b'\n'
-                yield tostring(result_elem,
-                               xml_declaration=not yielded_anything)
+                yield _make_complete_body(req, s3_etag, yielded_anything)
             except ErrorResponse as err_resp:
                 if yielded_anything:
                     err_resp.xml_declaration = False

@@ -45,7 +45,8 @@ from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
 from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, drain_and_close, \
-    document_iters_to_http_response_body, ShardRange, find_shard_range
+    document_iters_to_http_response_body, ShardRange, find_shard_range, \
+    cache_from_env
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -62,13 +63,15 @@ from swift.common.swob import Request, Response, Range, \
 from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_user_meta_prefix, is_user_meta, is_sys_meta, is_sys_or_user_meta, \
     http_response_to_document_iters, is_object_transient_sysmeta, \
-    strip_object_transient_sysmeta_prefix
+    strip_object_transient_sysmeta_prefix, get_ip_port, get_user_meta_prefix, \
+    get_sys_meta_prefix
 from swift.common.storage_policy import POLICIES
 
 
 DEFAULT_RECHECK_ACCOUNT_EXISTENCE = 60  # seconds
 DEFAULT_RECHECK_CONTAINER_EXISTENCE = 60  # seconds
 DEFAULT_RECHECK_UPDATING_SHARD_RANGES = 3600  # seconds
+DEFAULT_RECHECK_LISTING_SHARD_RANGES = 600  # seconds
 
 
 def update_headers(response, headers):
@@ -194,7 +197,98 @@ def headers_to_container_info(headers, status_int=HTTP_OK):
         'meta': meta,
         'sysmeta': sysmeta,
         'sharding_state': headers.get('x-backend-sharding-state', 'unsharded'),
+        # the 'internal' format version of timestamps is cached since the
+        # normal format can be derived from this when required
+        'created_at': headers.get('x-backend-timestamp'),
+        'put_timestamp': headers.get('x-backend-put-timestamp'),
+        'delete_timestamp': headers.get('x-backend-delete-timestamp'),
+        'status_changed_at': headers.get('x-backend-status-changed-at'),
     }
+
+
+def headers_from_container_info(info):
+    """
+    Construct a HeaderKeyDict from a container info dict.
+
+    :param info: a dict of container metadata
+    :returns: a HeaderKeyDict or None if info is None or any required headers
+        could not be constructed
+    """
+    if not info:
+        return None
+
+    required = (
+        ('x-backend-timestamp', 'created_at'),
+        ('x-backend-put-timestamp', 'put_timestamp'),
+        ('x-backend-delete-timestamp', 'delete_timestamp'),
+        ('x-backend-status-changed-at', 'status_changed_at'),
+        ('x-backend-storage-policy-index', 'storage_policy'),
+        ('x-container-object-count', 'object_count'),
+        ('x-container-bytes-used', 'bytes'),
+        ('x-backend-sharding-state', 'sharding_state'),
+    )
+    required_normal_format_timestamps = (
+        ('x-timestamp', 'created_at'),
+        ('x-put-timestamp', 'put_timestamp'),
+    )
+    optional = (
+        ('x-container-read', 'read_acl'),
+        ('x-container-write', 'write_acl'),
+        ('x-container-sync-key', 'sync_key'),
+        ('x-container-sync-to', 'sync_to'),
+        ('x-versions-location', 'versions'),
+    )
+    cors_optional = (
+        ('access-control-allow-origin', 'allow_origin'),
+        ('access-control-expose-headers', 'expose_headers'),
+        ('access-control-max-age', 'max_age')
+    )
+
+    def lookup(info, key):
+        # raises KeyError or ValueError
+        val = info[key]
+        if val is None:
+            raise ValueError
+        return val
+
+    # note: required headers may be missing from info for example during
+    # upgrade when stale info is still in cache
+    headers = HeaderKeyDict()
+    for hdr, key in required:
+        try:
+            headers[hdr] = lookup(info, key)
+        except (KeyError, ValueError):
+            return None
+
+    for hdr, key in required_normal_format_timestamps:
+        try:
+            headers[hdr] = Timestamp(lookup(info, key)).normal
+        except (KeyError, ValueError):
+            return None
+
+    for hdr, key in optional:
+        try:
+            headers[hdr] = lookup(info, key)
+        except (KeyError, ValueError):
+            pass
+
+    policy_index = info.get('storage_policy')
+    headers['x-storage-policy'] = POLICIES[int(policy_index)].name
+    prefix = get_user_meta_prefix('container')
+    headers.update(
+        (prefix + k, v)
+        for k, v in info.get('meta', {}).items())
+    for hdr, key in cors_optional:
+        try:
+            headers[prefix + hdr] = lookup(info.get('cors'), key)
+        except (KeyError, ValueError):
+            pass
+    prefix = get_sys_meta_prefix('container')
+    headers.update(
+        (prefix + k, v)
+        for k, v in info.get('sysmeta', {}).items())
+
+    return headers
 
 
 def headers_to_object_info(headers, status_int=HTTP_OK):
@@ -539,31 +633,27 @@ def set_info_cache(app, env, account, container, resp):
     :returns: the info that was placed into the cache, or None if the
               request status was not in (404, 410, 2xx).
     """
+    cache_key = get_cache_key(account, container)
     infocache = env.setdefault('swift.infocache', {})
+    memcache = cache_from_env(env, True)
+    if resp is None:
+        clear_info_cache(app, env, account, container)
+        return
 
-    cache_time = None
-    if container and resp:
+    if container:
         cache_time = int(resp.headers.get(
             'X-Backend-Recheck-Container-Existence',
             DEFAULT_RECHECK_CONTAINER_EXISTENCE))
-    elif resp:
+    else:
         cache_time = int(resp.headers.get(
             'X-Backend-Recheck-Account-Existence',
             DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
-    cache_key = get_cache_key(account, container)
 
-    if resp:
-        if resp.status_int in (HTTP_NOT_FOUND, HTTP_GONE):
-            cache_time *= 0.1
-        elif not is_success(resp.status_int):
-            cache_time = None
-
-    # Next actually set both memcache and the env cache
-    memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
-    if cache_time is None:
-        infocache.pop(cache_key, None)
-        if memcache:
-            memcache.delete(cache_key)
+    if resp.status_int in (HTTP_NOT_FOUND, HTTP_GONE):
+        cache_time *= 0.1
+    elif not is_success(resp.status_int):
+        # If we got a response, it was unsuccessful, and it wasn't an
+        # "authoritative" failure, bail without touching caches.
         return
 
     if container:
@@ -604,16 +694,24 @@ def set_object_info_cache(app, env, account, container, obj, resp):
     return info
 
 
-def clear_info_cache(app, env, account, container=None):
+def clear_info_cache(app, env, account, container=None, shard=None):
     """
     Clear the cached info in both memcache and env
 
     :param  app: the application object
     :param  env: the WSGI environment
     :param  account: the account name
-    :param  container: the containr name or None if setting info for containers
+    :param  container: the container name if clearing info for containers, or
+              None
+    :param  shard: the sharding state if clearing info for container shard
+              ranges, or None
     """
-    set_info_cache(app, env, account, container, None)
+    cache_key = get_cache_key(account, container, shard=shard)
+    infocache = env.setdefault('swift.infocache', {})
+    memcache = cache_from_env(env, True)
+    infocache.pop(cache_key, None)
+    if memcache:
+        memcache.delete(cache_key)
 
 
 def _get_info_from_infocache(env, account, container=None):
@@ -646,7 +744,7 @@ def _get_info_from_memcache(app, env, account, container=None):
       returns None if memcache is not in use.
     """
     cache_key = get_cache_key(account, container)
-    memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
+    memcache = cache_from_env(env, True)
     if memcache:
         info = memcache.get(cache_key)
         if info and six.PY2:
@@ -855,10 +953,10 @@ class ByteCountEnforcer(object):
             return chunk
 
 
-class ResumingGetter(object):
+class GetOrHeadHandler(object):
     def __init__(self, app, req, server_type, node_iter, partition, path,
-                 backend_headers, concurrency=1, client_chunk_size=None,
-                 newest=None, header_provider=None):
+                 backend_headers, concurrency=1, policy=None,
+                 client_chunk_size=None, newest=None):
         self.app = app
         self.node_iter = node_iter
         self.server_type = server_type
@@ -871,9 +969,13 @@ class ResumingGetter(object):
         self.used_nodes = []
         self.used_source_etag = ''
         self.concurrency = concurrency
+        self.policy = policy
         self.node = None
-        self.header_provider = header_provider
         self.latest_404_timestamp = Timestamp(0)
+        policy_options = self.app.get_policy_options(self.policy)
+        self.rebalance_missing_suppression_count = min(
+            policy_options.rebalance_missing_suppression_count,
+            node_iter.num_primary_nodes - 1)
 
         # stuff from request
         self.req_method = req.method
@@ -1011,13 +1113,6 @@ class ResumingGetter(object):
         if self.server_type == 'Object' and src.status == 416:
             return True
         return is_success(src.status) or is_redirection(src.status)
-
-    def response_parts_iter(self, req):
-        source, node = self._get_source_and_node()
-        it = None
-        if source:
-            it = self._get_response_parts_iter(req, node, source)
-        return it
 
     def _get_response_parts_iter(self, req, node, source):
         # Someday we can replace this [mess] with python 3's "nonlocal"
@@ -1262,14 +1357,12 @@ class ResumingGetter(object):
         if node in self.used_nodes:
             return False
         req_headers = dict(self.backend_headers)
-        # a request may be specialised with specific backend headers
-        if self.header_provider:
-            req_headers.update(self.header_provider())
+        ip, port = get_ip_port(node, req_headers)
         start_node_timing = time.time()
         try:
             with ConnectionTimeout(self.app.conn_timeout):
                 conn = http_connect(
-                    node['ip'], node['port'], node['device'],
+                    ip, port, node['device'],
                     self.partition, self.req_method, self.path,
                     headers=req_headers,
                     query_string=self.req_query_string)
@@ -1299,9 +1392,8 @@ class ResumingGetter(object):
                 close_swift_conn(possible_source)
             else:
                 if self.used_source_etag and \
-                    self.used_source_etag != normalize_etag(src_headers.get(
-                        'x-object-sysmeta-ec-etag',
-                        src_headers.get('etag', ''))):
+                        self.used_source_etag != normalize_etag(
+                            src_headers.get('etag', '')):
                     self.statuses.append(HTTP_NOT_FOUND)
                     self.reasons.append('')
                     self.bodies.append('')
@@ -1331,6 +1423,13 @@ class ResumingGetter(object):
                 # throw out 5XX and 404s from handoff nodes unless the data is
                 # really on disk and had been DELETEd
                 return False
+
+            if self.rebalance_missing_suppression_count > 0 and \
+                    possible_source.status == HTTP_NOT_FOUND and \
+                    not Timestamp(src_headers.get('x-backend-timestamp', 0)):
+                self.rebalance_missing_suppression_count -= 1
+                return False
+
             self.statuses.append(possible_source.status)
             self.reasons.append(possible_source.reason)
             self.bodies.append(possible_source.read())
@@ -1375,7 +1474,8 @@ class ResumingGetter(object):
         for node in nodes:
             pile.spawn(self._make_node_request, node, node_timeout,
                        self.app.logger.thread_locals)
-            _timeout = self.app.concurrency_timeout \
+            _timeout = self.app.get_policy_options(
+                self.policy).concurrency_timeout \
                 if pile.inflight < self.concurrency else None
             if pile.waitfirst(_timeout):
                 break
@@ -1401,18 +1501,14 @@ class ResumingGetter(object):
 
             # Save off the source etag so that, if we lose the connection
             # and have to resume from a different node, we can be sure that
-            # we have the same object (replication) or a fragment archive
-            # from the same object (EC). Otherwise, if the cluster has two
-            # versions of the same object, we might end up switching between
-            # old and new mid-stream and giving garbage to the client.
-            self.used_source_etag = normalize_etag(src_headers.get(
-                'x-object-sysmeta-ec-etag', src_headers.get('etag', '')))
+            # we have the same object (replication). Otherwise, if the cluster
+            # has two versions of the same object, we might end up switching
+            # between old and new mid-stream and giving garbage to the client.
+            self.used_source_etag = normalize_etag(src_headers.get('etag', ''))
             self.node = node
             return source, node
         return None, None
 
-
-class GetOrHeadHandler(ResumingGetter):
     def _make_app_iter(self, req, node, source):
         """
         Returns an iterator over the contents of the source (via its read
@@ -1504,17 +1600,21 @@ class NodeIter(object):
         if node_iter is None:
             node_iter = itertools.chain(
                 part_nodes, ring.get_more_nodes(partition))
-        num_primary_nodes = len(part_nodes)
-        self.nodes_left = self.app.request_node_count(num_primary_nodes)
-        self.expected_handoffs = self.nodes_left - num_primary_nodes
+        self.num_primary_nodes = len(part_nodes)
+        self.nodes_left = self.app.request_node_count(self.num_primary_nodes)
+        self.expected_handoffs = self.nodes_left - self.num_primary_nodes
 
         # Use of list() here forcibly yanks the first N nodes (the primary
         # nodes) from node_iter, so the rest of its values are handoffs.
         self.primary_nodes = self.app.sort_nodes(
-            list(itertools.islice(node_iter, num_primary_nodes)),
+            list(itertools.islice(node_iter, self.num_primary_nodes)),
             policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
+
+    @property
+    def primaries_left(self):
+        return len(self.primary_nodes)
 
     def __iter__(self):
         self._node_iter = self._node_gen()
@@ -1539,7 +1639,7 @@ class NodeIter(object):
             self.app.logger.increment('handoff_count')
             self.app.logger.warning(
                 'Handoff requested (%d)' % handoffs)
-            if (extra_handoffs == len(self.primary_nodes)):
+            if (extra_handoffs == self.num_primary_nodes):
                 # all the primaries were skipped, and handoffs didn't help
                 self.app.logger.increment('handoff_all_count')
 
@@ -1555,7 +1655,8 @@ class NodeIter(object):
         self._node_provider = callback
 
     def _node_gen(self):
-        for node in self.primary_nodes:
+        while self.primary_nodes:
+            node = self.primary_nodes.pop(0)
             if not self.app.error_limited(node):
                 yield node
                 if not self.app.error_limited(node):
@@ -1679,12 +1780,12 @@ class Controller(object):
         headers['referer'] = referer
         return headers
 
-    def account_info(self, account, req=None):
+    def account_info(self, account, req):
         """
         Get account information, and also verify that the account exists.
 
         :param account: native str name of the account to get the info for
-        :param req: caller's HTTP request context object (optional)
+        :param req: caller's HTTP request context object
         :returns: tuple of (account partition, account nodes, container_count)
                   or (None, None, None) if it does not exist
         """
@@ -1705,14 +1806,14 @@ class Controller(object):
         partition, nodes = self.app.account_ring.get_nodes(account)
         return partition, nodes, container_count
 
-    def container_info(self, account, container, req=None):
+    def container_info(self, account, container, req):
         """
         Get container information and thusly verify container existence.
         This will also verify account existence.
 
         :param account: native-str account name for the container
         :param container: native-str container name to look up
-        :param req: caller's HTTP request context object (optional)
+        :param req: caller's HTTP request context object
         :returns: dict containing at least container partition ('partition'),
                   container nodes ('containers'), container read
                   acl ('read_acl'), container write acl ('write_acl'),
@@ -1767,11 +1868,12 @@ class Controller(object):
             headers['Content-Length'] = str(len(body))
         for node in nodes:
             try:
+                ip, port = get_ip_port(node, headers)
                 start_node_timing = time.time()
                 with ConnectionTimeout(self.app.conn_timeout):
-                    conn = http_connect(node['ip'], node['port'],
-                                        node['device'], part, method, path,
-                                        headers=headers, query_string=query)
+                    conn = http_connect(
+                        ip, port, node['device'], part, method, path,
+                        headers=headers, query_string=query)
                     conn.node = node
                 self.app.set_node_timing(node, time.time() - start_node_timing)
                 if body:
@@ -2008,7 +2110,7 @@ class Controller(object):
             return False
 
     def GETorHEAD_base(self, req, server_type, node_iter, partition, path,
-                       concurrency=1, client_chunk_size=None):
+                       concurrency=1, policy=None, client_chunk_size=None):
         """
         Base handler for HTTP GET or HEAD requests.
 
@@ -2018,6 +2120,7 @@ class Controller(object):
         :param partition: partition
         :param path: path for the request
         :param concurrency: number of requests to run concurrently
+        :param policy: the policy instance, or None if Account or Container
         :param client_chunk_size: chunk size for response body iterator
         :returns: swob.Response object
         """
@@ -2026,7 +2129,7 @@ class Controller(object):
 
         handler = GetOrHeadHandler(self.app, req, self.server_type, node_iter,
                                    partition, path, backend_headers,
-                                   concurrency,
+                                   concurrency, policy=policy,
                                    client_chunk_size=client_chunk_size)
         res = handler.get_working_response(req)
 
@@ -2156,6 +2259,24 @@ class Controller(object):
             raise ValueError(
                 "server_type can only be 'account' or 'container'")
 
+    def _parse_listing_response(self, req, response):
+        if not is_success(response.status_int):
+            self.app.logger.warning(
+                'Failed to get container listing from %s: %s',
+                req.path_qs, response.status_int)
+            return None
+
+        try:
+            data = json.loads(response.body)
+            if not isinstance(data, list):
+                raise ValueError('not a list')
+            return data
+        except ValueError as err:
+            self.app.logger.error(
+                'Problem with listing response from %s: %r',
+                req.path_qs, err)
+            return None
+
     def _get_container_listing(self, req, account, container, headers=None,
                                params=None):
         """
@@ -2163,7 +2284,7 @@ class Controller(object):
 
         :param req: original Request instance.
         :param account: account in which `container` is stored.
-        :param container: container from listing should be fetched.
+        :param container: container from which listing should be fetched.
         :param headers: headers to be included with the request
         :param params: query string parameters to be used.
         :return: a tuple of (deserialized json data structure, swob Response)
@@ -2181,23 +2302,28 @@ class Controller(object):
         self.app.logger.debug(
             'Get listing from %s %s' % (subreq.path_qs, headers))
         response = self.app.handle_request(subreq)
+        data = self._parse_listing_response(req, response)
+        return data, response
 
-        if not is_success(response.status_int):
-            self.app.logger.warning(
-                'Failed to get container listing from %s: %s',
-                subreq.path_qs, response.status_int)
-            return None, response
+    def _parse_shard_ranges(self, req, listing, response):
+        if listing is None:
+            return None
+
+        record_type = response.headers.get('x-backend-record-type')
+        if record_type != 'shard':
+            err = 'unexpected record type %r' % record_type
+            self.app.logger.error("Failed to get shard ranges from %s: %s",
+                                  req.path_qs, err)
+            return None
 
         try:
-            data = json.loads(response.body)
-            if not isinstance(data, list):
-                raise ValueError('not a list')
-            return data, response
-        except ValueError as err:
+            return [ShardRange.from_dict(shard_range)
+                    for shard_range in listing]
+        except (ValueError, TypeError, KeyError) as err:
             self.app.logger.error(
-                'Problem with listing response from %s: %r',
-                subreq.path_qs, err)
-            return None, response
+                "Failed to get shard ranges from %s: invalid data: %r",
+                req.path_qs, err)
+            return None
 
     def _get_shard_ranges(self, req, account, container, includes=None,
                           states=None):
@@ -2225,24 +2351,7 @@ class Controller(object):
         headers = {'X-Backend-Record-Type': 'shard'}
         listing, response = self._get_container_listing(
             req, account, container, headers=headers, params=params)
-        if listing is None:
-            return None
-
-        record_type = response.headers.get('x-backend-record-type')
-        if record_type != 'shard':
-            err = 'unexpected record type %r' % record_type
-            self.app.logger.error("Failed to get shard ranges from %s: %s",
-                                  req.path_qs, err)
-            return None
-
-        try:
-            return [ShardRange.from_dict(shard_range)
-                    for shard_range in listing]
-        except (ValueError, TypeError, KeyError) as err:
-            self.app.logger.error(
-                "Failed to get shard ranges from %s: invalid data: %r",
-                req.path_qs, err)
-            return None
+        return self._parse_shard_ranges(req, listing, response)
 
     def _get_update_shard(self, req, account, container, obj):
         """
@@ -2269,8 +2378,7 @@ class Controller(object):
 
         cache_key = get_cache_key(account, container, shard='updating')
         infocache = req.environ.setdefault('swift.infocache', {})
-        memcache = getattr(self.app, 'memcache', None) or req.environ.get(
-            'swift.cache')
+        memcache = cache_from_env(req.environ, True)
 
         cached_ranges = infocache.get(cache_key)
         if cached_ranges is None and memcache:

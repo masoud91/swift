@@ -17,6 +17,7 @@ import os
 from textwrap import dedent
 import unittest
 
+from eventlet.green import ssl
 import mock
 from six.moves.configparser import NoSectionError, NoOptionError
 
@@ -159,6 +160,32 @@ class TestCacheMiddleware(unittest.TestCase):
         self.assertEqual(app.memcache._allow_unpickle, True)
         self.assertEqual(
             app.memcache._client_cache['6.7.8.9:10'].max_size, 5)
+
+    def test_conf_inline_ratelimiting(self):
+        with mock.patch.object(memcache, 'ConfigParser', get_config_parser()):
+            app = memcache.MemcacheMiddleware(
+                FakeApp(),
+                {'error_suppression_limit': '5',
+                 'error_suppression_interval': '2.5'})
+        self.assertEqual(app.memcache._error_limit_count, 5)
+        self.assertEqual(app.memcache._error_limit_time, 2.5)
+        self.assertEqual(app.memcache._error_limit_duration, 2.5)
+
+    def test_conf_inline_tls(self):
+        fake_context = mock.Mock()
+        with mock.patch.object(ssl, 'create_default_context',
+                               return_value=fake_context):
+            with mock.patch.object(memcache, 'ConfigParser',
+                                   get_config_parser()):
+                memcache.MemcacheMiddleware(
+                    FakeApp(),
+                    {'tls_enabled': 'true',
+                     'tls_cafile': 'cafile',
+                     'tls_certfile': 'certfile',
+                     'tls_keyfile': 'keyfile'})
+            ssl.create_default_context.assert_called_with(cafile='cafile')
+            fake_context.load_cert_chain.assert_called_with('certfile',
+                                                            'keyfile')
 
     def test_conf_extra_no_section(self):
         with mock.patch.object(memcache, 'ConfigParser',
@@ -323,6 +350,7 @@ class TestCacheMiddleware(unittest.TestCase):
         pool_timeout = 0.5
         tries = 4
         io_timeout = 1.0
+        tls_enabled = true
         """
         config_path = os.path.join(tempdir, 'test.conf')
         with open(config_path, 'w') as f:
@@ -336,6 +364,12 @@ class TestCacheMiddleware(unittest.TestCase):
         # tries is limited to server count
         self.assertEqual(memcache_ring._tries, 4)
         self.assertEqual(memcache_ring._io_timeout, 1.0)
+        self.assertEqual(memcache_ring._error_limit_count, 10)
+        self.assertEqual(memcache_ring._error_limit_time, 60)
+        self.assertEqual(memcache_ring._error_limit_duration, 60)
+        self.assertIsInstance(
+            list(memcache_ring._client_cache.values())[0]._tls_context,
+            ssl.SSLContext)
 
     @with_tempdir
     def test_real_memcache_config(self, tempdir):
@@ -363,6 +397,8 @@ class TestCacheMiddleware(unittest.TestCase):
             10.0.0.4:11211
         connect_timeout = 0.5
         io_timeout = 1.0
+        error_suppression_limit = 0
+        error_suppression_interval = 1.5
         """
         memcache_config_path = os.path.join(tempdir, 'memcache.conf')
         with open(memcache_config_path, 'w') as f:
@@ -376,6 +412,9 @@ class TestCacheMiddleware(unittest.TestCase):
         self.assertEqual(memcache_ring._tries, 3)
         # memcache conf options are defaults
         self.assertEqual(memcache_ring._io_timeout, 1.0)
+        self.assertEqual(memcache_ring._error_limit_count, 0)
+        self.assertEqual(memcache_ring._error_limit_time, 1.5)
+        self.assertEqual(memcache_ring._error_limit_duration, 1.5)
 
 
 if __name__ == '__main__':

@@ -23,13 +23,13 @@ import boto
 # pylint: disable-msg=E0611,F0401
 from distutils.version import StrictVersion
 
-from hashlib import md5
 from six.moves import zip, zip_longest
 
 import test.functional as tf
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     Element, SubElement
 from swift.common.middleware.s3api.utils import mktime
+from swift.common.utils import md5
 
 from test.functional.s3api import S3ApiBase
 from test.functional.s3api.s3_test_client import Connection
@@ -78,9 +78,9 @@ class TestS3ApiMultiUpload(S3ApiBase):
     def _upload_part(self, bucket, key, upload_id, content=None, part_num=1):
         query = 'partNumber=%s&uploadId=%s' % (part_num, upload_id)
         content = content if content else b'a' * self.min_segment_size
-        status, headers, body = \
-            self.conn.make_request('PUT', bucket, key, body=content,
-                                   query=query)
+        with self.quiet_boto_logging():
+            status, headers, body = self.conn.make_request(
+                'PUT', bucket, key, body=content, query=query)
         return status, headers, body
 
     def _upload_part_copy(self, src_bucket, src_obj, dst_bucket, dst_key,
@@ -113,7 +113,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         bucket = 'bucket'
         keys = ['obj1', 'obj2', 'obj3']
         bad_content_md5 = base64.b64encode(b'a' * 16).strip().decode('ascii')
-        headers = [None,
+        headers = [{'Content-Type': 'foo/bar', 'x-amz-meta-baz': 'quux'},
                    {'Content-MD5': bad_content_md5},
                    {'Etag': 'nonsense'}]
         uploads = []
@@ -180,7 +180,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         # Upload Part
         key, upload_id = uploads[0]
         content = b'a' * self.min_segment_size
-        etag = md5(content).hexdigest()
+        etag = md5(content, usedforsecurity=False).hexdigest()
         status, headers, body = \
             self._upload_part(bucket, key, upload_id, content)
         self.assertEqual(status, 200)
@@ -196,7 +196,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         src_bucket = 'bucket2'
         src_obj = 'obj3'
         src_content = b'b' * self.min_segment_size
-        etag = md5(src_content).hexdigest()
+        etag = md5(src_content, usedforsecurity=False).hexdigest()
 
         # prepare src obj
         self.conn.make_request('PUT', src_bucket)
@@ -293,7 +293,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
             self._complete_multi_upload(bucket, key, upload_id, xml)
         self.assertEqual(status, 200)
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-type' in headers)
+        self.assertIn('content-type', headers)
         self.assertEqual(headers['content-type'], 'application/xml')
         if 'content-length' in headers:
             self.assertEqual(headers['content-length'], str(len(body)))
@@ -304,22 +304,60 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertTrue(lines[0].startswith(b'<?xml'), body)
         self.assertTrue(lines[0].endswith(b'?>'), body)
         elem = fromstring(body, 'CompleteMultipartUploadResult')
-        # TODO: use tf.config value
         self.assertEqual(
-            'http://%s:%s/bucket/obj1' % (self.conn.host, self.conn.port),
+            '%s/bucket/obj1' % tf.config['s3_storage_url'].rstrip('/'),
             elem.find('Location').text)
         self.assertEqual(elem.find('Bucket').text, bucket)
         self.assertEqual(elem.find('Key').text, key)
         concatted_etags = b''.join(
             etag.strip('"').encode('ascii') for etag in etags)
         exp_etag = '"%s-%s"' % (
-            md5(binascii.unhexlify(concatted_etags)).hexdigest(), len(etags))
+            md5(binascii.unhexlify(concatted_etags),
+                usedforsecurity=False).hexdigest(), len(etags))
         etag = elem.find('ETag').text
         self.assertEqual(etag, exp_etag)
 
         exp_size = self.min_segment_size * len(etags)
-        swift_etag = '"%s"' % md5(concatted_etags).hexdigest()
+        status, headers, body = \
+            self.conn.make_request('HEAD', bucket, key)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['content-length'], str(exp_size))
+        self.assertEqual(headers['content-type'], 'foo/bar')
+        self.assertEqual(headers['x-amz-meta-baz'], 'quux')
+
+        swift_etag = '"%s"' % md5(
+            concatted_etags, usedforsecurity=False).hexdigest()
         # TODO: GET via swift api, check against swift_etag
+
+        # Should be safe to retry
+        status, headers, body = \
+            self._complete_multi_upload(bucket, key, upload_id, xml)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+        self.assertIn('content-type', headers)
+        self.assertEqual(headers['content-type'], 'application/xml')
+        if 'content-length' in headers:
+            self.assertEqual(headers['content-length'], str(len(body)))
+        else:
+            self.assertIn('transfer-encoding', headers)
+            self.assertEqual(headers['transfer-encoding'], 'chunked')
+        lines = body.split(b'\n')
+        self.assertTrue(lines[0].startswith(b'<?xml'), body)
+        self.assertTrue(lines[0].endswith(b'?>'), body)
+        elem = fromstring(body, 'CompleteMultipartUploadResult')
+        self.assertEqual(
+            '%s/bucket/obj1' % tf.config['s3_storage_url'].rstrip('/'),
+            elem.find('Location').text)
+        self.assertEqual(elem.find('Bucket').text, bucket)
+        self.assertEqual(elem.find('Key').text, key)
+        self.assertEqual(elem.find('ETag').text, exp_etag)
+
+        status, headers, body = \
+            self.conn.make_request('HEAD', bucket, key)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['content-length'], str(exp_size))
+        self.assertEqual(headers['content-type'], 'foo/bar')
+        self.assertEqual(headers['x-amz-meta-baz'], 'quux')
 
         # Upload Part Copy -- MU as source
         key, upload_id = uploads[1]
@@ -339,7 +377,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertIsNotNone(last_modified)
 
         exp_content = b'a' * self.min_segment_size
-        etag = md5(exp_content).hexdigest()
+        etag = md5(exp_content, usedforsecurity=False).hexdigest()
         self.assertEqual(resp_etag, etag)
 
         # Also check that the etag is correct in part listings
@@ -428,7 +466,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.conn.make_request('PUT', bucket)
         query = 'uploads'
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('POST', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -442,7 +480,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.conn.make_request('PUT', bucket)
         query = 'uploads'
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('GET', bucket, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -462,7 +500,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'partNumber=%s&uploadId=%s' % (1, upload_id)
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -500,7 +538,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'partNumber=%s&uploadId=%s' % (1, upload_id)
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', bucket, key,
                                          headers={
@@ -541,7 +579,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'uploadId=%s' % upload_id
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
 
         status, headers, body = \
             auth_error_conn.make_request('GET', bucket, key, query=query)
@@ -568,7 +606,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self._upload_part(bucket, key, upload_id)
 
         query = 'uploadId=%s' % upload_id
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('DELETE', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -612,7 +650,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertEqual(get_error_code(body), 'EntityTooSmall')
 
         # invalid credentials
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('POST', bucket, keys[0], body=xml,
                                          query=query)
@@ -822,7 +860,9 @@ class TestS3ApiMultiUpload(S3ApiBase):
         src_content = b'y' * (self.min_segment_size // 2) + b'z' * \
             self.min_segment_size
         src_range = 'bytes=0-%d' % (self.min_segment_size - 1)
-        etag = md5(src_content[:self.min_segment_size]).hexdigest()
+        etag = md5(
+            src_content[:self.min_segment_size],
+            usedforsecurity=False).hexdigest()
 
         # prepare src obj
         self.conn.make_request('PUT', src_bucket)
@@ -881,6 +921,8 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertEqual(headers['content-length'], '0')
 
     def test_object_multi_upload_part_copy_version(self):
+        if 'object_versioning' not in tf.cluster_info:
+            self.skipTest('Object Versioning not enabled')
         bucket = 'bucket'
         keys = ['obj1']
         uploads = []
@@ -913,7 +955,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         src_obj = 'obj4'
         src_content = b'y' * (self.min_segment_size // 2) + b'z' * \
             self.min_segment_size
-        etags = [md5(src_content).hexdigest()]
+        etags = [md5(src_content, usedforsecurity=False).hexdigest()]
 
         # prepare null-version src obj
         self.conn.make_request('PUT', src_bucket)
@@ -931,7 +973,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
 
         src_obj2 = 'obj5'
         src_content2 = b'stub'
-        etags.append(md5(src_content2).hexdigest())
+        etags.append(md5(src_content2, usedforsecurity=False).hexdigest())
 
         # prepare src obj w/ real version
         self.conn.make_request('PUT', src_bucket, src_obj2, body=src_content2)
@@ -1060,7 +1102,7 @@ class TestS3ApiMultiUploadSigV4(TestS3ApiMultiUpload):
 
         # Complete Multipart Upload
         key, upload_id = uploads[0]
-        etags = [md5(content).hexdigest()]
+        etags = [md5(content, usedforsecurity=False).hexdigest()]
         xml = self._gen_comp_xml(etags)
         status, headers, body = \
             self._complete_multi_upload(bucket, key, upload_id, xml)

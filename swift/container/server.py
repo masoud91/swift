@@ -32,9 +32,9 @@ from swift.container.backend import ContainerBroker, DATADIR, \
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.container_sync_realms import ContainerSyncRealms
-from swift.common.request_helpers import get_param, \
-    split_and_validate_path, is_sys_or_user_meta, \
-    validate_internal_container, validate_internal_obj, constrain_req_limit
+from swift.common.request_helpers import split_and_validate_path, \
+    is_sys_or_user_meta, validate_internal_container, validate_internal_obj, \
+    validate_container_params
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
@@ -43,7 +43,6 @@ from swift.common.utils import get_logger, hash_path, public, \
     ShardRange
 from swift.common.constraints import valid_timestamp, check_utf8, \
     check_drive, AUTO_CREATE_ACCOUNT_PREFIX
-from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.http import HTTP_NO_CONTENT, HTTP_NOT_FOUND, is_success
@@ -155,6 +154,8 @@ class ContainerController(BaseStorageServer):
                 conf['auto_create_account_prefix']
         else:
             self.auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
+        self.shards_account_prefix = (
+            self.auto_create_account_prefix + 'shards_')
         if config_true_value(conf.get('allow_versions', 'f')):
             self.save_headers.append('x-versions-location')
         if 'allow_versions' in conf:
@@ -375,14 +376,12 @@ class ContainerController(BaseStorageServer):
         # auto create accounts)
         obj_policy_index = self.get_and_validate_policy_index(req) or 0
         broker = self._get_container_broker(drive, part, account, container)
-        if account.startswith(self.auto_create_account_prefix) and obj and \
-                not os.path.exists(broker.db_file):
-            try:
-                broker.initialize(req_timestamp.internal, obj_policy_index)
-            except DatabaseAlreadyExists:
-                pass
-        if not os.path.exists(broker.db_file):
+        if obj:
+            self._maybe_autocreate(broker, req_timestamp, account,
+                                   obj_policy_index, req)
+        elif not os.path.exists(broker.db_file):
             return HTTPNotFound()
+
         if obj:     # delete object
             # redirect if a shard range exists for the object name
             redirect = self._redirect_to_shard(req, broker, obj)
@@ -449,11 +448,25 @@ class ContainerController(BaseStorageServer):
             broker.update_status_changed_at(timestamp)
         return recreated
 
+    def _should_autocreate(self, account, req):
+        auto_create_header = req.headers.get('X-Backend-Auto-Create')
+        if auto_create_header:
+            # If the caller included an explicit X-Backend-Auto-Create header,
+            # assume they know the behavior they want
+            return config_true_value(auto_create_header)
+        if account.startswith(self.shards_account_prefix):
+            # we have to specical case this subset of the
+            # auto_create_account_prefix because we don't want the updater
+            # accidently auto-creating shards; only the sharder creates
+            # shards and it will explicitly tell the server to do so
+            return False
+        return account.startswith(self.auto_create_account_prefix)
+
     def _maybe_autocreate(self, broker, req_timestamp, account,
-                          policy_index):
+                          policy_index, req):
         created = False
-        if account.startswith(self.auto_create_account_prefix) and \
-                not os.path.exists(broker.db_file):
+        should_autocreate = self._should_autocreate(account, req)
+        if should_autocreate and not os.path.exists(broker.db_file):
             if policy_index is None:
                 raise HTTPBadRequest(
                     'X-Backend-Storage-Policy-Index header is required')
@@ -506,8 +519,8 @@ class ContainerController(BaseStorageServer):
             # obj put expects the policy_index header, default is for
             # legacy support during upgrade.
             obj_policy_index = requested_policy_index or 0
-            self._maybe_autocreate(broker, req_timestamp, account,
-                                   obj_policy_index)
+            self._maybe_autocreate(
+                broker, req_timestamp, account, obj_policy_index, req)
             # redirect if a shard exists for this object name
             response = self._redirect_to_shard(req, broker, obj)
             if response:
@@ -531,8 +544,8 @@ class ContainerController(BaseStorageServer):
                                 for sr in json.loads(req.body)]
             except (ValueError, KeyError, TypeError) as err:
                 return HTTPBadRequest('Invalid body: %r' % err)
-            created = self._maybe_autocreate(broker, req_timestamp, account,
-                                             requested_policy_index)
+            created = self._maybe_autocreate(
+                broker, req_timestamp, account, requested_policy_index, req)
             self._update_metadata(req, broker, req_timestamp, 'PUT')
             if shard_ranges:
                 # TODO: consider writing the shard ranges into the pending
@@ -633,6 +646,19 @@ class ContainerController(BaseStorageServer):
           ``sharded``, then the listing will be a list of shard ranges;
           otherwise the response body will be a list of objects.
 
+        * Both shard range and object listings may be filtered according to
+          the constraints described below. However, the
+          ``X-Backend-Ignore-Shard-Name-Filter`` header may be used to override
+          the application of the ``marker``, ``end_marker``, ``includes`` and
+          ``reverse`` parameters to shard range listings. These parameters will
+          be ignored if the header has the value 'sharded' and the current db
+          sharding state is also 'sharded'. Note that this header does not
+          override the ``states`` constraint on shard range listings.
+
+        * The order of both shard range and object listings may be reversed by
+          using a ``reverse`` query string parameter with a
+          value in :attr:`swift.common.utils.TRUE_VALUES`.
+
         * Both shard range and object listings may be constrained to a name
           range by the ``marker`` and ``end_marker`` query string parameters.
           Object listings will only contain objects whose names are greater
@@ -684,13 +710,14 @@ class ContainerController(BaseStorageServer):
         :returns: an instance of :class:`swift.common.swob.Response`
         """
         drive, part, account, container, obj = get_obj_name_and_placement(req)
-        path = get_param(req, 'path')
-        prefix = get_param(req, 'prefix')
-        delimiter = get_param(req, 'delimiter')
-        marker = get_param(req, 'marker', '')
-        end_marker = get_param(req, 'end_marker')
-        limit = constrain_req_limit(req, constraints.CONTAINER_LISTING_LIMIT)
-        reverse = config_true_value(get_param(req, 'reverse'))
+        params = validate_container_params(req)
+        path = params.get('path')
+        prefix = params.get('prefix')
+        delimiter = params.get('delimiter')
+        marker = params.get('marker', '')
+        end_marker = params.get('end_marker')
+        limit = params['limit']
+        reverse = config_true_value(params.get('reverse'))
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
             check_drive(self.root, drive, self.mount_check)
@@ -701,8 +728,8 @@ class ContainerController(BaseStorageServer):
                                             stale_reads_ok=True)
         info, is_deleted = broker.get_info_is_deleted()
         record_type = req.headers.get('x-backend-record-type', '').lower()
-        if record_type == 'auto' and info.get('db_state') in (SHARDING,
-                                                              SHARDED):
+        db_state = info.get('db_state')
+        if record_type == 'auto' and db_state in (SHARDING, SHARDED):
             record_type = 'shard'
         if record_type == 'shard':
             override_deleted = info and config_true_value(
@@ -712,8 +739,16 @@ class ContainerController(BaseStorageServer):
             if is_deleted and not override_deleted:
                 return HTTPNotFound(request=req, headers=resp_headers)
             resp_headers['X-Backend-Record-Type'] = 'shard'
-            includes = get_param(req, 'includes')
-            states = get_param(req, 'states')
+            includes = params.get('includes')
+            override_filter_hdr = req.headers.get(
+                'x-backend-override-shard-name-filter', '').lower()
+            if override_filter_hdr == db_state == 'sharded':
+                # respect the request to send back *all* ranges if the db is in
+                # sharded state
+                resp_headers['X-Backend-Override-Shard-Name-Filter'] = 'true'
+                marker = end_marker = includes = None
+                reverse = False
+            states = params.get('states')
             fill_gaps = False
             if states:
                 states = list_from_csv(states)
@@ -805,7 +840,7 @@ class ContainerController(BaseStorageServer):
         requested_policy_index = self.get_and_validate_policy_index(req)
         broker = self._get_container_broker(drive, part, account, container)
         self._maybe_autocreate(broker, req_timestamp, account,
-                               requested_policy_index)
+                               requested_policy_index, req)
         try:
             objs = json.load(req.environ['wsgi.input'])
         except ValueError as err:

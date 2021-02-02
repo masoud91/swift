@@ -85,7 +85,7 @@ bind_port = 8080
 # CORS documentation).
 # cors_expose_headers =
 #
-# client_timeout = 60
+# client_timeout = 60.0
 # eventlet_debug = false
 #
 # You can set scheduling priority of processes. Niceness values range from -20
@@ -131,11 +131,18 @@ use = egg:swift#proxy
 # recheck_account_existence = 60
 # recheck_container_existence = 60
 #
-# How long the proxy should cache a set of shard ranges for a container.
+# How long the proxy should cache a set of shard ranges for a container when
+# the set is to be used for directing object updates.
 # Note that stale shard range info should be fine; updates will still
 # eventually make their way to the correct shard. As a result, you can
 # usually set this much higher than the existence checks above.
 # recheck_updating_shard_ranges = 3600
+#
+# How long the proxy should cache a set of shard ranges for a container when
+# the set is to be used for gathering object listings.
+# Note that stale shard range info might result in incomplete object listings
+# so this value should be set less than recheck_updating_shard_ranges.
+# recheck_listing_shard_ranges = 600
 #
 # object_chunk_size = 65536
 # client_chunk_size = 65536
@@ -160,6 +167,7 @@ use = egg:swift#proxy
 #
 # How long without an error before a node's error count is reset. This will
 # also be how long before a node is reenabled after suppression is triggered.
+# Set to 0 to disable error-limiting.
 # error_suppression_interval = 60
 #
 # How many errors can accumulate before a node is temporarily ignored.
@@ -200,12 +208,20 @@ use = egg:swift#proxy
 # the number of seconds configured by timing_expiry.
 # timing_expiry = 300
 #
-# By default on a GET/HEAD swift will connect to a storage node one at a time
-# in a single thread. There is smarts in the order they are hit however. If you
-# turn on concurrent_gets below, then replica count threads will be used.
-# With addition of the concurrency_timeout option this will allow swift to send
-# out GET/HEAD requests to the storage nodes concurrently and answer with the
-# first to respond. With an EC policy the parameter only affects HEAD requests.
+# Normally, you should only be moving one replica's worth of data at a time
+# when rebalancing. If you're rebalancing more aggressively, increase this
+# to avoid erroneously returning a 404 when the primary assignments that
+# *didn't* change get overloaded.
+# rebalance_missing_suppression_count = 1
+#
+# By default on a GET/HEAD swift will connect to a minimum number storage nodes
+# in a minimum number of threads - for replicated data just a single request to
+# a single node one at a time.  When enabled concurrent_gets allows the proxy
+# to use up to replica count threads when waiting on a response.  In
+# conjunction with the concurrency_timeout option this will allow swift to send
+# out GET/HEAD requests to the storage nodes concurrently and answer as soon as
+# the minimum number of backend responses are availabe - in replicated contexts
+# this will be the first backend replica to respond.
 # concurrent_gets = off
 #
 # This parameter controls how long to wait before firing off the next
@@ -214,6 +230,13 @@ use = egg:swift#proxy
 # between 0 and node_timeout. The default is what ever you set for the
 # conn_timeout parameter.
 # concurrency_timeout = 0.5
+#
+# By default on a EC GET request swift will connect to a minimum number of
+# storage nodes in a minimum number of threads - for erasure coded data, ndata
+# requests to primary nodes are started at the same time.  When greater than
+# zero this option provides additional robustness and may reduce first byte
+# latency by starting additional requests - up to as many as nparity.
+# concurrent_ec_extra_requests = 0
 #
 # Set to the number of nodes to contact for a normal request. You can use
 # '* replicas' at the end to have it use the number given times the number of
@@ -285,6 +308,16 @@ use = egg:swift#proxy
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# When upgrading from liberasurecode<=1.5.0, you may want to continue writing
+# legacy CRCs until all nodes are upgraded and capabale of reading fragments
+# with zlib CRCs. liberasurecode>=1.6.2 checks for the environment variable
+# LIBERASURECODE_WRITE_LEGACY_CRC; if set (value doesn't matter), it will use
+# its legacy CRC. Set this option to true or false to ensure the environment
+# variable is or is not set. Leave the option blank or absent to not touch
+# the environment (default). For more information, see
+# https://bugs.launchpad.net/liberasurecode/+bug/1886088
+# write_legacy_ec_crc =
 
 # Some proxy-server configuration options may be overridden on a per-policy
 # basis by including per-policy config section(s). The value of any option
@@ -298,6 +331,10 @@ use = egg:swift#proxy
 # write_affinity =
 # write_affinity_node_count =
 # write_affinity_handoff_delete_count =
+# rebalance_missing_suppression_count = 1
+# concurrent_gets = off
+# concurrency_timeout = 0.5
+# concurrent_ec_extra_requests = 0
 
 [filter:tempauth]
 use = egg:swift#tempauth
@@ -470,7 +507,10 @@ use = egg:swift#s3api
 # With either tempauth or your custom auth:
 # - Put s3api just before your auth filter(s) in the pipeline
 # With keystone:
-# - Put s3api and s3token before keystoneauth in the pipeline
+# - Put s3api and s3token before keystoneauth in the pipeline, but after
+#   auth_token
+# If you have ratelimit enabled for Swift requests, you may want to place a
+# second copy after auth to also ratelimit S3 requests.
 #
 # Swift has no concept of the S3's resource owner; the resources
 # (i.e. containers and objects) created via the Swift API have no owner
@@ -543,7 +583,9 @@ use = egg:swift#s3api
 # Enable multi-part uploads. (default: true)
 # This is required to store files larger than Swift's max_file_size (by
 # default, 5GiB). Note that has performance implications when deleting objects,
-# as we now have to check for whether there are also segments to delete.
+# as we now have to check for whether there are also segments to delete. The
+# SLO middleware must be in the pipeline after s3api for this option to have
+# effect.
 # allow_multipart_uploads = True
 #
 # Set the maximum number of parts for Upload Part operation.(default: 1000)
@@ -573,6 +615,10 @@ use = egg:swift#s3api
 # AWS S3 document says that each part must be at least 5 MB in a multipart
 # upload, except the last part.
 # min_segment_size = 5242880
+#
+# AWS allows clock skew up to 15 mins; note that older versions of swift/swift3
+# allowed at most 5 mins.
+# allowable_clock_skew = 900
 
 # You can override the default log routing for this filter here:
 # log_name = s3api
@@ -670,6 +716,18 @@ use = egg:swift#memcache
 #
 # Sets the maximum number of connections to each memcached server per worker
 # memcache_max_connections = 2
+#
+# How long without an error before a server's error count is reset. This will
+# also be how long before a server is reenabled after suppression is triggered.
+# Set to 0 to disable error-limiting.
+# error_suppression_interval = 60.0
+#
+# How many errors can accumulate before a server is temporarily ignored.
+# error_suppression_limit = 10
+#
+# (Optional) Global toggle for TLS usage when comunicating with
+# the caching servers.
+# tls_enabled =
 #
 # More options documented in memcache.conf-sample
 
@@ -884,6 +942,10 @@ use = egg:swift#proxy_logging
 # access_log_level = INFO
 # access_log_address = /dev/log
 #
+# Log route for this filter. Useful if you want to have different configs for
+# the two proxy-logging filters.
+# access_log_route = proxy-server
+#
 # If set, access_log_udp_host will override access_log_address
 # access_log_udp_host =
 # access_log_udp_port = 514
@@ -928,7 +990,7 @@ use = egg:swift#proxy_logging
 # log_anonymization_method = MD5
 #
 # Salt added during log anonymization
-# log_anonymization_salt = 
+# log_anonymization_salt =
 #
 # Template used to format access logs. All words surrounded by curly brackets
 # will be substituted with the appropriate values
@@ -996,6 +1058,13 @@ use = egg:swift#slo
 # clients may request that Swift send whitespace ahead of the final response
 # body. This whitespace will be yielded at most every yield_frequency seconds.
 # yield_frequency = 10
+#
+# Since SLOs may have thousands of segments, clients may request that the
+# object-expirer handle the deletion of segments using query params like
+# `?multipart-manifest=delete&async=on`. You may want to keep this off if it
+# negatively impacts your expirers; in that case, the deletes will still
+# be done as part of the client request.
+# allow_async_delete = false
 
 # Note: Put after auth and staticweb in the pipeline.
 # If you don't put it in the pipeline, it will be inserted for you.
@@ -1109,6 +1178,18 @@ use = egg:swift#copy
 # <other middleware> keymaster encryption proxy-logging proxy-server
 [filter:keymaster]
 use = egg:swift#keymaster
+
+# Over time, the format of crypto metadata on disk may change slightly to resolve
+# ambiguities. In general, you want to be writing the newest version, but to
+# ensure that all writes can still be read during rolling upgrades, there's the
+# option to write older formats as well.
+# Before upgrading from Swift 2.20.0 or Swift 2.19.1 or earlier, ensure this is set to 1
+# Before upgrading from Swift 2.25.0 or earlier, ensure this is set to at most 2
+# After upgrading all proxy servers, set this to 3 (currently the highest version)
+#
+# The default is currently 2 to support upgrades with no configuration changes,
+# but may change to 3 in the future.
+meta_version_to_write = 2
 
 # Sets the root secret from which encryption keys are derived. This must be set
 # before first use to a value that is a base64 encoding of at least 32 bytes.

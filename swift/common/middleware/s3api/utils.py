@@ -120,10 +120,6 @@ class S3Timestamp(utils.Timestamp):
         return self.isoformat.replace(
             '-', '').replace(':', '')[:-7] + 'Z'
 
-    @classmethod
-    def now(cls):
-        return cls(time.time())
-
 
 def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
     """
@@ -156,7 +152,18 @@ def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
 
 
 class Config(dict):
+    DEFAULTS = {
+        'storage_domain': '',
+        'location': 'us-east-1',
+        'force_swift_request_proxy_log': False,
+        'dns_compliant_bucket_names': True,
+        'allow_multipart_uploads': True,
+        'allow_no_owner': False,
+        'allowable_clock_skew': 900,
+    }
+
     def __init__(self, base=None):
+        self.update(self.DEFAULTS)
         if base is not None:
             self.update(base)
 

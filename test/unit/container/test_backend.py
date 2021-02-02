@@ -17,7 +17,6 @@
 import base64
 import errno
 import os
-import hashlib
 import inspect
 import unittest
 from time import sleep, time
@@ -26,8 +25,10 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 import sqlite3
+import string
 import pickle
 import json
+import itertools
 
 import six
 
@@ -38,7 +39,7 @@ from swift.container.backend import ContainerBroker, \
 from swift.common.db import DatabaseAlreadyExists, GreenDBConnection
 from swift.common.request_helpers import get_reserved_name
 from swift.common.utils import Timestamp, encode_timestamps, hash_path, \
-    ShardRange, make_db_file_path
+    ShardRange, make_db_file_path, md5
 from swift.common.storage_policy import POLICIES
 
 import mock
@@ -128,6 +129,92 @@ class TestContainerBroker(unittest.TestCase):
         except Exception:
             pass
         self.assertTrue(broker.conn is None)
+
+    @with_tempdir
+    @mock.patch("swift.container.backend.ContainerBroker.get")
+    def test_is_old_enough_to_reclaim(self, tempdir, mocked_get):
+        db_path = os.path.join(
+            tempdir, 'containers', 'part', 'suffix', 'hash', 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        def do_test(now, reclaim_age, put_ts, delete_ts, expected):
+            mocked_get.return_value.\
+                __enter__.return_value.\
+                execute.return_value.\
+                fetchone.return_value = dict(delete_timestamp=delete_ts,
+                                             put_timestamp=put_ts)
+
+            self.assertEqual(expected,
+                             broker.is_old_enough_to_reclaim(now, reclaim_age))
+
+        now_time = time()
+        tests = (
+            # (now, reclaim_age, put_ts, del_ts, expected),
+            (0, 0, 0, 0, False),
+            # Never deleted
+            (now_time, 100, now_time - 200, 0, False),
+            # Deleted ts older the put_ts
+            (now_time, 100, now_time - 150, now_time - 200, False),
+            # not reclaim_age yet
+            (now_time, 100, now_time - 150, now_time - 50, False),
+            # right on reclaim doesn't work
+            (now_time, 100, now_time - 150, now_time - 100, False),
+            # put_ts wins over del_ts
+            (now_time, 100, now_time - 150, now_time - 150, False),
+            # good case, reclaim > delete_ts > put_ts
+            (now_time, 100, now_time - 150, now_time - 125, True))
+        for test in tests:
+            do_test(*test)
+
+    @with_tempdir
+    def test_is_reclaimable(self, tempdir):
+        db_path = os.path.join(
+            tempdir, 'containers', 'part', 'suffix', 'hash', 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        self.assertFalse(broker.is_reclaimable(float(next(self.ts)), 0))
+        broker.delete_db(next(self.ts).internal)
+        self.assertFalse(broker.is_reclaimable(float(next(self.ts)), 604800))
+        self.assertTrue(broker.is_reclaimable(float(next(self.ts)), 0))
+
+        # adding a shard range makes us unreclaimable
+        sr = ShardRange('.shards_a/shard_c', next(self.ts), object_count=0)
+        broker.merge_shard_ranges([sr])
+        self.assertFalse(broker.is_reclaimable(float(next(self.ts)), 0))
+        # ... but still "deleted"
+        self.assertTrue(broker.is_deleted())
+        # ... until the shard range is deleted
+        sr.set_deleted(next(self.ts))
+        broker.merge_shard_ranges([sr])
+        self.assertTrue(broker.is_reclaimable(float(next(self.ts)), 0))
+
+        # adding an object makes us unreclaimable
+        obj = {'name': 'o', 'created_at': next(self.ts).internal,
+               'size': 0, 'content_type': 'text/plain', 'etag': EMPTY_ETAG,
+               'deleted': 0}
+        broker.merge_items([dict(obj)])
+        self.assertFalse(broker.is_reclaimable(float(next(self.ts)), 0))
+        # ... and "not deleted"
+        self.assertFalse(broker.is_deleted())
+
+    @with_tempdir
+    def test_sharding_state_is_not_reclaimable(self, tempdir):
+        db_path = os.path.join(
+            tempdir, 'containers', 'part', 'suffix', 'hash', 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+        broker.enable_sharding(next(self.ts))
+        broker.set_sharding_state()
+        broker.delete_db(next(self.ts).internal)
+        self.assertTrue(broker.is_deleted())
+        # we won't reclaim in SHARDING state
+        self.assertEqual(SHARDING, broker.get_db_state())
+        self.assertFalse(broker.is_reclaimable(float(next(self.ts)), 0))
+        # ... but if we find one stuck like this it's easy enough to fix
+        broker.set_sharded_state()
+        self.assertTrue(broker.is_reclaimable(float(next(self.ts)), 0))
 
     @with_tempdir
     def test_is_deleted(self, tempdir):
@@ -441,6 +528,7 @@ class TestContainerBroker(unittest.TestCase):
             self.assertTrue(broker_to_test.empty())
 
         self.assertTrue(broker.empty())
+        self.assertFalse(broker.is_root_container())
         check_object_counted(broker, broker)
 
         # own shard range is not considered for object count
@@ -497,6 +585,20 @@ class TestContainerBroker(unittest.TestCase):
         own_sr.update_meta(3, 4, meta_timestamp=next(self.ts))
         broker.merge_shard_ranges([own_sr])
         self.assertTrue(broker.empty())
+        self.assertFalse(broker.is_deleted())
+        self.assertFalse(broker.is_root_container())
+
+        # sharder won't call delete_db() unless own_shard_range is deleted
+        own_sr.deleted = True
+        own_sr.timestamp = next(self.ts)
+        broker.merge_shard_ranges([own_sr])
+        broker.delete_db(next(self.ts).internal)
+
+        # Get a fresh broker, with instance cache unset
+        broker = ContainerBroker(db_path, account='.shards_a', container='cc')
+        self.assertTrue(broker.empty())
+        self.assertTrue(broker.is_deleted())
+        self.assertFalse(broker.is_root_container())
 
     def test_reclaim(self):
         broker = ContainerBroker(':memory:', account='test_account',
@@ -557,6 +659,98 @@ class TestContainerBroker(unittest.TestCase):
         # Test before deletion
         broker.reclaim(Timestamp.now().internal, time())
         broker.delete_db(Timestamp.now().internal)
+
+    def test_batch_reclaim(self):
+        num_of_objects = 60
+        obj_specs = []
+        now = time()
+        top_of_the_minute = now - (now % 60)
+        c = itertools.cycle([True, False])
+        for m, is_deleted in six.moves.zip(range(num_of_objects), c):
+            offset = top_of_the_minute - (m * 60)
+            obj_specs.append((Timestamp(offset), is_deleted))
+        random.seed(now)
+        random.shuffle(obj_specs)
+        policy_indexes = list(p.idx for p in POLICIES)
+        broker = ContainerBroker(':memory:', account='test_account',
+                                 container='test_container')
+        broker.initialize(Timestamp('1').internal, 0)
+        for i, obj_spec in enumerate(obj_specs):
+            # with object12 before object2 and shuffled ts.internal we
+            # shouldn't be able to accidently rely on any implicit ordering
+            obj_name = 'object%s' % i
+            pidx = random.choice(policy_indexes)
+            ts, is_deleted = obj_spec
+            if is_deleted:
+                broker.delete_object(obj_name, ts.internal, pidx)
+            else:
+                broker.put_object(obj_name, ts.internal, 0, 'text/plain',
+                                  'etag', storage_policy_index=pidx)
+
+        def count_reclaimable(conn, reclaim_age):
+            return conn.execute(
+                "SELECT count(*) FROM object "
+                "WHERE deleted = 1 AND created_at < ?", (reclaim_age,)
+            ).fetchone()[0]
+
+        # This is intended to divide the set of timestamps exactly in half
+        # regardless of the value of now
+        reclaim_age = top_of_the_minute + 1 - (num_of_objects / 2 * 60)
+        with broker.get() as conn:
+            self.assertEqual(count_reclaimable(conn, reclaim_age),
+                             num_of_objects / 4)
+
+        orig__reclaim = broker._reclaim
+        trace = []
+
+        def tracing_reclaim(conn, age_timestamp, marker):
+            trace.append((age_timestamp, marker,
+                          count_reclaimable(conn, age_timestamp)))
+            return orig__reclaim(conn, age_timestamp, marker)
+
+        with mock.patch.object(broker, '_reclaim', new=tracing_reclaim), \
+                mock.patch('swift.common.db.RECLAIM_PAGE_SIZE', 10):
+            broker.reclaim(reclaim_age, reclaim_age)
+
+        with broker.get() as conn:
+            self.assertEqual(count_reclaimable(conn, reclaim_age), 0)
+        self.assertEqual(3, len(trace), trace)
+        self.assertEqual([age for age, marker, reclaimable in trace],
+                         [reclaim_age] * 3)
+        # markers are in-order
+        self.assertLess(trace[0][1], trace[1][1])
+        self.assertLess(trace[1][1], trace[2][1])
+        # reclaimable count gradually decreases
+        # generally, count1 > count2 > count3, but because of the randomness
+        # we may occassionally have count1 == count2 or count2 == count3
+        self.assertGreaterEqual(trace[0][2], trace[1][2])
+        self.assertGreaterEqual(trace[1][2], trace[2][2])
+        # technically, this might happen occasionally, but *really* rarely
+        self.assertTrue(trace[0][2] > trace[1][2] or
+                        trace[1][2] > trace[2][2])
+
+    def test_reclaim_with_duplicate_names(self):
+        broker = ContainerBroker(':memory:', account='test_account',
+                                 container='test_container')
+        broker.initialize(Timestamp('1').internal, 0)
+        now = time()
+        ages_ago = Timestamp(now - (3 * 7 * 24 * 60 * 60))
+        for i in range(10):
+            for spidx in range(10):
+                obj_name = 'object%s' % i
+                broker.delete_object(obj_name, ages_ago.internal, spidx)
+        reclaim_age = now - (2 * 7 * 24 * 60 * 60)
+        with broker.get() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM object "
+                "WHERE created_at < ?", (reclaim_age,)
+            ).fetchone()[0], 100)
+        with mock.patch('swift.common.db.RECLAIM_PAGE_SIZE', 10):
+            broker.reclaim(reclaim_age, reclaim_age)
+        with broker.get() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM object "
+            ).fetchone()[0], 0)
 
     @with_tempdir
     def test_reclaim_deadlock(self, tempdir):
@@ -642,10 +836,12 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(info['put_timestamp'], start.internal)
         self.assertTrue(Timestamp(info['created_at']) >= start)
         self.assertEqual(info['delete_timestamp'], '0')
-        if self.__class__ in (TestContainerBrokerBeforeMetadata,
-                              TestContainerBrokerBeforeXSync,
-                              TestContainerBrokerBeforeSPI,
-                              TestContainerBrokerBeforeShardRanges):
+        if self.__class__ in (
+                TestContainerBrokerBeforeMetadata,
+                TestContainerBrokerBeforeXSync,
+                TestContainerBrokerBeforeSPI,
+                TestContainerBrokerBeforeShardRanges,
+                TestContainerBrokerBeforeShardRangeReportedColumn):
             self.assertEqual(info['status_changed_at'], '0')
         else:
             self.assertEqual(info['status_changed_at'],
@@ -932,6 +1128,8 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT object_count FROM shard_range").fetchone()[0], 0)
             self.assertEqual(conn.execute(
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 0)
 
         # Reput same event
         broker.merge_shard_ranges(
@@ -957,6 +1155,64 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT object_count FROM shard_range").fetchone()[0], 0)
             self.assertEqual(conn.execute(
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 0)
+
+        # Mark it as reported
+        broker.merge_shard_ranges(
+            ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
+                       'low', 'up', meta_timestamp=meta_timestamp,
+                       reported=True))
+        with broker.get() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT name FROM shard_range").fetchone()[0],
+                '"a/{<shardrange \'&\' name>}"')
+            self.assertEqual(conn.execute(
+                "SELECT timestamp FROM shard_range").fetchone()[0],
+                timestamp)
+            self.assertEqual(conn.execute(
+                "SELECT meta_timestamp FROM shard_range").fetchone()[0],
+                meta_timestamp)
+            self.assertEqual(conn.execute(
+                "SELECT lower FROM shard_range").fetchone()[0], 'low')
+            self.assertEqual(conn.execute(
+                "SELECT upper FROM shard_range").fetchone()[0], 'up')
+            self.assertEqual(conn.execute(
+                "SELECT deleted FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT object_count FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT bytes_used FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 1)
+
+        # Reporting latches it
+        broker.merge_shard_ranges(
+            ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
+                       'low', 'up', meta_timestamp=meta_timestamp,
+                       reported=False))
+        with broker.get() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT name FROM shard_range").fetchone()[0],
+                '"a/{<shardrange \'&\' name>}"')
+            self.assertEqual(conn.execute(
+                "SELECT timestamp FROM shard_range").fetchone()[0],
+                timestamp)
+            self.assertEqual(conn.execute(
+                "SELECT meta_timestamp FROM shard_range").fetchone()[0],
+                meta_timestamp)
+            self.assertEqual(conn.execute(
+                "SELECT lower FROM shard_range").fetchone()[0], 'low')
+            self.assertEqual(conn.execute(
+                "SELECT upper FROM shard_range").fetchone()[0], 'up')
+            self.assertEqual(conn.execute(
+                "SELECT deleted FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT object_count FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT bytes_used FROM shard_range").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 1)
 
         # Put new event
         timestamp = next(self.ts).internal
@@ -984,11 +1240,14 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT object_count FROM shard_range").fetchone()[0], 1)
             self.assertEqual(conn.execute(
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 0)
 
         # Put old event
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', old_put_timestamp,
-                       'lower', 'upper', 1, 2, meta_timestamp=meta_timestamp))
+                       'lower', 'upper', 1, 2, meta_timestamp=meta_timestamp,
+                       reported=True))
         with broker.get() as conn:
             self.assertEqual(conn.execute(
                 "SELECT name FROM shard_range").fetchone()[0],
@@ -1009,6 +1268,8 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT object_count FROM shard_range").fetchone()[0], 1)
             self.assertEqual(conn.execute(
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                "SELECT reported FROM shard_range").fetchone()[0], 0)
 
         # Put old delete event
         broker.merge_shard_ranges(
@@ -1885,10 +2146,12 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(info['hash'], '00000000000000000000000000000000')
         self.assertEqual(info['put_timestamp'], Timestamp(1).internal)
         self.assertEqual(info['delete_timestamp'], '0')
-        if self.__class__ in (TestContainerBrokerBeforeMetadata,
-                              TestContainerBrokerBeforeXSync,
-                              TestContainerBrokerBeforeSPI,
-                              TestContainerBrokerBeforeShardRanges):
+        if self.__class__ in (
+                TestContainerBrokerBeforeMetadata,
+                TestContainerBrokerBeforeXSync,
+                TestContainerBrokerBeforeSPI,
+                TestContainerBrokerBeforeShardRanges,
+                TestContainerBrokerBeforeShardRangeReportedColumn):
             self.assertEqual(info['status_changed_at'], '0')
         else:
             self.assertEqual(info['status_changed_at'],
@@ -2983,7 +3246,7 @@ class TestContainerBroker(unittest.TestCase):
         def md5_str(s):
             if not isinstance(s, bytes):
                 s = s.encode('utf8')
-            return hashlib.md5(s).hexdigest()
+            return md5(s, usedforsecurity=False).hexdigest()
 
         broker = ContainerBroker(':memory:', account='a', container='c')
         broker.initialize(Timestamp('1').internal, 0)
@@ -3182,10 +3445,12 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(0, info['storage_policy_index'])  # sanity check
         self.assertEqual(0, info['object_count'])
         self.assertEqual(0, info['bytes_used'])
-        if self.__class__ in (TestContainerBrokerBeforeMetadata,
-                              TestContainerBrokerBeforeXSync,
-                              TestContainerBrokerBeforeSPI,
-                              TestContainerBrokerBeforeShardRanges):
+        if self.__class__ in (
+                TestContainerBrokerBeforeMetadata,
+                TestContainerBrokerBeforeXSync,
+                TestContainerBrokerBeforeSPI,
+                TestContainerBrokerBeforeShardRanges,
+                TestContainerBrokerBeforeShardRangeReportedColumn):
             self.assertEqual(info['status_changed_at'], '0')
         else:
             self.assertEqual(timestamp.internal, info['status_changed_at'])
@@ -3747,6 +4012,45 @@ class TestContainerBroker(unittest.TestCase):
         actual = broker.get_shard_ranges(
             include_own=False, exclude_others=True)
         self.assertFalse(actual)
+
+    @with_tempdir
+    def test_overloap_shard_range_order(self, tempdir):
+        db_path = os.path.join(tempdir, 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        epoch0 = next(self.ts)
+        epoch1 = next(self.ts)
+        shard_ranges = [
+            ShardRange('.shard_a/shard_%d-%d' % (e, s), epoch, l, u,
+                       state=ShardRange.ACTIVE)
+            for s, (l, u) in enumerate(zip(string.ascii_letters[:7],
+                                           string.ascii_letters[1:]))
+            for e, epoch in enumerate((epoch0, epoch1))
+        ]
+
+        random.shuffle(shard_ranges)
+        for sr in shard_ranges:
+            broker.merge_shard_ranges([sr])
+
+        expected = [
+            '.shard_a/shard_0-0',
+            '.shard_a/shard_1-0',
+            '.shard_a/shard_0-1',
+            '.shard_a/shard_1-1',
+            '.shard_a/shard_0-2',
+            '.shard_a/shard_1-2',
+            '.shard_a/shard_0-3',
+            '.shard_a/shard_1-3',
+            '.shard_a/shard_0-4',
+            '.shard_a/shard_1-4',
+            '.shard_a/shard_0-5',
+            '.shard_a/shard_1-5',
+            '.shard_a/shard_0-6',
+            '.shard_a/shard_1-6',
+        ]
+        self.assertEqual(expected, [
+            sr.name for sr in broker.get_shard_ranges()])
 
     @with_tempdir
     def test_get_shard_ranges_with_sharding_overlaps(self, tempdir):
@@ -5219,6 +5523,75 @@ class TestContainerBrokerBeforeShardRanges(ContainerBrokerMigrationMixin,
         broker.initialize(Timestamp('1').internal, 0)
         with broker.get() as conn:
             conn.execute('''SELECT *
+                            FROM shard_range''')
+
+
+def pre_reported_create_shard_range_table(self, conn):
+    """
+    Copied from ContainerBroker before the
+    reported column was added; used for testing with
+    TestContainerBrokerBeforeShardRangeReportedColumn.
+
+    Create a shard_range table with no 'reported' column.
+
+    :param conn: DB connection object
+    """
+    conn.execute("""
+        CREATE TABLE shard_range (
+            ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            timestamp TEXT,
+            lower TEXT,
+            upper TEXT,
+            object_count INTEGER DEFAULT 0,
+            bytes_used INTEGER DEFAULT 0,
+            meta_timestamp TEXT,
+            deleted INTEGER DEFAULT 0,
+            state INTEGER,
+            state_timestamp TEXT,
+            epoch TEXT
+        );
+    """)
+
+    conn.execute("""
+        CREATE TRIGGER shard_range_update BEFORE UPDATE ON shard_range
+        BEGIN
+            SELECT RAISE(FAIL, 'UPDATE not allowed; DELETE and INSERT');
+        END;
+    """)
+
+
+class TestContainerBrokerBeforeShardRangeReportedColumn(
+        ContainerBrokerMigrationMixin, TestContainerBroker):
+    """
+    Tests for ContainerBroker against databases created
+    before the shard_ranges table was added.
+    """
+    # *grumble grumble* This should include container_info/policy_stat :-/
+    expected_db_tables = {'outgoing_sync', 'incoming_sync', 'object',
+                          'sqlite_sequence', 'container_stat', 'shard_range'}
+
+    def setUp(self):
+        super(TestContainerBrokerBeforeShardRangeReportedColumn,
+              self).setUp()
+        ContainerBroker.create_shard_range_table = \
+            pre_reported_create_shard_range_table
+
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(Timestamp('1').internal, 0)
+        with self.assertRaises(sqlite3.DatabaseError) as raised, \
+                broker.get() as conn:
+            conn.execute('''SELECT reported
+                            FROM shard_range''')
+        self.assertIn('no such column: reported', str(raised.exception))
+
+    def tearDown(self):
+        super(TestContainerBrokerBeforeShardRangeReportedColumn,
+              self).tearDown()
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(Timestamp('1').internal, 0)
+        with broker.get() as conn:
+            conn.execute('''SELECT reported
                             FROM shard_range''')
 
 

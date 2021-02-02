@@ -40,7 +40,6 @@ import os
 import re
 import time
 import uuid
-from hashlib import md5
 import logging
 import traceback
 import xattr
@@ -66,13 +65,14 @@ from swift.common.utils import mkdirs, Timestamp, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
     MD5_OF_EMPTY_STRING, link_fd_to_path, \
-    O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory
+    O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory, \
+    md5
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum
+    DiskFileBadMetadataChecksum, PartitionLockTimeout
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
@@ -222,14 +222,16 @@ def read_metadata(fd, add_missing_checksum=False):
         # exist. This is fine; it just means that this object predates the
         # introduction of metadata checksums.
         if add_missing_checksum:
-            new_checksum = md5(metadata).hexdigest().encode('ascii')
+            new_checksum = (md5(metadata, usedforsecurity=False)
+                            .hexdigest().encode('ascii'))
             try:
                 xattr.setxattr(fd, METADATA_CHECKSUM_KEY, new_checksum)
             except (IOError, OSError) as e:
                 logging.error("Error adding metadata: %s" % e)
 
     if metadata_checksum:
-        computed_checksum = md5(metadata).hexdigest().encode('ascii')
+        computed_checksum = (md5(metadata, usedforsecurity=False)
+                             .hexdigest().encode('ascii'))
         if metadata_checksum != computed_checksum:
             raise DiskFileBadMetadataChecksum(
                 "Metadata checksum mismatch for %s: "
@@ -254,7 +256,8 @@ def write_metadata(fd, metadata, xattr_size=65536):
     :param metadata: metadata to write
     """
     metastr = pickle.dumps(_encode_metadata(metadata), PICKLE_PROTOCOL)
-    metastr_md5 = md5(metastr).hexdigest().encode('ascii')
+    metastr_md5 = (
+        md5(metastr, usedforsecurity=False).hexdigest().encode('ascii'))
     key = 0
     try:
         while metastr:
@@ -1113,11 +1116,11 @@ class BaseDiskFileManager(object):
         :param policy: storage policy used
         """
         if six.PY2:
-            hashes = defaultdict(md5)
+            hashes = defaultdict(lambda: md5(usedforsecurity=False))
         else:
             class shim(object):
                 def __init__(self):
-                    self.md5 = md5()
+                    self.md5 = md5(usedforsecurity=False)
 
                 def update(self, s):
                     if isinstance(s, str):
@@ -1333,8 +1336,8 @@ class BaseDiskFileManager(object):
     @contextmanager
     def replication_lock(self, device, policy, partition):
         """
-        A context manager that will lock on the device given, if
-        configured to do so.
+        A context manager that will lock on the partition and, if configured
+        to do so, on the device given.
 
         :param device: name of target device
         :param policy: policy targeted by the replication request
@@ -1342,24 +1345,36 @@ class BaseDiskFileManager(object):
         :raises ReplicationLockTimeout: If the lock on the device
             cannot be granted within the configured timeout.
         """
-        if self.replication_concurrency_per_device:
-            dev_path = self.get_dev_path(device)
-            part_path = os.path.join(dev_path, get_data_dir(policy),
-                                     str(partition))
-            limit_time = time.time() + self.replication_lock_timeout
-            with lock_path(
-                    dev_path,
-                    timeout=self.replication_lock_timeout,
-                    timeout_class=ReplicationLockTimeout,
-                    limit=self.replication_concurrency_per_device):
-                with lock_path(
-                        part_path,
-                        timeout=limit_time - time.time(),
-                        timeout_class=ReplicationLockTimeout,
-                        limit=1,
-                        name='replication'):
+        limit_time = time.time() + self.replication_lock_timeout
+        with self.partition_lock(device, policy, partition, name='replication',
+                                 timeout=self.replication_lock_timeout):
+            if self.replication_concurrency_per_device:
+                with lock_path(self.get_dev_path(device),
+                               timeout=limit_time - time.time(),
+                               timeout_class=ReplicationLockTimeout,
+                               limit=self.replication_concurrency_per_device):
                     yield True
-        else:
+            else:
+                yield True
+
+    @contextmanager
+    def partition_lock(self, device, policy, partition, name=None,
+                       timeout=None):
+        """
+        A context manager that will lock on the partition given.
+
+        :param device: device targeted by the lock request
+        :param policy: policy targeted by the lock request
+        :param partition: partition targeted by the lock request
+        :raises PartitionLockTimeout: If the lock on the partition
+            cannot be granted within the configured timeout.
+        """
+        if timeout is None:
+            timeout = self.replication_lock_timeout
+        part_path = os.path.join(self.get_dev_path(device),
+                                 get_data_dir(policy), str(partition))
+        with lock_path(part_path, timeout=timeout,
+                       timeout_class=PartitionLockTimeout, limit=1, name=name):
             yield True
 
     def pickle_async_update(self, device, account, container, obj, data,
@@ -1497,13 +1512,15 @@ class BaseDiskFileManager(object):
                                  partition, account, container, obj,
                                  policy=policy, **kwargs)
 
-    def get_hashes(self, device, partition, suffixes, policy):
+    def get_hashes(self, device, partition, suffixes, policy,
+                   skip_rehash=False):
         """
 
         :param device: name of target device
         :param partition: partition name
         :param suffixes: a list of suffix directories to be recalculated
         :param policy: the StoragePolicy instance
+        :param skip_rehash: just mark the suffixes dirty; return None
         :returns: a dictionary that maps suffix directories
         """
         dev_path = self.get_dev_path(device)
@@ -1512,8 +1529,14 @@ class BaseDiskFileManager(object):
         partition_path = get_part_path(dev_path, policy, partition)
         if not os.path.exists(partition_path):
             mkdirs(partition_path)
-        _junk, hashes = tpool.execute(
-            self._get_hashes, device, partition, policy, recalculate=suffixes)
+        if skip_rehash:
+            for suffix in suffixes or []:
+                invalidate_hash(os.path.join(partition_path, suffix))
+            return None
+        else:
+            _junk, hashes = tpool.execute(
+                self._get_hashes, device, partition, policy,
+                recalculate=suffixes)
         return hashes
 
     def _listdir(self, path):
@@ -1567,6 +1590,7 @@ class BaseDiskFileManager(object):
         - ts_meta -> timestamp of meta file, if one exists
         - ts_ctype -> timestamp of meta file containing most recent
                       content-type value, if one exists
+        - durable -> True if data file at ts_data is durable, False otherwise
 
         where timestamps are instances of
         :class:`~swift.common.utils.Timestamp`
@@ -1588,11 +1612,15 @@ class BaseDiskFileManager(object):
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)
 
-        key_preference = (
+        # define keys that we need to extract the result from the on disk info
+        # data:
+        #   (x, y, z) -> result[x] should take the value of y[z]
+        key_map = (
             ('ts_meta', 'meta_info', 'timestamp'),
             ('ts_data', 'data_info', 'timestamp'),
             ('ts_data', 'ts_info', 'timestamp'),
             ('ts_ctype', 'ctype_info', 'ctype_timestamp'),
+            ('durable', 'data_info', 'durable'),
         )
 
         # cleanup_ondisk_files() will remove empty hash dirs, and we'll
@@ -1603,21 +1631,24 @@ class BaseDiskFileManager(object):
             for object_hash in self._listdir(suffix_path):
                 object_path = os.path.join(suffix_path, object_hash)
                 try:
-                    results = self.cleanup_ondisk_files(
+                    diskfile_info = self.cleanup_ondisk_files(
                         object_path, **kwargs)
-                    if results['files']:
+                    if diskfile_info['files']:
                         found_files = True
-                    timestamps = {}
-                    for ts_key, info_key, info_ts_key in key_preference:
-                        if info_key not in results:
+                    result = {}
+                    for result_key, diskfile_info_key, info_key in key_map:
+                        if diskfile_info_key not in diskfile_info:
                             continue
-                        timestamps[ts_key] = results[info_key][info_ts_key]
-                    if 'ts_data' not in timestamps:
+                        info = diskfile_info[diskfile_info_key]
+                        if info_key in info:
+                            # durable key not returned from replicated Diskfile
+                            result[result_key] = info[info_key]
+                    if 'ts_data' not in result:
                         # file sets that do not include a .data or .ts
                         # file cannot be opened and therefore cannot
                         # be ssync'd
                         continue
-                    yield (object_hash, timestamps)
+                    yield object_hash, result
                 except AssertionError as err:
                     self.logger.debug('Invalid file set in %s (%s)' % (
                         object_path, err))
@@ -1666,7 +1697,7 @@ class BaseDiskFileWriter(object):
         self._fd = None
         self._tmppath = None
         self._size = size
-        self._chunks_etag = md5()
+        self._chunks_etag = md5(usedforsecurity=False)
         self._bytes_per_sync = bytes_per_sync
         self._diskfile = diskfile
         self.next_part_power = next_part_power
@@ -1983,7 +2014,7 @@ class BaseDiskFileReader(object):
     def _init_checks(self):
         if self._fp.tell() == 0:
             self._started_at_0 = True
-            self._iter_etag = md5()
+            self._iter_etag = md5(usedforsecurity=False)
 
     def _update_checks(self, chunk):
         if self._iter_etag:
@@ -2310,6 +2341,9 @@ class BaseDiskFile(object):
             self._datadir = join(
                 device_path, storage_directory(get_data_dir(policy),
                                                partition, name_hash))
+
+    def __repr__(self):
+        return '<%s datadir=%r>' % (self.__class__.__name__, self._datadir)
 
     @property
     def manager(self):
@@ -3463,6 +3497,11 @@ class ECDiskFileManager(BaseDiskFileManager):
                     break
             if durable_info and durable_info['timestamp'] == timestamp:
                 durable_frag_set = frag_set
+                # a data frag filename may not have the #d part if durability
+                # is defined by a legacy .durable, so always mark all data
+                # frags as durable here
+                for frag in frag_set:
+                    frag['durable'] = True
                 break  # ignore frags that are older than durable timestamp
 
         # Choose which frag set to use

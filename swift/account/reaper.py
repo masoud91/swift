@@ -19,7 +19,6 @@ import socket
 from logging import DEBUG
 from math import sqrt
 from time import time
-from hashlib import md5
 import itertools
 
 from eventlet import GreenPool, sleep, Timeout
@@ -31,10 +30,11 @@ from swift.common.constraints import check_drive
 from swift.common.direct_client import direct_delete_container, \
     direct_delete_object, direct_get_container
 from swift.common.exceptions import ClientException
+from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring import Ring
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, whataremyips, config_true_value, \
-    Timestamp
+    Timestamp, md5
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES, PolicyError
 
@@ -270,8 +270,9 @@ class AccountReaper(Daemon):
                             container_ = container.encode('utf-8')
                         else:
                             container_ = container
-                        this_shard = int(md5(container_).hexdigest(), 16) % \
-                            len(nodes)
+                        this_shard = (
+                            int(md5(container_, usedforsecurity=False)
+                                .hexdigest(), 16) % len(nodes))
                         if container_shard not in (this_shard, None):
                             continue
 
@@ -370,7 +371,8 @@ class AccountReaper(Daemon):
                     node, part, account, container,
                     marker=marker,
                     conn_timeout=self.conn_timeout,
-                    response_timeout=self.node_timeout)
+                    response_timeout=self.node_timeout,
+                    headers={USE_REPLICATION_NETWORK_HEADER: 'true'})
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
                 self.logger.increment('return_codes.2')
@@ -418,7 +420,8 @@ class AccountReaper(Daemon):
                              'X-Account-Partition': str(account_partition),
                              'X-Account-Device': anode['device'],
                              'X-Account-Override-Deleted': 'yes',
-                             'X-Timestamp': timestamp.internal})
+                             'X-Timestamp': timestamp.internal,
+                             USE_REPLICATION_NETWORK_HEADER: 'true'})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
@@ -494,7 +497,8 @@ class AccountReaper(Daemon):
                              'X-Container-Partition': str(container_partition),
                              'X-Container-Device': cnode['device'],
                              'X-Backend-Storage-Policy-Index': policy_index,
-                             'X-Timestamp': timestamp.internal})
+                             'X-Timestamp': timestamp.internal,
+                             USE_REPLICATION_NETWORK_HEADER: 'true'})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1

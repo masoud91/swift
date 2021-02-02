@@ -15,10 +15,13 @@
 
 import os
 
+from eventlet.green import ssl
 from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
 
-from swift.common.memcached import (MemcacheRing, CONN_TIMEOUT, POOL_TIMEOUT,
-                                    IO_TIMEOUT, TRY_COUNT)
+from swift.common.memcached import (
+    MemcacheRing, CONN_TIMEOUT, POOL_TIMEOUT, IO_TIMEOUT, TRY_COUNT,
+    ERROR_LIMIT_COUNT, ERROR_LIMIT_TIME)
+from swift.common.utils import get_logger, config_true_value
 
 
 class MemcacheMiddleware(object):
@@ -28,6 +31,7 @@ class MemcacheMiddleware(object):
 
     def __init__(self, app, conf):
         self.app = app
+        self.logger = get_logger(conf, log_route='memcache')
         self.memcache_servers = conf.get('memcache_servers')
         serialization_format = conf.get('memcache_serialization_support')
         try:
@@ -84,6 +88,21 @@ class MemcacheMiddleware(object):
             'pool_timeout', POOL_TIMEOUT))
         tries = int(memcache_options.get('tries', TRY_COUNT))
         io_timeout = float(memcache_options.get('io_timeout', IO_TIMEOUT))
+        if config_true_value(memcache_options.get('tls_enabled', 'false')):
+            tls_cafile = memcache_options.get('tls_cafile')
+            tls_certfile = memcache_options.get('tls_certfile')
+            tls_keyfile = memcache_options.get('tls_keyfile')
+            self.tls_context = ssl.create_default_context(
+                cafile=tls_cafile)
+            if tls_certfile:
+                self.tls_context.load_cert_chain(tls_certfile,
+                                                 tls_keyfile)
+        else:
+            self.tls_context = None
+        error_suppression_interval = float(memcache_options.get(
+            'error_suppression_interval', ERROR_LIMIT_TIME))
+        error_suppression_limit = float(memcache_options.get(
+            'error_suppression_limit', ERROR_LIMIT_COUNT))
 
         if not self.memcache_servers:
             self.memcache_servers = '127.0.0.1:11211'
@@ -102,7 +121,12 @@ class MemcacheMiddleware(object):
             io_timeout=io_timeout,
             allow_pickle=(serialization_format == 0),
             allow_unpickle=(serialization_format <= 1),
-            max_conns=max_conns)
+            max_conns=max_conns,
+            tls_context=self.tls_context,
+            logger=self.logger,
+            error_limit_count=error_suppression_limit,
+            error_limit_time=error_suppression_interval,
+            error_limit_duration=error_suppression_interval)
 
     def __call__(self, env, start_response):
         env['swift.cache'] = self.memcache

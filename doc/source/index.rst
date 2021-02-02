@@ -66,6 +66,15 @@ Overview and Concepts
     ring_partpower
     associated_projects
 
+Contributor Documentation
+=========================
+
+.. toctree::
+    :maxdepth: 2
+
+    contributor/contributing
+    contributor/review_guidelines
+
 Developer Documentation
 =======================
 
@@ -79,6 +88,7 @@ Developer Documentation
     development_auth
     development_middleware
     development_ondisk_backends
+    development_watchers
 
 Administrator Documentation
 ===========================
@@ -95,6 +105,8 @@ Administrator Documentation
     ops_runbook/index
     admin/index
     install/index
+    config/index
+
 
 Object Storage v1 REST API Documentation
 ========================================

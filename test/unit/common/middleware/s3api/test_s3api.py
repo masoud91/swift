@@ -18,17 +18,19 @@ import unittest
 from mock import patch, MagicMock
 import calendar
 from datetime import datetime
-import hashlib
 import mock
 import requests
 import json
 import six
+from paste.deploy import loadwsgi
 from six.moves.urllib.parse import unquote, quote
 
 import swift.common.middleware.s3api
+from swift.common.middleware.s3api.utils import Config
 from swift.common.middleware.keystoneauth import KeystoneAuth
 from swift.common import swob, utils
 from swift.common.swob import Request
+from swift.common.utils import md5
 
 from keystonemiddleware.auth_token import AuthProtocol
 from keystoneauth1.access import AccessInfoV2
@@ -98,6 +100,85 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         super(TestS3ApiMiddleware, self).setUp()
 
         self.swift.register('GET', '/something', swob.HTTPOk, {}, 'FAKE APP')
+
+    def test_init_config(self):
+        # verify config loading
+        # note: test confs do not have __file__ attribute so check_pipeline
+        # will be short-circuited
+
+        # check all defaults
+        expected = Config()
+        expected.update({
+            'auth_pipeline_check': True,
+            'check_bucket_owner': False,
+            'max_bucket_listing': 1000,
+            'max_multi_delete_objects': 1000,
+            'max_parts_listing': 1000,
+            'max_upload_part_num': 1000,
+            'min_segment_size': 5242880,
+            'multi_delete_concurrency': 2,
+            's3_acl': False,
+        })
+        s3api = S3ApiMiddleware(None, {})
+        self.assertEqual(expected, s3api.conf)
+
+        # check all non-defaults are loaded
+        conf = {
+            'storage_domain': 'somewhere',
+            'location': 'us-west-1',
+            'force_swift_request_proxy_log': True,
+            'dns_compliant_bucket_names': False,
+            'allow_multipart_uploads': False,
+            'allow_no_owner': True,
+            'allowable_clock_skew': 300,
+            'auth_pipeline_check': False,
+            'check_bucket_owner': True,
+            'max_bucket_listing': 500,
+            'max_multi_delete_objects': 600,
+            'max_parts_listing': 70,
+            'max_upload_part_num': 800,
+            'min_segment_size': 1000000,
+            'multi_delete_concurrency': 1,
+            's3_acl': True,
+        }
+        s3api = S3ApiMiddleware(None, conf)
+        self.assertEqual(conf, s3api.conf)
+
+        def check_bad_positive_ints(**kwargs):
+            bad_conf = dict(conf, **kwargs)
+            self.assertRaises(ValueError, S3ApiMiddleware, None, bad_conf)
+
+        check_bad_positive_ints(allowable_clock_skew=-100)
+        check_bad_positive_ints(allowable_clock_skew=0)
+        check_bad_positive_ints(max_bucket_listing=-100)
+        check_bad_positive_ints(max_bucket_listing=0)
+        check_bad_positive_ints(max_multi_delete_objects=-100)
+        check_bad_positive_ints(max_multi_delete_objects=0)
+        check_bad_positive_ints(max_parts_listing=-100)
+        check_bad_positive_ints(max_parts_listing=0)
+        check_bad_positive_ints(max_upload_part_num=-100)
+        check_bad_positive_ints(max_upload_part_num=0)
+        check_bad_positive_ints(min_segment_size=-100)
+        check_bad_positive_ints(min_segment_size=0)
+        check_bad_positive_ints(multi_delete_concurrency=-100)
+        check_bad_positive_ints(multi_delete_concurrency=0)
+
+    def test_init_passes_wsgi_conf_file_to_check_pipeline(self):
+        # verify that check_pipeline is called during init: add __file__ attr
+        # to test config to make it more representative of middleware being
+        # init'd by wgsi
+        context = mock.Mock()
+        with patch("swift.common.middleware.s3api.s3api.loadcontext",
+                   return_value=context) as loader, \
+                patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
+                as pipeline:
+            conf = dict(self.conf,
+                        auth_pipeline_check=True,
+                        __file__='proxy-conf-file')
+            pipeline.return_value = 's3api tempauth proxy-server'
+            self.s3api = S3ApiMiddleware(None, conf)
+            loader.assert_called_with(loadwsgi.APP, 'proxy-conf-file')
+            pipeline.assert_called_with(context)
 
     def test_non_s3_request_passthrough(self):
         req = Request.blank('/something')
@@ -177,7 +258,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
         def verify(hash, path, headers):
             s = canonical_string(path, headers)
-            self.assertEqual(hash, hashlib.md5(s).hexdigest())
+            self.assertEqual(hash, md5(s, usedforsecurity=False).hexdigest())
 
         verify('6dd08c75e42190a1ce9468d1fd2eb787', '/bucket/object',
                {'Content-Type': 'text/plain', 'X-Amz-Something': 'test',
@@ -500,8 +581,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                         'S3Request.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
-            self.assertEqual('/v1/AUTH_test/bucket',
-                             req.environ['swift.backend_path'])
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
 
         _, _, headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req.environ['s3api.auth_details'], {
@@ -530,8 +612,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                         'S3Request.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
-            self.assertEqual('/v1/AUTH_test/bucket',
-                             req.environ['swift.backend_path'])
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
 
         _, _, headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req.environ['s3api.auth_details'], {
@@ -561,7 +644,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
 
     def test_object_create_bad_md5_too_short(self):
-        too_short_digest = hashlib.md5(b'hey').digest()[:-1]
+        too_short_digest = md5(b'hey', usedforsecurity=False).digest()[:-1]
         md5_str = base64.b64encode(too_short_digest).strip()
         if not six.PY2:
             md5_str = md5_str.decode('ascii')
@@ -574,8 +657,23 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
 
+    def test_object_create_bad_md5_bad_padding(self):
+        too_short_digest = md5(b'hey', usedforsecurity=False).digest()
+        md5_str = base64.b64encode(too_short_digest).strip(b'=\n')
+        if not six.PY2:
+            md5_str = md5_str.decode('ascii')
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT',
+                     'HTTP_AUTHORIZATION': 'AWS X:Y:Z',
+                     'HTTP_CONTENT_MD5': md5_str},
+            headers={'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'InvalidDigest')
+
     def test_object_create_bad_md5_too_long(self):
-        too_long_digest = hashlib.md5(b'hey').digest() + b'suffix'
+        too_long_digest = md5(
+            b'hey', usedforsecurity=False).digest() + b'suffix'
         md5_str = base64.b64encode(too_long_digest).strip()
         if not six.PY2:
             md5_str = md5_str.decode('ascii')
@@ -705,7 +803,24 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self._test_unsupported_resource('cors')
 
     def test_tagging(self):
-        self._test_unsupported_resource('tagging')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
 
     def test_restore(self):
         self._test_unsupported_resource('restore')
@@ -726,20 +841,22 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         swift_info = utils.get_swift_info()
         self.assertTrue('s3api' in swift_info)
         self.assertEqual(swift_info['s3api'].get('max_bucket_listing'),
-                         self.conf.max_bucket_listing)
+                         self.conf['max_bucket_listing'])
         self.assertEqual(swift_info['s3api'].get('max_parts_listing'),
-                         self.conf.max_parts_listing)
+                         self.conf['max_parts_listing'])
         self.assertEqual(swift_info['s3api'].get('max_upload_part_num'),
-                         self.conf.max_upload_part_num)
+                         self.conf['max_upload_part_num'])
         self.assertEqual(swift_info['s3api'].get('max_multi_delete_objects'),
-                         self.conf.max_multi_delete_objects)
+                         self.conf['max_multi_delete_objects'])
 
     def test_check_pipeline(self):
         with patch("swift.common.middleware.s3api.s3api.loadcontext"), \
                 patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
                 as pipeline:
-            self.conf.auth_pipeline_check = True
-            self.conf.__file__ = ''
+            # cause check_pipeline to not return early...
+            self.conf['__file__'] = ''
+            # ...and enable pipeline auth checking
+            self.s3api.conf.auth_pipeline_check = True
 
             pipeline.return_value = 's3api tempauth proxy-server'
             self.s3api.check_pipeline(self.conf)
@@ -779,9 +896,10 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         with patch("swift.common.middleware.s3api.s3api.loadcontext"), \
                 patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
                 as pipeline:
-            # Disable pipeline check
-            self.conf.auth_pipeline_check = False
-            self.conf.__file__ = ''
+            # cause check_pipeline to not return early...
+            self.conf['__file__'] = ''
+            # ...but disable pipeline auth checking
+            self.s3api.conf.auth_pipeline_check = False
 
             pipeline.return_value = 's3api tempauth proxy-server'
             self.s3api.check_pipeline(self.conf)
@@ -952,7 +1070,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                        'S3Request._validate_headers'), \
                     patch('swift.common.middleware.s3api.utils.time.time',
                           return_value=fake_time):
-                req = SigV4Request(env, location=self.conf.location)
+                req = SigV4Request(env, conf=self.s3api.conf)
             return req
 
         def canonical_string(path, environ):
@@ -962,7 +1080,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             # See http://docs.aws.amazon.com/general/latest/gr
             # /signature-v4-test-suite.html for where location, service, and
             # signing key came from
-            with patch.object(self.conf, 'location', 'us-east-1'), \
+            with patch.object(self.s3api.conf, 'location', 'us-east-1'), \
                     patch.object(swift.common.middleware.s3api.s3request,
                                  'SERVICE', 'host'):
                 req = _get_req(path, environ)
