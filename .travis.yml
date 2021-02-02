@@ -12,4 +12,3 @@ matrix:
 script: 
   - apt-get install liberasurecode-dev
   - apt-get install ssh rsync
-  - tox
