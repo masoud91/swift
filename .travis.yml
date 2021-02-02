@@ -1,9 +1,5 @@
 language: python
 
-before_script: 
-  - apt-get install liberasurecode-dev
-  - apt-get install ssh rsync
-
 matrix:
   include:
    - env: TOXENV=py37
@@ -13,4 +9,7 @@ matrix:
    - env: TOXENV=pep8
      python: 3.7
 
-script: tox
+script: 
+  - apt-get install liberasurecode-dev
+  - apt-get install ssh rsync
+  - tox
