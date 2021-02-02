@@ -1,5 +1,7 @@
 language: python
 
+before_script: apt-get install liberasurecode-dev
+
 matrix:
   include:
    - env: TOXENV=py37
