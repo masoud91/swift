@@ -3,8 +3,7 @@ sudo: required
 addons:
   sonarcloud:
     organization: "masoud91"
-    token:
-      secure: ${SONAR_TOKEN}
+    token: ${SONAR_TOKEN}
  
 script:
   - sonar-scanner
