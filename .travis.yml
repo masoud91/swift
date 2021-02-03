@@ -4,7 +4,7 @@ addons:
   sonarcloud:
     organization: "masoud91"
     token:
-      secure: SONAR_TOKEN
+      secure: $SONAR_TOKEN
  
 script:
   - sonar-scanner
