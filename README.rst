@@ -4,6 +4,9 @@ OpenStack Swift
 
 .. image:: https://governance.openstack.org/tc/badges/swift.svg
     :target: https://governance.openstack.org/tc/reference/tags/index.html
+    
+.. image:: https://sonarcloud.io/api/badges/gate?key=swift_travis
+    :target: https://sonarcloud.io/dashboard/index/swift_travis
 
 .. Change things from this point on
 
