@@ -4,10 +4,13 @@ addons:
   sonarcloud:
     organization: "masoud91"
     token: ${SONAR_TOKEN}
- 
+
+services:
+  - docker
+
 script:
   - sonar-scanner
-
+  - docker build -f Dockerfile-py3 -t masoud92_swift:latest .
 
 # language: python
 
