@@ -1,16 +1,21 @@
 sudo: required
 
 addons:
-  sonarcloud:
-    organization: "masoud91"
-    token: ${SONAR_TOKEN}
+#   sonarcloud:
+#     organization: "masoud91"
+#     token: ${SONAR_TOKEN}
+
+  sonarqube: true
 
 services:
   - docker
 
 script:
-  - sonar-scanner
-  - docker build -f Dockerfile-py3 -t masoud92_swift:latest .
+    - sonar-scanner -D sonar.host.url=${SONAR_HOST_URL} -D sonar.login=${SONAR_TOKEN} -X
+#   - sonar-scanner
+#   - docker build -f Dockerfile-py3 -t masoud92_swift:latest .
+
+# sonar_cloud_token = 80dc43d7cb3571803dbbbefa67852ada7faff57c
 
 # language: python
 
