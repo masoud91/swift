@@ -11,7 +11,7 @@ services:
   - docker
 
 script:
-    - sonar-scanner -D sonar.host.url=${SONAR_HOST_URL} -D sonar.login=${SONAR_TOKEN} -X
+    - sonar-scanner -D sonar.host.url=https://sonar.zdrive.ir/ -D sonar.login=${SONAR_TOKEN} -X
 #   - sonar-scanner
 #   - docker build -f Dockerfile-py3 -t masoud92_swift:latest .
 
