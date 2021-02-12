@@ -1,5 +1,24 @@
 sudo: required
 
+services:
+  - docker
+
+cache:
+  directories:
+    - /home/travis/.sonarcache
+
+script:
+  - mkdir -p /home/travis/.sonarcache
+  - docker run --rm \
+        -u "$(id -u):$(id -g)" \
+        -e SONAR_HOST_URL="https://sonar.zdrive.ir" \
+        -v "$(pwd):/usr/src" \
+        -v "/home/travis/.sonarcache:/opt/sonar-scanner/.sonar/cache" \
+        lequal/sonar-scanner
+
+
+# sudo: required
+
 # addons:
 #   sonarcloud:
 #     organization: "masoud91"
@@ -7,11 +26,11 @@ sudo: required
 
 #   sonarqube: true
 
-services:
-  - docker
+# services:
+#   - docker
 
-script:
-  - docker run --rm -e SONAR_HOST_URL="https://sonar.zdrive.ir/" -e SONAR_LOGIN="${SONAR_TOKEN}" -v "$(pwd):/usr/src" sonarsource/sonar-scanner-cli
+# script:
+#   - docker run --rm -e SONAR_HOST_URL="https://sonar.zdrive.ir/" -e SONAR_LOGIN="${SONAR_TOKEN}" -v "$(pwd):/usr/src" sonarsource/sonar-scanner-cli
 
 #     - sonar-scanner -D sonar.host.url=https://sonar.zdrive.ir/ -D sonar.login=${SONAR_TOKEN} -X
 #   - sonar-scanner
