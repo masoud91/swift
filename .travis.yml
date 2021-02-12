@@ -1,11 +1,11 @@
 sudo: required
 
-addons:
+# addons:
 #   sonarcloud:
 #     organization: "masoud91"
 #     token: ${SONAR_TOKEN}
 
-  sonarqube: true
+#   sonarqube: true
 
 services:
   - docker
@@ -15,7 +15,7 @@ script:
     --rm \
     -e SONAR_HOST_URL="https://sonar.zdrive.ir/" \
     -e SONAR_LOGIN="${SONAR_TOKEN}" \
-    -v "(pwd):/usr/src" \
+    -v "$(pwd):/usr/src" \
     sonarsource/sonar-scanner-cli
 
 #     - sonar-scanner -D sonar.host.url=https://sonar.zdrive.ir/ -D sonar.login=${SONAR_TOKEN} -X
