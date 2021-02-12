@@ -2,12 +2,10 @@ sudo: required
 
 services:
   - docker
-  
-services:
-  - docker
 
 script:
-  - docker run --user="$(id -u):$(id -g)" -it -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli
+  - ping sonar.zdrive.ir
+#   - docker run --user="$(id -u):$(id -g)" -it -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli
 #   - docker run --rm --user="$(id -u):$(id -g)" -e SONAR_HOST_URL="https://sonar.zdrive.ir/" -e SONAR_LOGIN="${SONAR_TOKEN}" -v "$(pwd):/usr/src" sonarsource/sonar-scanner-cli
 
 # cache:
