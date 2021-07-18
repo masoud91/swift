@@ -82,6 +82,7 @@ from six.moves.configparser import (ConfigParser, NoSectionError,
 from six.moves import range, http_client
 from six.moves.urllib.parse import quote as _quote, unquote
 from six.moves.urllib.parse import urlparse
+from six.moves import UserList
 
 from swift import gettext_ as _
 import swift.common.exceptions
@@ -204,6 +205,7 @@ LOG_LINE_DEFAULT_FORMAT = '{remote_addr} - - [{time.d}/{time.b}/{time.Y}' \
                           '"{referer}" "{txn_id}" "{user_agent}" ' \
                           '{trans_time:.4f} "{additional_info}" {pid} ' \
                           '{policy_index}'
+DEFAULT_LOCK_TIMEOUT = 10
 
 
 class InvalidHashPathConfigError(ValueError):
@@ -423,6 +425,35 @@ def backward(f, blocksize=4096):
 TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
 
 
+def non_negative_float(value):
+    """
+    Check that the value casts to a float and is non-negative.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to a float or is negative.
+    :return: a float
+    """
+    value = float(value)
+    if value < 0:
+        raise ValueError
+    return value
+
+
+def non_negative_int(value):
+    """
+    Check that the value casts to an int and is a whole number.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to an int or does not
+        represent a whole number.
+    :return: an int
+    """
+    int_value = int(value)
+    if int_value != non_negative_float(value):
+        raise ValueError
+    return int_value
+
+
 def config_true_value(value):
     """
     Returns True if the value is either True or a string in TRUE_VALUES.
@@ -476,6 +507,30 @@ def config_auto_int_value(value, default):
         raise ValueError('Config option must be an integer or the '
                          'string "auto", not "%s".' % value)
     return value
+
+
+def config_percent_value(value):
+    try:
+        return config_float_value(value, 0, 100) / 100.0
+    except ValueError as err:
+        raise ValueError("%s: %s" % (str(err), value))
+
+
+def config_request_node_count_value(value):
+    try:
+        value_parts = value.lower().split()
+        rnc_value = int(value_parts[0])
+    except (ValueError, AttributeError):
+        pass
+    else:
+        if len(value_parts) == 1:
+            return lambda replicas: rnc_value
+        elif (len(value_parts) == 3 and
+              value_parts[1] == '*' and
+              value_parts[2] == 'replicas'):
+            return lambda replicas: rnc_value * replicas
+    raise ValueError(
+        'Invalid request_node_count value: %r' % value)
 
 
 def append_underscore(prefix):
@@ -2187,6 +2242,8 @@ class LogAdapter(logging.LoggerAdapter, object):
                 emsg = _('Network unreachable')
             elif exc.errno == errno.ETIMEDOUT:
                 emsg = _('Connection timeout')
+            elif exc.errno == errno.EPIPE:
+                emsg = _('Broken pipe')
             else:
                 call = self._exception
         elif isinstance(exc, http_client.BadStatusLine):
@@ -2365,13 +2422,19 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                                           facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
+        handler = None
         try:
-            handler = ThreadSafeSysLogHandler(address=log_address,
-                                              facility=facility)
-        except socket.error as e:
-            # Either /dev/log isn't a UNIX socket or it does not exist at all
+            mode = os.stat(log_address).st_mode
+            if stat.S_ISSOCK(mode):
+                handler = ThreadSafeSysLogHandler(address=log_address,
+                                                  facility=facility)
+        except (OSError, socket.error) as e:
+            # If either /dev/log isn't a UNIX socket or it does not exist at
+            # all then py2 would raise an error
             if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
                 raise
+        if handler is None:
+            # fallback to default UDP
             handler = ThreadSafeSysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -2789,7 +2852,8 @@ def _get_any_lock(fds):
 
 
 @contextmanager
-def lock_path(directory, timeout=10, timeout_class=None, limit=1, name=None):
+def lock_path(directory, timeout=None, timeout_class=None,
+              limit=1, name=None):
     """
     Context manager that acquires a lock on a directory.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
@@ -2800,7 +2864,8 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1, name=None):
     workaround by locking a hidden file in the directory.
 
     :param directory: directory to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     :param timeout_class: The class of the exception to raise if the
         lock cannot be granted within the timeout. Will be
         constructed as timeout_class(timeout, lockpath). Default:
@@ -2814,10 +2879,12 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1, name=None):
     :raises TypeError: if limit is not an int.
     :raises ValueError: if limit is less than 1.
     """
-    if limit < 1:
-        raise ValueError('limit must be greater than or equal to 1')
+    if timeout is None:
+        timeout = DEFAULT_LOCK_TIMEOUT
     if timeout_class is None:
         timeout_class = swift.common.exceptions.LockTimeout
+    if limit < 1:
+        raise ValueError('limit must be greater than or equal to 1')
     mkdirs(directory)
     lockpath = '%s/.lock' % directory
     if name:
@@ -2845,17 +2912,20 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1, name=None):
 
 
 @contextmanager
-def lock_file(filename, timeout=10, append=False, unlink=True):
+def lock_file(filename, timeout=None, append=False, unlink=True):
     """
     Context manager that acquires a lock on a file.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
     first).
 
     :param filename: file to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     :param append: True if file should be opened in append mode
     :param unlink: True if the file should be unlinked at the end
     """
+    if timeout is None:
+        timeout = DEFAULT_LOCK_TIMEOUT
     flags = os.O_CREAT | os.O_RDWR
     if append:
         flags |= os.O_APPEND
@@ -2890,14 +2960,15 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
             file_obj.close()
 
 
-def lock_parent_directory(filename, timeout=10):
+def lock_parent_directory(filename, timeout=None):
     """
     Context manager that acquires a lock on the parent directory of the given
     file path.  This will block until the lock can be acquired, or the timeout
     time has expired (whichever occurs first).
 
     :param filename: file path of the parent directory to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     """
     return lock_path(os.path.dirname(filename), timeout=timeout)
 
@@ -3208,6 +3279,25 @@ def remove_directory(path):
             raise
 
 
+def is_file_older(path, age):
+    """
+    Test if a file mtime is older than the given age, suppressing any OSErrors.
+
+    :param path: first and only argument passed to os.stat
+    :param age: age in seconds
+    :return: True if age is less than or equal to zero or if the file mtime is
+        more than ``age`` in the past; False if age is greater than zero and
+        the file mtime is less than or equal to ``age`` in the past or if there
+        is an OSError while stat'ing the file.
+    """
+    if age <= 0:
+        return True
+    try:
+        return time.time() - os.stat(path).st_mtime > age
+    except OSError:
+        return False
+
+
 def audit_location_generator(devices, datadir, suffix='',
                              mount_check=True, logger=None,
                              devices_filter=None, partitions_filter=None,
@@ -3215,7 +3305,8 @@ def audit_location_generator(devices, datadir, suffix='',
                              hook_pre_device=None, hook_post_device=None,
                              hook_pre_partition=None, hook_post_partition=None,
                              hook_pre_suffix=None, hook_post_suffix=None,
-                             hook_pre_hash=None, hook_post_hash=None):
+                             hook_pre_hash=None, hook_post_hash=None,
+                             error_counter=None, yield_hash_dirs=False):
     """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
@@ -3234,25 +3325,30 @@ def audit_location_generator(devices, datadir, suffix='',
                     one of the DATADIR constants defined in the account,
                     container, and object servers.
     :param suffix: path name suffix required for all names returned
+                   (ignored if yield_hash_dirs is True)
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
-    :devices_filter: a callable taking (devices, [list of devices]) as
-                     parameters and returning a [list of devices]
-    :partitions_filter: a callable taking (datadir_path, [list of parts]) as
-                        parameters and returning a [list of parts]
-    :suffixes_filter: a callable taking (part_path, [list of suffixes]) as
-                      parameters and returning a [list of suffixes]
-    :hashes_filter: a callable taking (suff_path, [list of hashes]) as
-                    parameters and returning a [list of hashes]
-    :hook_pre_device: a callable taking device_path as parameter
-    :hook_post_device: a callable taking device_path as parameter
-    :hook_pre_partition: a callable taking part_path as parameter
-    :hook_post_partition: a callable taking part_path as parameter
-    :hook_pre_suffix: a callable taking suff_path as parameter
-    :hook_post_suffix: a callable taking suff_path as parameter
-    :hook_pre_hash: a callable taking hash_path as parameter
-    :hook_post_hash: a callable taking hash_path as parameter
+    :param devices_filter: a callable taking (devices, [list of devices]) as
+                           parameters and returning a [list of devices]
+    :param partitions_filter: a callable taking (datadir_path, [list of parts])
+                              as parameters and returning a [list of parts]
+    :param suffixes_filter: a callable taking (part_path, [list of suffixes])
+                            as parameters and returning a [list of suffixes]
+    :param hashes_filter: a callable taking (suff_path, [list of hashes]) as
+                          parameters and returning a [list of hashes]
+    :param hook_pre_device: a callable taking device_path as parameter
+    :param hook_post_device: a callable taking device_path as parameter
+    :param hook_pre_partition: a callable taking part_path as parameter
+    :param hook_post_partition: a callable taking part_path as parameter
+    :param hook_pre_suffix: a callable taking suff_path as parameter
+    :param hook_post_suffix: a callable taking suff_path as parameter
+    :param hook_pre_hash: a callable taking hash_path as parameter
+    :param hook_post_hash: a callable taking hash_path as parameter
+    :param error_counter: a dictionary used to accumulate error counts; may
+                          add keys 'unmounted' and 'unlistable_partitions'
+    :param yield_hash_dirs: if True, yield hash dirs instead of individual
+                            files
     """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
@@ -3260,17 +3356,24 @@ def audit_location_generator(devices, datadir, suffix='',
     if devices_filter:
         device_dir = devices_filter(devices, device_dir)
     for device in device_dir:
-        if hook_pre_device:
-            hook_pre_device(os.path.join(devices, device))
         if mount_check and not ismount(os.path.join(devices, device)):
+            if error_counter is not None:
+                error_counter.setdefault('unmounted', [])
+                error_counter['unmounted'].append(device)
             if logger:
                 logger.warning(
                     _('Skipping %s as it is not mounted'), device)
             continue
+        if hook_pre_device:
+            hook_pre_device(os.path.join(devices, device))
         datadir_path = os.path.join(devices, device, datadir)
         try:
             partitions = listdir(datadir_path)
         except OSError as e:
+            # NB: listdir ignores non-existent datadir_path
+            if error_counter is not None:
+                error_counter.setdefault('unlistable_partitions', [])
+                error_counter['unlistable_partitions'].append(datadir_path)
             if logger:
                 logger.warning(_('Skipping %(datadir)s because %(err)s'),
                                {'datadir': datadir_path, 'err': e})
@@ -3305,17 +3408,21 @@ def audit_location_generator(devices, datadir, suffix='',
                     hash_path = os.path.join(suff_path, hsh)
                     if hook_pre_hash:
                         hook_pre_hash(hash_path)
-                    try:
-                        files = sorted(listdir(hash_path), reverse=True)
-                    except OSError as e:
-                        if e.errno != errno.ENOTDIR:
-                            raise
-                        continue
-                    for fname in files:
-                        if suffix and not fname.endswith(suffix):
+                    if yield_hash_dirs:
+                        if os.path.isdir(hash_path):
+                            yield hash_path, device, partition
+                    else:
+                        try:
+                            files = sorted(listdir(hash_path), reverse=True)
+                        except OSError as e:
+                            if e.errno != errno.ENOTDIR:
+                                raise
                             continue
-                        path = os.path.join(hash_path, fname)
-                        yield path, device, partition
+                        for fname in files:
+                            if suffix and not fname.endswith(suffix):
+                                continue
+                            path = os.path.join(hash_path, fname)
+                            yield path, device, partition
                     if hook_post_hash:
                         hook_post_hash(hash_path)
                 if hook_post_suffix:
@@ -4910,6 +5017,33 @@ except TypeError:
         return hashlib.md5(string)  # nosec
 
 
+class ShardRangeOuterBound(object):
+    """
+    A custom singleton type to be subclassed for the outer bounds of
+    ShardRanges.
+    """
+    _singleton = None
+
+    def __new__(cls):
+        if cls is ShardRangeOuterBound:
+            raise TypeError('ShardRangeOuterBound is an abstract class; '
+                            'only subclasses should be instantiated')
+        if cls._singleton is None:
+            cls._singleton = super(ShardRangeOuterBound, cls).__new__(cls)
+        return cls._singleton
+
+    def __str__(self):
+        return ''
+
+    def __repr__(self):
+        return type(self).__name__
+
+    def __bool__(self):
+        return False
+
+    __nonzero__ = __bool__
+
+
 class ShardRange(object):
     """
     A ShardRange encapsulates sharding state related to a container including
@@ -4955,6 +5089,8 @@ class ShardRange(object):
         sharding was enabled for a container.
     :param reported: optional indicator that this shard and its stats have
         been reported to the root container.
+    :param tombstones: the number of tombstones in the shard range; defaults to
+        -1 to indicate that the value is unknown.
     """
     FOUND = 10
     CREATED = 20
@@ -4974,31 +5110,15 @@ class ShardRange(object):
               SHRUNK: 'shrunk'}
     STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
 
-    class OuterBound(object):
-        def __eq__(self, other):
-            return isinstance(other, type(self))
-
-        def __ne__(self, other):
-            return not self.__eq__(other)
-
-        def __str__(self):
-            return ''
-
-        def __repr__(self):
-            return type(self).__name__
-
-        def __bool__(self):
-            return False
-
-        __nonzero__ = __bool__
-
     @functools.total_ordering
-    class MaxBound(OuterBound):
+    class MaxBound(ShardRangeOuterBound):
+        # singleton for maximum bound
         def __ge__(self, other):
             return True
 
     @functools.total_ordering
-    class MinBound(OuterBound):
+    class MinBound(ShardRangeOuterBound):
+        # singleton for minimum bound
         def __le__(self, other):
             return True
 
@@ -5008,7 +5128,7 @@ class ShardRange(object):
     def __init__(self, name, timestamp, lower=MIN, upper=MAX,
                  object_count=0, bytes_used=0, meta_timestamp=None,
                  deleted=False, state=None, state_timestamp=None, epoch=None,
-                 reported=False):
+                 reported=False, tombstones=-1):
         self.account = self.container = self._timestamp = \
             self._meta_timestamp = self._state_timestamp = self._epoch = None
         self._lower = ShardRange.MIN
@@ -5028,6 +5148,7 @@ class ShardRange(object):
         self.state_timestamp = state_timestamp
         self.epoch = epoch
         self.reported = reported
+        self.tombstones = tombstones
 
     @classmethod
     def sort_key(cls, sr):
@@ -5047,7 +5168,7 @@ class ShardRange(object):
         return value
 
     def _encode_bound(self, bound):
-        if isinstance(bound, ShardRange.OuterBound):
+        if isinstance(bound, ShardRangeOuterBound):
             return bound
         if not (isinstance(bound, six.text_type) or
                 isinstance(bound, six.binary_type)):
@@ -5203,6 +5324,24 @@ class ShardRange(object):
             raise ValueError('bytes_used cannot be < 0')
         self._bytes = bytes_used
 
+    @property
+    def tombstones(self):
+        return self._tombstones
+
+    @tombstones.setter
+    def tombstones(self, tombstones):
+        self._tombstones = int(tombstones)
+
+    @property
+    def row_count(self):
+        """
+        Returns the total number of rows in the shard range i.e. the sum of
+        objects and tombstones.
+
+        :return: the row count
+        """
+        return self.object_count + max(self.tombstones, 0)
+
     def update_meta(self, object_count, bytes_used, meta_timestamp=None):
         """
         Set the object stats metadata to the given values and update the
@@ -5224,6 +5363,27 @@ class ShardRange(object):
             self.bytes_used = int(bytes_used)
             self.reported = False
 
+        if meta_timestamp is None:
+            self.meta_timestamp = Timestamp.now()
+        else:
+            self.meta_timestamp = meta_timestamp
+
+    def update_tombstones(self, tombstones, meta_timestamp=None):
+        """
+        Set the tombstones metadata to the given values and update the
+        meta_timestamp to the current time.
+
+        :param tombstones: should be an integer
+        :param meta_timestamp: timestamp for metadata; if not given the
+            current time will be set.
+        :raises ValueError: if ``tombstones`` cannot be cast to an int, or
+            if meta_timestamp is neither None nor can be cast to a
+            :class:`~swift.common.utils.Timestamp`.
+        """
+        tombstones = int(tombstones)
+        if 0 <= tombstones != self.tombstones:
+            self.tombstones = tombstones
+            self.reported = False
         if meta_timestamp is None:
             self.meta_timestamp = Timestamp.now()
         else:
@@ -5254,17 +5414,19 @@ class ShardRange(object):
             valid state number.
         """
         try:
-            state = state.lower()
-            state_num = cls.STATES_BY_NAME[state]
-        except (KeyError, AttributeError):
             try:
-                state_name = cls.STATES[state]
-            except KeyError:
-                raise ValueError('Invalid state %r' % state)
-            else:
-                state_num = state
-        else:
-            state_name = state
+                # maybe it's a number
+                float_state = float(state)
+                state_num = int(float_state)
+                if state_num != float_state:
+                    raise ValueError('Invalid state %r' % state)
+                state_name = cls.STATES[state_num]
+            except (ValueError, TypeError):
+                # maybe it's a state name
+                state_name = state.lower()
+                state_num = cls.STATES_BY_NAME[state_name]
+        except (KeyError, AttributeError):
+            raise ValueError('Invalid state %r' % state)
         return state_num, state_name
 
     @property
@@ -5273,14 +5435,7 @@ class ShardRange(object):
 
     @state.setter
     def state(self, state):
-        try:
-            float_state = float(state)
-            int_state = int(float_state)
-        except (ValueError, TypeError):
-            raise ValueError('Invalid state %r' % state)
-        if int_state != float_state or int_state not in self.STATES:
-            raise ValueError('Invalid state %r' % state)
-        self._state = int_state
+        self._state = self.resolve_state(state)[0]
 
     @property
     def state_text(self):
@@ -5452,6 +5607,7 @@ class ShardRange(object):
         yield 'state_timestamp', self.state_timestamp.internal
         yield 'epoch', self.epoch.internal if self.epoch is not None else None
         yield 'reported', 1 if self.reported else 0
+        yield 'tombstones', self.tombstones
 
     def copy(self, timestamp=None, **kwargs):
         """
@@ -5484,7 +5640,161 @@ class ShardRange(object):
             params['upper'], params['object_count'], params['bytes_used'],
             params['meta_timestamp'], params['deleted'], params['state'],
             params['state_timestamp'], params['epoch'],
-            params.get('reported', 0))
+            params.get('reported', 0), params.get('tombstones', -1))
+
+    def expand(self, donors):
+        """
+        Expands the bounds as necessary to match the minimum and maximum bounds
+        of the given donors.
+
+        :param donors: A list of :class:`~swift.common.utils.ShardRange`
+        :return: True if the bounds have been modified, False otherwise.
+        """
+        modified = False
+        new_lower = self.lower
+        new_upper = self.upper
+        for donor in donors:
+            new_lower = min(new_lower, donor.lower)
+            new_upper = max(new_upper, donor.upper)
+        if self.lower > new_lower or self.upper < new_upper:
+            self.lower = new_lower
+            self.upper = new_upper
+            modified = True
+        return modified
+
+
+class ShardRangeList(UserList):
+    """
+    This class provides some convenience functions for working with lists of
+    :class:`~swift.common.utils.ShardRange`.
+
+    This class does not enforce ordering or continuity of the list items:
+    callers should ensure that items are added in order as appropriate.
+    """
+    def __getitem__(self, index):
+        # workaround for py3 - not needed for py2.7,py3.8
+        result = self.data[index]
+        return ShardRangeList(result) if type(result) == list else result
+
+    @property
+    def lower(self):
+        """
+        Returns the lower bound of the first item in the list. Note: this will
+        only be equal to the lowest bound of all items in the list if the list
+        contents has been sorted.
+
+        :return: lower bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[0].lower
+
+    @property
+    def upper(self):
+        """
+        Returns the upper bound of the first item in the list. Note: this will
+        only be equal to the uppermost bound of all items in the list if the
+        list has previously been sorted.
+
+        :return: upper bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[-1].upper
+
+    @property
+    def object_count(self):
+        """
+        Returns the total number of objects of all items in the list.
+
+        :return: total object count
+        """
+        return sum(sr.object_count for sr in self)
+
+    @property
+    def row_count(self):
+        """
+        Returns the total number of rows of all items in the list.
+
+        :return: total row count
+        """
+        return sum(sr.row_count for sr in self)
+
+    @property
+    def bytes_used(self):
+        """
+        Returns the total number of bytes in all items in the list.
+
+        :return: total bytes used
+        """
+        return sum(sr.bytes_used for sr in self)
+
+    @property
+    def timestamps(self):
+        return set(sr.timestamp for sr in self)
+
+    @property
+    def states(self):
+        return set(sr.state for sr in self)
+
+    def includes(self, other):
+        """
+        Check if another ShardRange namespace is enclosed between the list's
+        ``lower`` and ``upper`` properties. Note: the list's ``lower`` and
+        ``upper`` properties will only equal the outermost bounds of all items
+        in the list if the list has previously been sorted.
+
+        Note: the list does not need to contain an item matching ``other`` for
+        this method to return True, although if the list has been sorted and
+        does contain an item matching ``other`` then the method will return
+        True.
+
+        :param other: an instance of :class:`~swift.common.utils.ShardRange`
+        :return: True if other's namespace is enclosed, False otherwise.
+        """
+        return self.lower <= other.lower and self.upper >= other.upper
+
+    def filter(self, includes=None, marker=None, end_marker=None):
+        """
+        Filter the list for those shard ranges whose namespace includes the
+        ``includes`` name or any part of the namespace between ``marker`` and
+        ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker``
+        are specified then all shard ranges will be returned.
+
+        :param includes: a string; if not empty then only the shard range, if
+            any, whose namespace includes this string will be returned, and
+            ``marker`` and ``end_marker`` will be ignored.
+        :param marker: if specified then only shard ranges whose upper bound is
+            greater than this value will be returned.
+        :param end_marker: if specified then only shard ranges whose lower
+            bound is less than this value will be returned.
+        :return: A new instance of :class:`~swift.common.utils.ShardRangeList`
+            containing the filtered shard ranges.
+        """
+        return ShardRangeList(
+            filter_shard_ranges(self, includes, marker, end_marker))
+
+    def find_lower(self, condition):
+        """
+        Finds the first shard range satisfies the given condition and returns
+        its lower bound.
+
+        :param condition: A function that must accept a single argument of type
+            :class:`~swift.common.utils.ShardRange` and return True if the
+            shard range satisfies the condition or False otherwise.
+        :return: The lower bound of the first shard range to satisfy the
+            condition, or the ``upper`` value of this list if no such shard
+            range is found.
+
+        """
+        for sr in self:
+            if condition(sr):
+                return sr.lower
+        return self.upper
 
 
 def find_shard_range(item, ranges):
@@ -5504,6 +5814,22 @@ def find_shard_range(item, ranges):
 
 
 def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
+    """
+    Filter the given shard ranges to those whose namespace includes the
+    ``includes`` name or any part of the namespace between ``marker`` and
+    ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker`` are
+    specified then all shard ranges will be returned.
+
+    :param shard_ranges: A list of :class:`~swift.common.utils.ShardRange`.
+    :param includes: a string; if not empty then only the shard range, if any,
+        whose namespace includes this string will be returned, and ``marker``
+        and ``end_marker`` will be ignored.
+    :param marker: if specified then only shard ranges whose upper bound is
+        greater than this value will be returned.
+    :param end_marker: if specified then only shard ranges whose lower bound is
+        less than this value will be returned.
+    :return: A filtered list of :class:`~swift.common.utils.ShardRange`.
+    """
     if includes:
         shard_range = find_shard_range(includes, shard_ranges)
         return [shard_range] if shard_range else []
@@ -5518,6 +5844,10 @@ def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
 
     if marker or end_marker:
         return list(filter(shard_range_filter, shard_ranges))
+
+    if marker == ShardRange.MAX or end_marker == ShardRange.MIN:
+        # MIN and MAX are both Falsy so not handled by shard_range_filter
+        return []
 
     return shard_ranges
 
@@ -5670,25 +6000,53 @@ def md5_hash_for_file(fname):
     return md5sum.hexdigest()
 
 
-def replace_partition_in_path(path, part_power):
+def get_partition_for_hash(hex_hash, part_power):
     """
-    Takes a full path to a file and a partition power and returns
-    the same path, but with the correct partition number. Most useful when
-    increasing the partition power.
+    Return partition number for given hex hash and partition power.
+    :param hex_hash: A hash string
+    :param part_power: partition power
+    :returns: partition number
+    """
+    raw_hash = binascii.unhexlify(hex_hash)
+    part_shift = 32 - int(part_power)
+    return struct.unpack_from('>I', raw_hash)[0] >> part_shift
 
-    :param path: full path to a file, for example object .data file
+
+def get_partition_from_path(devices, path):
+    """
+    :param devices: directory where devices are mounted (e.g. /srv/node)
+    :param path: full path to a object file or hashdir
+    :returns: the (integer) partition from the path
+    """
+    offset_parts = devices.rstrip(os.sep).split(os.sep)
+    path_components = path.split(os.sep)
+    if offset_parts == path_components[:len(offset_parts)]:
+        offset = len(offset_parts)
+    else:
+        raise ValueError('Path %r is not under device dir %r' % (
+            path, devices))
+    return int(path_components[offset + 2])
+
+
+def replace_partition_in_path(devices, path, part_power):
+    """
+    Takes a path and a partition power and returns the same path, but with the
+    correct partition number. Most useful when increasing the partition power.
+
+    :param devices: directory where devices are mounted (e.g. /srv/node)
+    :param path: full path to a object file or hashdir
     :param part_power: partition power to compute correct partition number
     :returns: Path with re-computed partition power
     """
-
+    offset_parts = devices.rstrip(os.sep).split(os.sep)
     path_components = path.split(os.sep)
-    digest = binascii.unhexlify(path_components[-2])
-
-    part_shift = 32 - int(part_power)
-    part = struct.unpack_from('>I', digest)[0] >> part_shift
-
-    path_components[-4] = "%d" % part
-
+    if offset_parts == path_components[:len(offset_parts)]:
+        offset = len(offset_parts)
+    else:
+        raise ValueError('Path %r is not under device dir %r' % (
+            path, devices))
+    part = get_partition_for_hash(path_components[offset + 4], part_power)
+    path_components[offset + 2] = "%d" % part
     return os.sep.join(path_components)
 
 

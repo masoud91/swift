@@ -44,6 +44,8 @@ from swift.common.exceptions import DriveNotMounted
 from swift.common.daemon import Daemon
 from swift.common.swob import Response, HTTPNotFound, HTTPNoContent, \
     HTTPAccepted, HTTPBadRequest
+from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
+    server_type_to_recon_file
 
 
 DEBUG_TIMINGS_THRESHOLD = 10
@@ -196,8 +198,8 @@ class Replicator(Daemon):
         self._local_device_ids = set()
         self.per_diff = int(conf.get('per_diff', 1000))
         self.max_diffs = int(conf.get('max_diffs') or 100)
-        self.interval = int(conf.get('interval') or
-                            conf.get('run_pause') or 30)
+        self.interval = float(conf.get('interval') or
+                              conf.get('run_pause') or 30)
         if 'run_pause' in conf:
             if 'interval' in conf:
                 self.logger.warning(
@@ -229,8 +231,8 @@ class Replicator(Daemon):
             config_true_value(conf.get('db_query_logging', 'f'))
         self._zero_stats()
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.recon_replicator = '%s.recon' % self.server_type
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.recon_replicator = server_type_to_recon_file(self.server_type)
         self.rcache = os.path.join(self.recon_cache_path,
                                    self.recon_replicator)
         self.extract_device_re = re.compile('%s%s([^%s]+)' % (
@@ -566,6 +568,12 @@ class Replicator(Daemon):
         self.logger.debug('Successfully deleted db %s', broker.db_file)
         return True
 
+    def _reclaim(self, broker, now=None):
+        if not now:
+            now = time.time()
+        return broker.reclaim(now - self.reclaim_age,
+                              now - (self.reclaim_age * 2))
+
     def _replicate_object(self, partition, object_file, node_id):
         """
         Replicate the db, choosing method based on whether or not it
@@ -591,8 +599,7 @@ class Replicator(Daemon):
         try:
             broker = self.brokerclass(object_file, pending_timeout=30,
                                       logger=self.logger)
-            broker.reclaim(now - self.reclaim_age,
-                           now - (self.reclaim_age * 2))
+            self._reclaim(broker, now)
             info = broker.get_replication_info()
             bpart = self.ring.get_part(
                 info['account'], info.get('container'))

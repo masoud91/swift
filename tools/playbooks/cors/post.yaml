@@ -1,0 +1,38 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: Check for geckodriver log
+      stat:
+        path: '{{ ansible_env.HOME }}/geckodriver.log'
+      register: geckodriver_output
+
+    - name: Copy geckodriver log from worker nodes to executor node
+      synchronize:
+        src: '{{ ansible_env.HOME }}/geckodriver.log'
+        dest: '{{ zuul.executor.log_root }}'
+        mode: pull
+        copy_links: true
+        verify_host: true
+      when: geckodriver_output.stat.exists == true
+
+    - name: Check for CORS test output
+      stat:
+        path: '{{ ansible_env.HOME }}/cors-test-results.txt'
+      register: test_output
+
+    - name: Copy CORS tests output from worker nodes to executor node
+      synchronize:
+        src: '{{ ansible_env.HOME }}/cors-test-results.txt'
+        dest: '{{ zuul.executor.log_root }}'
+        mode: pull
+        copy_links: true
+        verify_host: true
+      when: test_output.stat.exists == true
+
+    - zuul_return:
+        data:
+          zuul:
+            artifacts:
+              - name: CORS test results
+                url: cors-test-results.txt
+      when: test_output.stat.exists == true

@@ -94,6 +94,41 @@
     post-run: tools/playbooks/common/cover-post.yaml
 
 - job:
+    name: swift-tox-py38-arm64
+    parent: swift-tox-py38
+    nodeset: ubuntu-focal-arm64
+    description: |
+      Run unit tests for an OpenStack Python project under cPython
+      version 3.8 on top of arm64 architecture.
+
+- job:
+    name: swift-tox-py39-arm64
+    parent: swift-tox-py39
+    nodeset: ubuntu-focal-arm64
+    description: |
+      Run unit tests for an OpenStack Python project under cPython
+      version 3.9 on top of arm64 architecture.
+
+- job:
+    name: swift-tox-py39
+    parent: swift-tox-base
+    nodeset: ubuntu-focal
+    description: |
+      Run unit-tests for swift under cPython version 3.9.
+
+      Uses tox with the ``py39`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: py39
+      bindep_profile: test py39
+      python_version: 3.9
+      tox_environment:
+        NOSE_COVER_HTML: 1
+        NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
+    post-run: tools/playbooks/common/cover-post.yaml
+
+- job:
     name: swift-tox-func-py27
     parent: swift-tox-base
     description: |
@@ -106,23 +141,23 @@
       tox_envlist: func
 
 - job:
-    name: swift-tox-func-py37
+    name: swift-tox-func-py38
     parent: swift-tox-base
-    nodeset: ubuntu-bionic
+    nodeset: ubuntu-focal
     description: |
-      Run functional tests for swift under cPython version 3.7.
+      Run functional tests for swift under cPython version 3.8.
 
       Uses tox with the ``func-py3`` environment.
       It sets TMPDIR to an XFS mount point created via
       tools/test-setup.sh.
     vars:
       tox_envlist: func-py3
-      bindep_profile: test py37
-      python_version: 3.7
+      bindep_profile: test py38
+      python_version: 3.8
 
 - job:
     name: swift-tox-func-py36-centos-8
-    parent: swift-tox-func-py37
+    parent: swift-tox-func-py38
     nodeset: centos-8
     vars:
       bindep_profile: test py36
@@ -141,10 +176,10 @@
       tox_envlist: func-ec-py3
 
 - job:
-    name: swift-tox-func-encryption-py37
-    parent: swift-tox-func-py37
+    name: swift-tox-func-encryption-py38
+    parent: swift-tox-func-py38
     description: |
-      Run functional tests for swift under cPython version 3.7.
+      Run functional tests for swift under cPython version 3.8.
 
       Uses tox with the ``func-encryption-py3`` environment.
       It sets TMPDIR to an XFS mount point created via
@@ -153,10 +188,34 @@
       tox_envlist: func-encryption-py3
 
 - job:
-    name: swift-tox-func-ec-py37
-    parent: swift-tox-func-py37
+    name: swift-tox-func-encryption-py38-arm64
+    parent: swift-tox-func-encryption-py38
+    nodeset: ubuntu-focal-arm64
     description: |
-      Run functional tests for swift under cPython version 3.7.
+      Run functional tests for swift under cPython version 3.8
+      on top of arm64 architecture.
+
+      Uses tox with the ``func-encryption-py3`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+
+- job:
+    name: swift-tox-func-py38-arm64
+    parent: swift-tox-func-py38
+    nodeset: ubuntu-focal-arm64
+    description: |
+      Run functional tests for swift under cPython version 3.8
+      on top of arm64 architecture.
+
+      Uses tox with the ``func-py3`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+
+- job:
+    name: swift-tox-func-ec-py38
+    parent: swift-tox-func-py38
+    description: |
+      Run functional tests for swift under cPython version 3.8.
 
       Uses tox with the ``func-ec-py3`` environment.
       It sets TMPDIR to an XFS mount point created via
@@ -253,6 +312,8 @@
     description: |
       Setup a SAIO dev environment and run ceph-s3tests
     timeout: 5400
+    vars:
+      s3_acl: yes
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -289,6 +350,28 @@
       under Python 3.
     vars:
       bindep_profile: test py36
+
+- job:
+    name: swift-probetests-centos-8-arm64
+    parent: swift-probetests-centos-8
+    nodeset: centos-8-arm64
+    description: |
+      Setup a SAIO dev environment and run Swift's probe tests
+      under Python 3 on top of arm64 architecture.
+
+- job:
+    name: swift-func-cors
+    parent: swift-probetests-centos-7
+    description: |
+      Setup a SAIO dev environment and run Swift's CORS functional tests
+    timeout: 1200
+    vars:
+      s3_acl: no
+    pre-run:
+      - tools/playbooks/saio_single_node_setup/add_s3api.yaml
+      - tools/playbooks/cors/install_selenium.yaml
+    run: tools/playbooks/cors/run.yaml
+    post-run: tools/playbooks/cors/post.yaml
 
 - nodeset:
     name: swift-five-nodes
@@ -376,6 +459,12 @@
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: origin/stable/victoria
+
+- job:
+    name: swift-multinode-rolling-upgrade-wallaby
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/wallaby
 
 - job:
     name: swift-multinode-rolling-upgrade-master
@@ -476,6 +565,24 @@
       pass-to-parent: true
     vars: *swift_image_vars_py3
 
+- project-template:
+   name: swift-jobs-arm64
+   description: |
+     Runs tests for an OpenStack Python project under the CPython
+     version 3 releases designated for testing on top of ARM64 architecture.
+   check-arm64:
+     jobs:
+       - swift-tox-py38-arm64:
+           voting: false
+       - swift-tox-py39-arm64:
+           voting: false
+       - swift-probetests-centos-8-arm64:
+           voting: false
+       - swift-tox-func-encryption-py38-arm64:
+           voting: false
+       - swift-tox-func-py38-arm64:
+           voting: false
+
 - project:
     templates:
       - publish-openstack-docs-pti
@@ -483,198 +590,138 @@
       - check-requirements
       - release-notes-jobs-python3
       - integrated-gate-object-storage
+      - swift-jobs-arm64
     check:
       jobs:
         - swift-build-image:
-            irrelevant-files:
+            irrelevant-files: &docker-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/(functional|probe)/.*$
         - swift-build-image-py3:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *docker-irrelevant-files
 
         # Unit tests
         - swift-tox-py27:
-            irrelevant-files:
+            irrelevant-files: &unittest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+              - ^test/(cors|functional|probe)/.*$
         - swift-tox-py36:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *unittest-irrelevant-files
         - swift-tox-py37:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *unittest-irrelevant-files
         - swift-tox-py38:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *unittest-irrelevant-files
+        - swift-tox-py39:
+            irrelevant-files: *unittest-irrelevant-files
 
         # Functional tests
         - swift-tox-func-py27:
-            irrelevant-files:
+            irrelevant-files: &functest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
+              - ^test/(cors|probe)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
         - swift-tox-func-encryption-py27:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
         - swift-tox-func-ec-py27:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
 
         # py3 functional tests
-        - swift-tox-func-py37:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-tox-func-encryption-py37:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-tox-func-ec-py37:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+        - swift-tox-func-py38:
+            irrelevant-files: *functest-irrelevant-files
+        - swift-tox-func-encryption-py38:
+            irrelevant-files: *functest-irrelevant-files
+        - swift-tox-func-ec-py38:
+            irrelevant-files: *functest-irrelevant-files
 
         # Other tests
+        - swift-func-cors:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              # Keep doc/saio -- we use those sample configs in the saio playbooks
+              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
+              - ^test/(unit|functional|probe)/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
         - swift-tox-func-s3api-ceph-s3tests-tempauth:
             irrelevant-files:
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
               # Also keep doc/s3api -- it holds known failures for these tests
               - ^doc/(requirements.txt|(manpages|source)/.*)$
-              - ^test/(unit|probe)/.*$
+              - ^test/(cors|unit|probe)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
         - swift-probetests-centos-7:
-            irrelevant-files:
+            irrelevant-files: &probetest-irrelevant-files
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
-              - ^test/(unit|functional)/.*$
+              - ^test/(cors|unit|functional)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
         - swift-probetests-centos-8:
-            irrelevant-files:
-              - ^(api-ref|releasenotes)/.*$
-              # Keep doc/saio -- we use those sample configs in the saio playbooks
-              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
-              - ^test/(unit|functional)/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
         - swift-dsvm-functional-ipv6:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
         - swift-tox-lower-constraints:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *unittest-irrelevant-files
         - openstack-tox-pep8:
-            irrelevant-files:
+            irrelevant-files: &pep8-irrelevant-files
               - ^(api-ref|etc|examples|releasenotes)/.*$
               # Keep doc/manpages -- we want to syntax check them
               - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
         - swift-multinode-rolling-upgrade:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-            voting: false
+            irrelevant-files: *functest-irrelevant-files
         - tempest-integrated-object-storage:
-            irrelevant-files:
+            irrelevant-files: &tempest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
         - tempest-ipv6-only:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *tempest-irrelevant-files
         - grenade:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *tempest-irrelevant-files
     gate:
       jobs:
         # For gate jobs, err towards running more jobs (so, generally avoid
         # using irrelevant-files). Exceptions should mainly be made for
         # long-running jobs, like probetests or (once they move to
         # in-tree definitions) dsvm jobs.
-        - swift-upload-image
-        - swift-upload-image-py3
+        - swift-upload-image:
+            irrelevant-files: *docker-irrelevant-files
+        - swift-upload-image-py3:
+            irrelevant-files: *docker-irrelevant-files
         - swift-tox-py27
         - swift-tox-py36
         - swift-tox-py37
         - swift-tox-py38
+        - swift-tox-py39
         - swift-tox-func-py27
         - swift-tox-func-encryption-py27
         - swift-tox-func-ec-py27
-        - swift-tox-func-py37
-        - swift-tox-func-encryption-py37
-        - swift-tox-func-ec-py37
+        - swift-tox-func-py38
+        - swift-tox-func-encryption-py38
+        - swift-tox-func-ec-py38
+        - swift-func-cors
         - swift-probetests-centos-7:
-            irrelevant-files:
-              - ^(api-ref|releasenotes)/.*$
-              # Keep doc/saio -- we use those sample configs in the saio playbooks
-              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
-              - ^test/(unit|functional)/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *probetest-irrelevant-files
         - swift-probetests-centos-8:
-            irrelevant-files:
-              - ^(api-ref|releasenotes)/.*$
-              # Keep doc/saio -- we use those sample configs in the saio playbooks
-              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
-              - ^test/(unit|functional)/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
         - swift-dsvm-functional-ipv6:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/probe/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *functest-irrelevant-files
         - swift-tox-lower-constraints:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/(functional|probe)/.*$
+            irrelevant-files: *unittest-irrelevant-files
         - openstack-tox-pep8:
-            irrelevant-files:
-              - ^(api-ref|etc|examples|releasenotes)/.*$
-              # Keep doc/manpages -- we want to syntax check them
-              - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
+            irrelevant-files: *pep8-irrelevant-files
+        - swift-multinode-rolling-upgrade:
+            irrelevant-files: *functest-irrelevant-files
         - tempest-integrated-object-storage:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *tempest-irrelevant-files
         - tempest-ipv6-only:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *tempest-irrelevant-files
         - grenade:
-            irrelevant-files:
-              - ^(api-ref|doc|releasenotes)/.*$
-              - ^test/.*$
-              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            irrelevant-files: *tempest-irrelevant-files
     experimental:
       jobs:
         - swift-tox-py27-centos-7
@@ -690,6 +737,7 @@
         - swift-multinode-rolling-upgrade-train
         - swift-multinode-rolling-upgrade-ussuri
         - swift-multinode-rolling-upgrade-victoria
+        - swift-multinode-rolling-upgrade-wallaby
         - swift-multinode-rolling-upgrade-master:
             branches: master
 

@@ -34,19 +34,21 @@ from gzip import GzipFile
 from shutil import rmtree
 from six.moves.urllib.parse import unquote
 from swift.common import utils
-from swift.common.exceptions import DiskFileError
+from swift.common.exceptions import DiskFileError, DiskFileQuarantined
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import dump_recon_cache, md5
+from swift.common.utils import dump_recon_cache, md5, Timestamp
 from swift.obj import diskfile, reconstructor as object_reconstructor
 from swift.common import ring
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.obj.reconstructor import SYNC, REVERT
+from test import annotate_failure
 
-from test.unit import (patch_policies, debug_logger, mocked_http_conn,
-                       FabricatedRing, make_timestamp_iter,
-                       DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies,
-                       quiet_eventlet_exceptions, skip_if_no_xattrs)
+from test.debug_logger import debug_logger
+from test.unit import (patch_policies, mocked_http_conn, FabricatedRing,
+                       make_timestamp_iter, DEFAULT_TEST_EC_TYPE,
+                       encode_frag_archive_bodies, quiet_eventlet_exceptions,
+                       skip_if_no_xattrs)
 from test.unit.obj.common import write_diskfile
 
 
@@ -243,18 +245,15 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                          '1': part_1,
                          '2': part_2}
 
-            def _create_df(obj_num, part_num):
-                self._create_diskfile(
-                    part=part_num, object_name='o' + str(obj_set),
-                    policy=policy, frag_index=scenarios[part_num](obj_set),
-                    timestamp=utils.Timestamp(t))
-
             for part_num in self.part_nums:
                 # create 3 unique objects per part, each part
                 # will then have a unique mix of FIs for the
                 # possible scenarios
                 for obj_num in range(0, 3):
-                    _create_df(obj_num, part_num)
+                    self._create_diskfile(
+                        part=part_num, object_name='o' + str(obj_set),
+                        policy=policy, frag_index=scenarios[part_num](obj_set),
+                        timestamp=utils.Timestamp(t))
 
         ips = utils.whataremyips(self.reconstructor.bind_ip)
         for policy in [p for p in POLICIES if p.policy_type == EC_POLICY]:
@@ -291,7 +290,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         rmtree(self.testdir, ignore_errors=1)
 
     def _create_diskfile(self, policy=None, part=0, object_name='o',
-                         frag_index=0, timestamp=None, test_data=None):
+                         frag_index=0, timestamp=None, test_data=None,
+                         commit=True):
         policy = policy or self.policy
         df_mgr = self.reconstructor._df_router[policy]
         df = df_mgr.get_diskfile('sda1', part, 'a', 'c', object_name,
@@ -299,7 +299,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         timestamp = timestamp or utils.Timestamp.now()
         test_data = test_data or b'test data'
         write_diskfile(df, timestamp, data=test_data, frag_index=frag_index,
-                       legacy_durable=self.legacy_durable)
+                       commit=commit, legacy_durable=self.legacy_durable)
         return df
 
     def assert_expected_jobs(self, part_num, jobs):
@@ -784,22 +784,13 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
 
         def do_test(stat_code):
             with mocked_http_conn(stat_code):
-                resp = self.reconstructor._get_response(node, part,
-                                                        path='nada',
-                                                        headers={},
-                                                        full_path='nada/nada')
+                resp = self.reconstructor._get_response(
+                    node, self.policy, part, path='nada', headers={})
             return resp
 
-        resp = do_test(200)
-        self.assertEqual(resp.status, 200)
-
-        resp = do_test(400)
-        # on the error case return value will be None instead of response
-        self.assertIsNone(resp)
-        # ... and log warnings for 400
-        for line in self.logger.get_lines_for_level('warning'):
-            self.assertIn('Invalid response 400', line)
-        self.logger._clear()
+        for status in (200, 400, 404, 503):
+            resp = do_test(status)
+            self.assertEqual(status, resp.status)
 
         resp = do_test(Exception())
         self.assertIsNone(resp)
@@ -816,20 +807,6 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             # sanity Timeout has extra message in the error log
             self.assertIn('Timeout', line)
         self.logger.clear()
-
-        # we should get a warning on 503 (sanity)
-        resp = do_test(503)
-        self.assertIsNone(resp)
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(warnings))
-        self.assertIn('Invalid response 503', warnings[0])
-        self.logger.clear()
-
-        # ... but no messages should be emitted for 404
-        resp = do_test(404)
-        self.assertIsNone(resp)
-        for level, msgs in self.logger.lines_dict.items():
-            self.assertFalse(msgs)
 
     def test_reconstructor_skips_bogus_partition_dirs(self):
         # A directory in the wrong place shouldn't crash the reconstructor
@@ -1113,7 +1090,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                           matches a failure dict will return success == False.
         """
         class _fake_ssync(object):
-            def __init__(self, daemon, node, job, suffixes, **kwargs):
+            def __init__(self, daemon, node, job, suffixes,
+                         include_non_durable=False, **kwargs):
                 # capture context and generate an available_map of objs
                 context = {}
                 context['node'] = node
@@ -1122,10 +1100,12 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                 self.suffixes = suffixes
                 self.daemon = daemon
                 self.job = job
+                frag_prefs = [] if include_non_durable else None
                 hash_gen = self.daemon._df_router[job['policy']].yield_hashes(
                     self.job['device'], self.job['partition'],
                     self.job['policy'], self.suffixes,
-                    frag_index=self.job.get('frag_index'))
+                    frag_index=self.job.get('frag_index'),
+                    frag_prefs=frag_prefs)
                 self.available_map = {}
                 for hash_, timestamps in hash_gen:
                     self.available_map[hash_] = timestamps
@@ -1137,7 +1117,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                         self.success = False
                         break
                 context['success'] = self.success
-                context.update(kwargs)
+                context['include_non_durable'] = include_non_durable
 
             def __call__(self, *args, **kwargs):
                 return self.success, self.available_map if self.success else {}
@@ -1211,6 +1191,66 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
 
         # sanity check that some files should were deleted
         self.assertGreater(n_files, n_files_after)
+
+    def test_delete_reverted_nondurable(self):
+        # verify reconstructor only deletes reverted nondurable fragments after
+        # nondurable_purge_delay
+        shutil.rmtree(self.ec_obj_path)
+        ips = utils.whataremyips(self.reconstructor.bind_ip)
+        local_devs = [dev for dev in self.ec_obj_ring.devs
+                      if dev and dev['replication_ip'] in ips and
+                      dev['replication_port'] ==
+                      self.reconstructor.port]
+        partition = (local_devs[0]['id'] + 1) % 3
+        # recent non-durable
+        df_recent = self._create_diskfile(
+            object_name='recent', part=partition, commit=False)
+        datafile_recent = df_recent.manager.cleanup_ondisk_files(
+            df_recent._datadir, frag_prefs=[])['data_file']
+        # older non-durable but with recent mtime
+        df_older = self._create_diskfile(
+            object_name='older', part=partition, commit=False,
+            timestamp=Timestamp(time.time() - 61))
+        datafile_older = df_older.manager.cleanup_ondisk_files(
+            df_older._datadir, frag_prefs=[])['data_file']
+        # durable
+        df_durable = self._create_diskfile(
+            object_name='durable', part=partition, commit=True)
+        datafile_durable = df_durable.manager.cleanup_ondisk_files(
+            df_durable._datadir, frag_prefs=[])['data_file']
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+        self.assertTrue(os.path.exists(datafile_durable))
+
+        ssync_calls = []
+        with mock.patch('swift.obj.reconstructor.ssync_sender',
+                        self._make_fake_ssync(ssync_calls)):
+            self.reconstructor.handoffs_only = True
+            self.reconstructor.reconstruct()
+        for context in ssync_calls:
+            self.assertEqual(REVERT, context['job']['job_type'])
+            self.assertTrue(True, context.get('include_non_durable'))
+        # neither nondurable should be removed yet with default purge delay
+        # because their mtimes are too recent
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+        # but durable is purged
+        self.assertFalse(os.path.exists(datafile_durable))
+
+        ssync_calls = []
+        with mock.patch('swift.obj.reconstructor.ssync_sender',
+                        self._make_fake_ssync(ssync_calls)):
+            self.reconstructor.handoffs_only = True
+            # turn down the purge delay...
+            self.reconstructor.nondurable_purge_delay = 0
+            self.reconstructor.reconstruct()
+        for context in ssync_calls:
+            self.assertEqual(REVERT, context['job']['job_type'])
+            self.assertTrue(True, context.get('include_non_durable'))
+
+        # ...now the nondurables get purged
+        self.assertFalse(os.path.exists(datafile_recent))
+        self.assertFalse(os.path.exists(datafile_older))
 
     def test_no_delete_failed_revert(self):
         # test will only process revert jobs
@@ -1335,8 +1375,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         # part 2 should be totally empty
         hash_gen = self.reconstructor._df_router[self.policy].yield_hashes(
             'sda1', '2', self.policy, suffixes=stub_data.keys())
-        for path, hash_, ts in hash_gen:
-            self.fail('found %s with %s in %s' % (hash_, ts, path))
+        for hash_, ts in hash_gen:
+            self.fail('found %s : %s' % (hash_, ts))
 
         new_hashes = self.reconstructor._get_hashes(
             'sda1', 2, self.policy, do_listdir=True)
@@ -4548,17 +4588,27 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
 
 class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
-    obj_path = b'/a/c/o'  # subclass overrides this
+    obj_name = b'o'  # subclass overrides this
 
     def setUp(self):
         super(TestReconstructFragmentArchive, self).setUp()
+        self.obj_path = b'/a/c/' + self.obj_name
         self.obj_timestamp = self.ts()
-        self.obj_metadata = {
-            'name': self.obj_path,
-            'Content-Length': '0',
-            'ETag': 'etag',
-            'X-Timestamp': self.obj_timestamp.normal
-        }
+
+    def _create_fragment(self, frag_index, body=b'test data'):
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df_mgr = self.reconstructor._df_router[self.policy]
+        if six.PY2:
+            obj_name = self.obj_name
+        else:
+            obj_name = self.obj_name.decode('utf8')
+        self.df = df_mgr.get_diskfile('sda1', 9, 'a', 'c', obj_name,
+                                      policy=self.policy)
+        write_diskfile(self.df, self.obj_timestamp, data=body,
+                       frag_index=frag_index)
+        self.df.open()
+        self.logger.clear()
+        return self.df
 
     def test_reconstruct_fa_no_errors(self):
         job = {
@@ -4585,9 +4635,9 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         called_headers = []
         orig_func = object_reconstructor.ObjectReconstructor._get_response
 
-        def _get_response_hook(self, node, part, path, headers, policy):
+        def _get_response_hook(self, node, policy, part, path, headers):
             called_headers.append(headers)
-            return orig_func(self, node, part, path, headers, policy)
+            return orig_func(self, node, policy, part, path, headers)
 
         codes, body_iter, headers = zip(*responses)
         get_response_path = \
@@ -4596,7 +4646,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self.obj_metadata)
+                    job, node, self._create_fragment(2, body=b''))
                 self.assertEqual(0, df.content_length)
                 fixed_body = b''.join(df.reader())
         self.assertEqual(len(fixed_body), len(broken_body))
@@ -4655,12 +4705,53 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(*codes, body_iter=body_iter,
                                   headers=headers_iter):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, dict(self.obj_metadata))
+                    job, node, self._create_fragment(2))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
                     md5(fixed_body, usedforsecurity=False).hexdigest(),
                     md5(broken_body, usedforsecurity=False).hexdigest())
+
+    def test_reconstruct_fa_mixed_meta_timestamps_works(self):
+        # verify scenario where all fragments have same data timestamp but some
+        # have different meta timestamp
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[4]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(4)
+        ts_data = next(self.ts_iter)  # all frags .data timestamp
+        ts_meta = next(self.ts_iter)  # some frags .meta timestamp
+        ts_cycle = itertools.cycle((ts_data, ts_meta))
+        responses = list()
+        for body in ec_archive_bodies:
+            ts = next(ts_cycle)  # vary timestamp between data and meta
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag,
+                            'X-Timestamp': ts.normal,
+                            'X-Backend-Timestamp': ts.internal,
+                            'X-Backend-Data-Timestamp': ts_data.internal,
+                            'X-Backend-Durable-Timestamp': ts_data.internal})
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers_iter):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(2))
+            fixed_body = b''.join(df.reader())
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
 
     def test_reconstruct_fa_error_with_invalid_header(self):
         job = {
@@ -4701,7 +4792,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         with mocked_http_conn(*codes, body_iter=body_iter,
                               headers=headers_iter):
             df = self.reconstructor.reconstruct_fa(
-                job, node, dict(self.obj_metadata))
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             # ... this bad response should be ignored like any other failure
             self.assertEqual(len(fixed_body), len(broken_body))
@@ -4740,7 +4831,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(*codes, body_iter=body_iter,
                                   headers=headers_iter):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, dict(self.obj_metadata))
+                    job, node, self._create_fragment(2))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -4762,7 +4853,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                  range(policy.object_ring.replicas - 1)]
         with mocked_http_conn(*codes):
             self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
-                              job, node, self.obj_metadata)
+                              job, node, self._create_fragment(2))
         error_lines = self.logger.get_lines_for_level('error')
         # # of replicas failed and one more error log to report not enough
         # responses to reconstruct.
@@ -4770,7 +4861,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         for line in error_lines[:-1]:
             self.assertIn("Trying to GET", line)
         self.assertIn(
-            'Unable to get enough responses (%s error responses)'
+            'Unable to get enough responses (%s x unknown error responses)'
             % (policy.object_ring.replicas - 1),
             error_lines[-1],
             "Unexpected error line found: %s" % error_lines[-1])
@@ -4778,6 +4869,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.assertFalse(self.logger.get_lines_for_level('warning'))
 
     def test_reconstruct_fa_all_404s_fails(self):
+        self._create_fragment(2)
         job = {
             'partition': 0,
             'policy': self.policy,
@@ -4790,17 +4882,98 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes = [404 for i in range(policy.object_ring.replicas - 1)]
         with mocked_http_conn(*codes):
             self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
-                              job, node, self.obj_metadata)
+                              job, node, self.df)
         error_lines = self.logger.get_lines_for_level('error')
         # only 1 log to report not enough responses
         self.assertEqual(1, len(error_lines))
         self.assertIn(
-            'Unable to get enough responses (%s error responses)'
+            'Unable to get enough responses (%s x 404 error responses)'
             % (policy.object_ring.replicas - 1),
             error_lines[0],
             "Unexpected error line found: %s" % error_lines[0])
         # no warning
         self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_all_404s_fails_custom_request_node_count(self):
+        # verify that when quarantine_threshold is not set the number of
+        # requests is capped at replicas - 1 regardless of request_node_count
+        self._create_fragment(2)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+        ring = self.policy.object_ring
+        # sanity check: number of handoffs available == replicas
+        self.assertEqual(ring.max_more_nodes, ring.replicas)
+        for request_node_count in (0,
+                                   self.policy.ec_ndata - 1,
+                                   ring.replicas + 1,
+                                   2 * ring.replicas - 1,
+                                   2 * ring.replicas,
+                                   3 * ring.replicas,
+                                   99 * ring.replicas):
+            with annotate_failure(request_node_count):
+                self.logger.clear()
+                self.reconstructor.request_node_count = \
+                    lambda replicas: request_node_count
+                # request count capped at num primaries - 1
+                exp_requests = ring.replicas - 1
+                codes = [404 for i in range(exp_requests)]
+                with mocked_http_conn(*codes):
+                    self.assertRaises(DiskFileError,
+                                      self.reconstructor.reconstruct_fa,
+                                      job, node, self.df)
+                error_lines = self.logger.get_lines_for_level('error')
+                # only 1 log to report not enough responses
+                self.assertEqual(1, len(error_lines))
+                self.assertIn(
+                    'Unable to get enough responses (%s x 404 error responses)'
+                    % exp_requests,
+                    error_lines[0],
+                    "Unexpected error line found: %s" % error_lines[0])
+                # no warning
+                self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_mixture_of_errors_fails(self):
+        self._create_fragment(2)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+        policy = self.policy
+
+        # ensure at least one of each error type
+        possible_errors = [Timeout(), 404, 507]
+        codes = possible_errors + [random.choice(possible_errors) for i in
+                                   range(policy.object_ring.replicas - 4)]
+        with mocked_http_conn(*codes):
+            self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
+                              job, node, self.df)
+        exp_timeouts = len([c for c in codes if isinstance(c, Timeout)])
+        exp_404s = len([c for c in codes if c == 404])
+        exp_507s = len([c for c in codes if c == 507])
+        error_lines = self.logger.get_lines_for_level('error')
+        # 1 error log to report not enough responses and possibly some to
+        # report Timeouts
+        self.assertEqual(len(error_lines), exp_timeouts + 1, error_lines)
+        for line in error_lines[:-1]:
+            self.assertIn("Trying to GET", line)
+        self.assertIn(
+            'Unable to get enough responses '
+            '(%s x unknown, %s x 404, %s x 507 error responses)'
+            % (exp_timeouts, exp_404s, exp_507s), error_lines[-1],
+            "Unexpected error line found: %s" % error_lines[-1])
+        # no warning
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(exp_507s, len(warning_lines), warning_lines)
+        for line in warning_lines:
+            self.assertIn('Invalid response 507', line)
 
     def test_reconstruct_fa_with_mixed_old_etag(self):
         job = {
@@ -4843,7 +5016,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self.obj_metadata)
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -4883,7 +5056,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, dict(self.obj_metadata))
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -4900,7 +5073,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, dict(self.obj_metadata))
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -4937,7 +5110,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, dict(self.obj_metadata))
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -4958,7 +5131,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, dict(self.obj_metadata))
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -4975,7 +5148,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             error_log_lines[0])
         self.assertFalse(self.logger.get_lines_for_level('warning'))
 
-    def test_reconstruct_fa_with_mixed_not_enough_etags_fail(self):
+    def test_reconstruct_fa_with_mixed_timestamps_etags_fail(self):
         job = {
             'partition': 0,
             'policy': self.policy,
@@ -5022,7 +5195,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
-                              job, node, self.obj_metadata)
+                              job, node, self._create_fragment(2))
 
         error_lines = self.logger.get_lines_for_level('error')
         # 1 error log per etag to report not enough responses
@@ -5039,13 +5212,12 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             # following error lines
             del ec_archive_dict[(expected_etag, ts, durable)]
 
-            expected = 'Unable to get enough responses (%s/10) to ' \
-                       'reconstruct %s 10.0.0.1:1001/sdb/0%s policy#0 ' \
-                       'frag#1 with ETag %s and timestamp %s' % \
-                       (etag_count[expected_etag],
+            expected = 'Unable to get enough responses (%s/10 from %s ok ' \
+                       'responses) to reconstruct %s 10.0.0.1:1001/sdb/0%s ' \
+                       'policy#0 frag#1 with ETag %s and timestamp %s' %\
+                       (etag_count[expected_etag], etag_count[expected_etag],
                         'durable' if durable else 'non-durable',
-                        self.obj_path.decode('utf8'),
-                        expected_etag, ts)
+                        self.obj_path.decode('utf8'), expected_etag, ts)
             self.assertIn(
                 expected, error_line,
                 "Unexpected error line found: Expected: %s Got: %s"
@@ -5053,7 +5225,85 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         # no warning
         self.assertFalse(self.logger.get_lines_for_level('warning'))
 
-    def test_reconstruct_fa_finds_itself_does_not_fail(self):
+    def test_reconstruct_fa_with_mixed_etags_same_timestamp_fail(self):
+        self._create_fragment(2)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        ec_archive_dict = dict()
+        ts = next(make_timestamp_iter())
+        # create 3 different ec bodies
+        for i in range(3):
+            body = test_data[i:]
+            archive_bodies = encode_frag_archive_bodies(self.policy, body)
+            # pop the index to the destination node
+            archive_bodies.pop(1)
+            key = (md5(body, usedforsecurity=False).hexdigest(),
+                   ts.internal, bool(i % 2))
+            ec_archive_dict[key] = archive_bodies
+
+        responses = list()
+        # fill out response list by 3 different etag bodies, same timestamp
+        for etag, ts, durable in itertools.cycle(ec_archive_dict):
+            body = ec_archive_dict[(etag, ts, durable)].pop(0)
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag,
+                            'X-Backend-Timestamp': ts})
+            if durable:
+                headers['X-Backend-Durable-Timestamp'] = ts
+            responses.append((200, body, headers))
+            if len(responses) >= (self.policy.object_ring.replicas - 1):
+                break
+
+        # sanity, there is 3 different etag and each etag
+        # doesn't have > ec_k bodies
+        etag_count = collections.Counter(
+            [in_resp_headers['X-Object-Sysmeta-Ec-Etag']
+             for _, _, in_resp_headers in responses])
+        self.assertEqual(3, len(etag_count))
+        for etag, count in etag_count.items():
+            self.assertLess(count, self.policy.ec_ndata)
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
+            self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
+                              job, node, self.df)
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertGreater(len(error_lines), 1)
+        for expected_etag, ts, durable in ec_archive_dict:
+            if expected_etag in error_lines[-1]:
+                break
+        else:
+            self.fail(
+                "no expected etag %s found: %s" %
+                (list(ec_archive_dict), error_lines[0]))
+
+        other_etags_count = sum(count for etag, count in etag_count.items()
+                                if etag != expected_etag)
+        self.assertEqual(other_etags_count + 1, len(error_lines))
+        for line in error_lines[:-1]:
+            self.assertIn('Mixed Etag', line)
+        expected = 'Unable to get enough responses (%s/10 from %s ok ' \
+                   'responses) to reconstruct %s 10.0.0.1:1001/sdb/0%s ' \
+                   'policy#0 frag#1 with ETag %s and timestamp %s' % \
+                   (etag_count[expected_etag], len(responses),
+                    'durable' if durable else 'non-durable',
+                    self.obj_path.decode('utf8'), expected_etag, ts)
+        self.assertIn(
+            expected, error_lines[-1],
+            "Unexpected error line found: Expected: %s Got: %s"
+            % (expected, error_lines[0]))
+        # no warning
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_finds_missing_frag_does_not_fail(self):
         # verify that reconstruction of a missing frag can cope with finding
         # that missing frag in the responses it gets from other nodes while
         # attempting to rebuild the missing frag
@@ -5085,7 +5335,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self.obj_metadata)
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5100,7 +5350,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         # redundant frag found once in first ec_ndata responses
         self.assertIn(
             'Found existing frag #%s at' % broken_index,
-            debug_log_lines[0])
+            debug_log_lines[0], debug_log_lines)
 
         # N.B. in the future, we could avoid those check because
         # definitely sending the copy rather than reconstruct will
@@ -5116,6 +5366,607 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         got_frag_index_list = json.loads(
             debug_log_lines[1][len(log_prefix):])
         self.assertNotIn(broken_index, got_frag_index_list)
+
+    def test_quarantine_threshold_conf(self):
+        reconstructor = object_reconstructor.ObjectReconstructor({})
+        self.assertEqual(0, reconstructor.quarantine_threshold)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_threshold': '0'})
+        self.assertEqual(0, reconstructor.quarantine_threshold)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_threshold': '1'})
+        self.assertEqual(1, reconstructor.quarantine_threshold)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_threshold': 2.0})
+        self.assertEqual(2, reconstructor.quarantine_threshold)
+
+        for bad in ('1.1', 1.1, '-1', -1, 'auto', 'bad'):
+            with annotate_failure(bad):
+                with self.assertRaises(ValueError):
+                    object_reconstructor.ObjectReconstructor(
+                        {'quarantine_threshold': bad})
+
+    def test_nondurable_purge_delay_conf(self):
+        reconstructor = object_reconstructor.ObjectReconstructor({})
+        self.assertEqual(60, reconstructor.nondurable_purge_delay)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'nondurable_purge_delay': '0'})
+        self.assertEqual(0, reconstructor.nondurable_purge_delay)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'nondurable_purge_delay': '3.2'})
+        self.assertEqual(3.2, reconstructor.nondurable_purge_delay)
+
+        for bad in ('-1', -1, 'auto', 'bad'):
+            with annotate_failure(bad):
+                with self.assertRaises(ValueError):
+                    object_reconstructor.ObjectReconstructor(
+                        {'nondurable_purge_delay': bad})
+
+    def test_quarantine_age_conf(self):
+        # defaults to DEFAULT_RECLAIM_AGE
+        reconstructor = object_reconstructor.ObjectReconstructor({})
+        self.assertEqual(604800, reconstructor.quarantine_age)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_age': '0'})
+        self.assertEqual(0, reconstructor.quarantine_age)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_age': '1'})
+        self.assertEqual(1, reconstructor.quarantine_age)
+
+        # trumps reclaim_age
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_age': '1', 'reclaim_age': 0})
+        self.assertEqual(1, reconstructor.quarantine_age)
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_age': '1', 'reclaim_age': 2})
+        self.assertEqual(1, reconstructor.quarantine_age)
+
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            {'quarantine_age': 2.2})
+        self.assertEqual(2, reconstructor.quarantine_age)
+
+        for bad in ('1.1', 'auto', 'bad'):
+            with annotate_failure(bad):
+                with self.assertRaises(ValueError):
+                    object_reconstructor.ObjectReconstructor(
+                        {'quarantine_age': bad})
+
+    def test_request_node_count_conf(self):
+        # default is 1 * replicas
+        reconstructor = object_reconstructor.ObjectReconstructor({})
+        self.assertEqual(6, reconstructor.request_node_count(3))
+        self.assertEqual(22, reconstructor.request_node_count(11))
+
+        def do_test(value, replicas, expected):
+            reconstructor = object_reconstructor.ObjectReconstructor(
+                {'request_node_count': value})
+            self.assertEqual(expected,
+                             reconstructor.request_node_count(replicas))
+        do_test('0', 10, 0)
+        do_test('1 * replicas', 3, 3)
+        do_test('1 * replicas', 11, 11)
+        do_test('2 * replicas', 3, 6)
+        do_test('2 * replicas', 11, 22)
+        do_test('11', 11, 11)
+        do_test('10', 11, 10)
+        do_test('12', 11, 12)
+
+        for bad in ('1.1', 1.1, 'auto', 'bad',
+                    '2.5 * replicas', 'two * replicas'):
+            with annotate_failure(bad):
+                with self.assertRaises(ValueError):
+                    object_reconstructor.ObjectReconstructor(
+                        {'request_node_count': bad})
+
+    def _do_test_reconstruct_insufficient_frags(
+            self, extra_conf, num_frags, other_responses,
+            local_frag_index=2, frag_index_to_rebuild=1,
+            resp_timestamps=None, resp_etags=None):
+        # num_frags is number of ok responses, other_responses is bad responses
+        # By default frag_index_to_rebuild is less than local_frag_index and
+        # all frag responses have indexes >= local_frag_index
+        self.assertGreater(num_frags, 0)
+        self.logger.clear()
+        self._configure_reconstructor(**extra_conf)
+        self._create_fragment(local_frag_index)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[frag_index_to_rebuild]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        frags = ec_archive_bodies[
+            local_frag_index:local_frag_index + num_frags]
+
+        if resp_etags:
+            self.assertEqual(len(frags), len(resp_etags))
+            etags = []
+            for other_etag in resp_etags:
+                # use default etag where other_etag is None
+                etags.append(other_etag if other_etag else etag)
+        else:
+            etags = [etag] * len(frags)
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etags.pop(0)})
+            return headers
+
+        responses = [(200, frag, make_header(frag)) for frag in frags]
+        codes, body_iter, headers = zip(*(responses + other_responses))
+        resp_timestamps = (resp_timestamps if resp_timestamps
+                           else [self.obj_timestamp] * len(codes))
+        resp_timestamps = [ts.internal for ts in resp_timestamps]
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers,
+                              timestamps=resp_timestamps):
+            with self.assertRaises(DiskFileError) as cm:
+                self.reconstructor.reconstruct_fa(
+                    job, node, self._create_fragment(2))
+        return cm.exception
+
+    def _verify_error_lines(self, num_frags, other_responses,
+                            exp_useful_responses):
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines), error_lines)
+        self.assertIn(
+            'Unable to get enough responses (%d/%d from %d ok responses)'
+            % (exp_useful_responses, self.policy.ec_ndata, num_frags),
+            error_lines[0])
+        bad_codes = collections.Counter(
+            status for status, _, _ in other_responses)
+        errors = ', '.join('%s x %s' % (num, code)
+                           for code, num in sorted(bad_codes.items()))
+        self.assertIn('Unable to get enough responses (%s error responses)'
+                      % errors, error_lines[1])
+
+    def _assert_diskfile_quarantined(self):
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn('Quarantined object', warning_lines[0])
+
+        # Check the diskfile has moved to quarantine dir
+        data_filename = os.path.basename(self.df._data_file)
+        df_hash = os.path.basename(self.df._datadir)
+        quarantine_dir = os.path.join(
+            self.df._device_path, 'quarantined',
+            diskfile.get_data_dir(self.policy), df_hash)
+        self.assertTrue(os.path.isdir(quarantine_dir))
+        quarantine_file = os.path.join(quarantine_dir, data_filename)
+        self.assertTrue(os.path.isfile(quarantine_file))
+        with open(quarantine_file, 'r') as fd:
+            self.assertEqual('test data', fd.read())
+        self.assertFalse(os.path.exists(self.df._data_file))
+
+    def _assert_diskfile_not_quarantined(self):
+        # Check the diskfile has not moved to quarantine dir
+        quarantine_dir = os.path.join(
+            self.df._device_path, 'quarantined')
+        self.assertFalse(os.path.isdir(quarantine_dir))
+        self.assertTrue(os.path.exists(self.df._data_file))
+        with open(self.df._data_file, 'r') as fd:
+            self.assertEqual('test data', fd.read())
+
+    def test_reconstruct_fa_quarantine_threshold_one_rnc_two_replicas(self):
+        # use default request_node_count == 2 * replicas
+        num_other_resps = 2 * self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        conf = {'quarantine_threshold': 1, 'reclaim_age': 0}
+        exc = self._do_test_reconstruct_insufficient_frags(
+            conf, 1, other_responses)
+        self.assertIsInstance(exc, DiskFileQuarantined)
+        self._assert_diskfile_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+    def test_reconstruct_fa_quarantine_threshold_one_rnc_three_replicas(self):
+        num_other_resps = 3 * self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        conf = {'quarantine_threshold': 1, 'reclaim_age': 0,
+                'request_node_count': '3 * replicas'}
+        # set ring get_more_nodes to yield enough handoffs
+        self.policy.object_ring.max_more_nodes = (
+            2 * self.policy.object_ring.replicas)
+        exc = self._do_test_reconstruct_insufficient_frags(
+            conf, 1, other_responses)
+        self.assertIsInstance(exc, DiskFileQuarantined)
+        self._assert_diskfile_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+    def test_reconstruct_fa_quarantine_threshold_one_rnc_four_replicas(self):
+        # verify handoff search exhausting handoff node iter
+        num_other_resps = 3 * self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        conf = {'quarantine_threshold': 1, 'reclaim_age': 0,
+                'request_node_count': '4 * replicas'}
+        # limit ring get_more_nodes to yield less than
+        # (request_node_count - 1 * replicas) nodes
+        self.policy.object_ring.max_more_nodes = (
+            2 * self.policy.object_ring.replicas)
+        exc = self._do_test_reconstruct_insufficient_frags(
+            conf, 1, other_responses)
+        self.assertIsInstance(exc, DiskFileQuarantined)
+        self._assert_diskfile_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+    def test_reconstruct_fa_quarantine_threshold_one_rnc_absolute_number(self):
+        def do_test(rnc_num):
+            if rnc_num < self.policy.object_ring.replicas:
+                num_other_resps = self.policy.object_ring.replicas - 2
+            else:
+                num_other_resps = rnc_num - 2
+            other_responses = [(404, None, None)] * num_other_resps
+            conf = {'quarantine_threshold': 1, 'reclaim_age': 0,
+                    'request_node_count': str(rnc_num)}
+            # set ring get_more_nodes to yield enough handoffs
+            self.policy.object_ring.max_more_nodes = (
+                2 * self.policy.object_ring.replicas)
+            exc = self._do_test_reconstruct_insufficient_frags(
+                conf, 1, other_responses)
+            self.assertIsInstance(exc, DiskFileQuarantined)
+            self._assert_diskfile_quarantined()
+            self._verify_error_lines(1, other_responses, 1)
+
+        for rnc_num in range(0, 3 * self.policy.object_ring.replicas):
+            do_test(rnc_num)
+
+    def test_reconstruct_fa_quarantine_threshold_two(self):
+        num_other_resps = 2 * self.policy.object_ring.replicas - 3
+        other_responses = [(404, None, None)] * num_other_resps
+        conf = {'quarantine_threshold': 2, 'reclaim_age': 0}
+        exc = self._do_test_reconstruct_insufficient_frags(
+            conf, 2, other_responses)
+        self.assertIsInstance(exc, DiskFileQuarantined)
+        self._assert_diskfile_quarantined()
+        self._verify_error_lines(2, other_responses, 2)
+
+    def test_reconstruct_fa_quarantine_threshold_two_with_quarantine_age(self):
+        num_other_resps = 2 * self.policy.object_ring.replicas - 3
+        other_responses = [(404, None, None)] * num_other_resps
+        conf = {'quarantine_threshold': 2,
+                'quarantine_age': 0,  # quarantine age trumps reclaim age
+                'reclaim_age': 1000}
+        exc = self._do_test_reconstruct_insufficient_frags(
+            conf, 2, other_responses)
+        self.assertIsInstance(exc, DiskFileQuarantined)
+        self._assert_diskfile_quarantined()
+        self._verify_error_lines(2, other_responses, 2)
+
+    def test_reconstruct_fa_no_quarantine_more_than_threshold_frags(self):
+        # default config
+        num_other_resps = self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'reclaim_age': 0}, 1, other_responses)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+
+        # configured quarantine_threshold
+        for quarantine_threshold in range(self.policy.ec_ndata):
+            for num_frags in range(quarantine_threshold + 1,
+                                   self.policy.ec_ndata):
+                num_other_resps = (self.policy.object_ring.replicas -
+                                   num_frags - 1)
+                other_responses = [(404, None, None)] * num_other_resps
+                exc = self._do_test_reconstruct_insufficient_frags(
+                    {'quarantine_threshold': quarantine_threshold,
+                     'reclaim_age': 0},
+                    num_frags, other_responses)
+                self.assertIsInstance(exc, DiskFileError)
+                self._assert_diskfile_not_quarantined()
+                self._verify_error_lines(num_frags, other_responses, num_frags)
+                warning_lines = self.logger.get_lines_for_level('warning')
+                self.assertEqual([], warning_lines)
+
+        # responses include the frag_index_to_rebuild - verify that response is
+        # counted against the threshold
+        num_other_resps = self.policy.object_ring.replicas - 3
+        other_responses = [(404, None, None)] * num_other_resps
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1, 'reclaim_age': 0}, 2, other_responses,
+            local_frag_index=2, frag_index_to_rebuild=3)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(2, other_responses, 1)
+
+    def test_reconstruct_fa_no_quarantine_non_404_response(self):
+        num_frags = 1
+        ring = self.policy.object_ring
+        for bad_status in (400, 503, 507):
+            # a non-404 in primary responses will prevent quarantine
+            num_other_resps = ring.replicas - num_frags - 1
+            other_responses = [(404, None, None)] * (num_other_resps - 1)
+            other_responses.append((bad_status, None, None))
+            exc = self._do_test_reconstruct_insufficient_frags(
+                {'quarantine_threshold': 1, 'reclaim_age': 0},
+                num_frags, other_responses)
+            self.assertIsInstance(exc, DiskFileError)
+            self._assert_diskfile_not_quarantined()
+            self._verify_error_lines(num_frags, other_responses, num_frags)
+            warning_lines = self.logger.get_lines_for_level('warning')
+            self.assertEqual(1, len(warning_lines), warning_lines)
+            self.assertIn('Invalid response %s' % bad_status, warning_lines[0])
+
+            # a non-404 in handoff responses will prevent quarantine; non-404
+            # is the *final* handoff response...
+            ring.max_more_nodes = (13 * ring.replicas)
+            for request_node_count in (2, 3, 13):
+                num_other_resps = (request_node_count * ring.replicas
+                                   - num_frags - 1)
+                other_responses = [(404, None, None)] * (num_other_resps - 1)
+                other_responses.append((bad_status, None, None))
+                with annotate_failure(
+                        'request_node_count=%d' % request_node_count):
+                    exc = self._do_test_reconstruct_insufficient_frags(
+                        {'quarantine_threshold': 1,
+                         'reclaim_age': 0,
+                         'request_node_count': '%s * replicas'
+                                               % request_node_count},
+                        num_frags, other_responses)
+                self.assertIsInstance(exc, DiskFileError)
+                self._assert_diskfile_not_quarantined()
+                self._verify_error_lines(num_frags, other_responses, num_frags)
+                warning_lines = self.logger.get_lines_for_level('warning')
+                self.assertEqual(1, len(warning_lines), warning_lines)
+                self.assertIn('Invalid response %s' % bad_status,
+                              warning_lines[0])
+
+            # a non-404 in handoff responses will prevent quarantine; non-404
+            # is part way through all handoffs so not all handoffs are used
+            # regardless of how big request_node_count is
+            non_404_handoff = 3
+            for request_node_count in (2, 3, 13):
+                # replicas - 1 - num_frags other_responses from primaries,
+                # plus a batch of replicas - 1 during which non-404 shows up,
+                # plus some that trickle out before the non-404 shows up, but
+                # limited to (request_node_count * replicas - num_frags - 1)
+                # e.g. for 10+4 policy with request_node_count > 2
+                #   - batch of 13 requests go to primaries,
+                #   - 12 other_responses are consumed,
+                #   - then a batch of 13 handoff requests is sent,
+                #   - the non-404 is the 4th response in that batch,
+                #   - so 3 more requests will have been trickled out
+                batch_size = ring.replicas - 1
+                num_other_resps = min(
+                    2 * batch_size - num_frags + non_404_handoff,
+                    request_node_count * ring.replicas - 1 - num_frags)
+                other_responses = [(404, None, None)] * (num_other_resps - 1)
+                other_responses.insert(
+                    batch_size - num_frags + non_404_handoff,
+                    (bad_status, None, None))
+                exc = self._do_test_reconstruct_insufficient_frags(
+                    {'quarantine_threshold': 1, 'reclaim_age': 0,
+                     'request_node_count': '%s * replicas'
+                                           % request_node_count},
+                    num_frags, other_responses)
+                self.assertIsInstance(exc, DiskFileError)
+                self._assert_diskfile_not_quarantined()
+                self._verify_error_lines(num_frags, other_responses, num_frags)
+                warning_lines = self.logger.get_lines_for_level('warning')
+                self.assertEqual(1, len(warning_lines), warning_lines)
+                self.assertIn('Invalid response %s' % bad_status,
+                              warning_lines[0])
+
+    def test_reconstruct_fa_no_quarantine_frag_not_old_enough(self):
+        # verify that solitary fragment is not quarantined if it has not
+        # reached reclaim_age
+        num_other_resps = self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1, 'reclaim_age': 10000},
+            1, other_responses)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1,
+             'quarantine_age': 10000,  # quarantine_age trumps reclaim_age
+             'reclaim_age': 0},
+            1, other_responses)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1},  # default reclaim_age
+            1, other_responses)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+    def test_reconstruct_fa_no_quarantine_frag_resp_different_timestamp(self):
+        # verify that solitary fragment is not quarantined if the only frag
+        # response is for a different timestamp than the local frag
+        resp_timestamp = utils.Timestamp(float(self.obj_timestamp) + 1)
+        num_other_resps = self.policy.object_ring.replicas - 2
+        other_responses = [(404, None, None)] * num_other_resps
+        resp_timestamps = [resp_timestamp] * (num_other_resps + 1)
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1, 'reclaim_age': 0},
+            1, other_responses, resp_timestamps=resp_timestamps)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(1, other_responses, 1)
+
+    def test_reconstruct_fa_no_quarantine_frag_resp_mixed_timestamps(self):
+        # verify that solitary fragment is not quarantined if there is a
+        # response for a frag at different timestamp in addition to the
+        # response for the solitary local frag
+        resp_timestamp = utils.Timestamp(float(self.obj_timestamp) + 1)
+        num_other_resps = self.policy.object_ring.replicas - 3
+        other_responses = [(404, None, None)] * num_other_resps
+        resp_timestamps = ([self.obj_timestamp] +
+                           [resp_timestamp] * (num_other_resps + 1))
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1, 'reclaim_age': 0},
+            2, other_responses, resp_timestamps=resp_timestamps)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(3, len(error_lines), error_lines)
+        self.assertIn(
+            'Unable to get enough responses (1/%d from 1 ok responses)'
+            % (self.policy.ec_ndata,), error_lines[0])
+        self.assertIn(
+            'Unable to get enough responses (1/%d from 1 ok responses)'
+            % (self.policy.ec_ndata,), error_lines[1])
+        self.assertIn(
+            'Unable to get enough responses (%d x 404 error responses)'
+            % num_other_resps, error_lines[2])
+
+    def test_reconstruct_fa_no_quarantine_frag_resp_mixed_etags(self):
+        # verify that solitary fragment is not quarantined if there is a
+        # response for a frag with different etag in addition to the
+        # response for the solitary local frag
+        etags = [None, 'unexpected_etag']
+        num_other_resps = self.policy.object_ring.replicas - 3
+        other_responses = [(404, None, None)] * num_other_resps
+        exc = self._do_test_reconstruct_insufficient_frags(
+            {'quarantine_threshold': 1, 'reclaim_age': 0},
+            2, other_responses, resp_etags=etags)
+        self.assertIsInstance(exc, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(3, len(error_lines), error_lines)
+        self.assertIn(
+            'Mixed Etag', error_lines[0])
+        self.assertIn(
+            'Unable to get enough responses (1/%d from 2 ok responses)'
+            % (self.policy.ec_ndata,), error_lines[1])
+        self.assertIn(
+            'Unable to get enough responses (%d x 404 error responses)'
+            % num_other_resps, error_lines[2])
+
+    def _do_test_reconstruct_fa_no_quarantine_bad_headers(self, bad_headers):
+        # verify that responses with invalid headers count against the
+        # quarantine_threshold
+        self._configure_reconstructor(reclaim_age=0, quarantine_threshold=1)
+        local_frag_index = 2
+        self._create_fragment(local_frag_index)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[0]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
+
+        responses = []
+        body = ec_archive_bodies[2]
+        headers = make_header(body)
+        responses.append((200, body, headers))
+        body = ec_archive_bodies[3]
+        headers = make_header(body)
+        headers.update(bad_headers)
+        responses.append((200, body, headers))
+        other_responses = ([(404, None, None)] *
+                           (self.policy.object_ring.replicas - 3))
+        codes, body_iter, headers = zip(*(responses + other_responses))
+        resp_timestamps = [self.obj_timestamp] * len(codes)
+        resp_timestamps = [ts.internal for ts in resp_timestamps]
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers,
+                              timestamps=resp_timestamps):
+            with self.assertRaises(DiskFileError) as cm:
+                self.reconstructor.reconstruct_fa(
+                    job, node, self._create_fragment(2))
+        self.assertIsInstance(cm.exception, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines), error_lines)
+        self.assertIn(
+            'Unable to get enough responses (1/%d from 1 ok responses)'
+            % (self.policy.ec_ndata,), error_lines[0])
+        self.assertIn(
+            'Unable to get enough responses '
+            '(1 x unknown, %d x 404 error responses)'
+            % len(other_responses), error_lines[1])
+
+    def test_reconstruct_fa_no_quarantine_invalid_frag_index_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Frag-Index': 'two'})
+
+    def test_reconstruct_fa_no_quarantine_missing_frag_index_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Frag-Index': ''})
+
+    def test_reconstruct_fa_no_quarantine_missing_timestamp_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Backend-Data-Timestamp': ''})
+
+    def test_reconstruct_fa_no_quarantine_missing_etag_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Etag': ''})
+
+    def test_reconstruct_fa_frags_on_handoffs(self):
+        # just a lonely old frag on primaries: this appears to be a quarantine
+        # candidate, but unexpectedly the other frags are found on handoffs so
+        # expect rebuild
+        # set reclaim_age to 0 to make lonely frag old enugh for quarantine
+        self._configure_reconstructor(quarantine_threshold=1, reclaim_age=0)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        broken_body = ec_archive_bodies.pop(1)
+
+        # arrange for just one 200 to come from a primary, then 404s, then 200s
+        # from handoffs
+        responses = list()
+        for i, body in enumerate(ec_archive_bodies):
+            if i == 1:
+                # skip: this is the frag index we're rebuilding; insert 404s
+                responses.extend(
+                    ((404, None, None),) * self.policy.object_ring.replicas)
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers,
+                timestamps=[self.obj_timestamp.internal] * len(codes)):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(0, body=b''))
+            self.assertEqual(0, df.content_length)
+            fixed_body = b''.join(df.reader())
+        self.assertEqual(len(fixed_body), len(broken_body))
+        self.assertEqual(md5(fixed_body, usedforsecurity=False).hexdigest(),
+                         md5(broken_body, usedforsecurity=False).hexdigest())
+        # no error and warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertIn('Reconstructing frag from handoffs, node_count=%d'
+                      % (self.policy.object_ring.replicas * 2), debug_lines)
 
     def test_reconstruct_fa_finds_duplicate_does_not_fail(self):
         job = {
@@ -5146,7 +5997,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self.obj_metadata)
+                job, node, self._create_fragment(2))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5205,7 +6056,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers) as mock_conn:
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self.obj_metadata)
+                    job, node, self._create_fragment(2))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -5235,7 +6086,8 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             ', frag index 0 (missing Etag)')
         test_missing_header(
             'X-Backend-Timestamp',
-            ', frag index 0 (missing X-Backend-Timestamp)')
+            ', frag index 0 (missing X-Backend-Data-Timestamp and '
+            'X-Backend-Timestamp)')
 
     def test_reconstruct_fa_invalid_frag_index_headers(self):
         # This is much negative tests asserting when the expected
@@ -5273,7 +6125,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers) as mock_conn:
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self.obj_metadata)
+                    job, node, self._create_fragment(2))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -5304,7 +6156,60 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 @patch_policies(with_ec_default=True)
 class TestReconstructFragmentArchiveUTF8(TestReconstructFragmentArchive):
     # repeat superclass tests with an object path that contains non-ascii chars
-    obj_path = b'/a/c/o\xc3\xa8'
+    obj_name = b'o\xc3\xa8'
+
+
+@patch_policies([ECStoragePolicy(0, name='ec', is_default=True,
+                                 ec_type=DEFAULT_TEST_EC_TYPE,
+                                 ec_ndata=10, ec_nparity=4,
+                                 ec_segment_size=4096,
+                                 ec_duplication_factor=2),
+                 StoragePolicy(1, name='other')],
+                fake_ring_args=[{'replicas': 28}, {'replicas': 3}])
+class TestReconstructFragmentArchiveECDuplicationFactor(
+        TestReconstructFragmentArchive):
+    def test_reconstruct_fa_no_quarantine_duplicate_frags(self):
+        # verify that quarantine does not happen if the only other response in
+        # addition to the lonely frag's own response is for the same
+        # (duplicate) frag index
+        self._configure_reconstructor(quarantine_threshold=1, reclaim_age=0)
+        local_frag_index = 2
+        self._create_fragment(local_frag_index)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[0]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        frags = [
+            ec_archive_bodies[local_frag_index],
+            ec_archive_bodies[local_frag_index +
+                              self.policy.ec_n_unique_fragments]]
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
+
+        responses = [(200, frag, make_header(frag)) for frag in frags]
+        other_responses = ([(404, None, None)] *
+                           (self.policy.ec_n_unique_fragments * 2 - 3))
+        codes, body_iter, headers = zip(*(responses + other_responses))
+        resp_timestamps = [self.obj_timestamp.internal] * len(codes)
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers,
+                              timestamps=resp_timestamps):
+            with self.assertRaises(DiskFileError) as cm:
+                self.reconstructor.reconstruct_fa(
+                    job, node, self._create_fragment(2))
+        self.assertIsInstance(cm.exception, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        self._verify_error_lines(2, other_responses, 1)
 
 
 @patch_policies([ECStoragePolicy(0, name='ec', is_default=True,
@@ -5320,6 +6225,13 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         self.fabricated_ring = FabricatedRing(replicas=28, devices=56)
 
     def _test_reconstruct_with_duplicate_frags_no_errors(self, index):
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df_mgr = self.reconstructor._df_router[self.policy]
+        df = df_mgr.get_diskfile('sda1', 9, 'a', 'c', 'o',
+                                 policy=self.policy)
+        write_diskfile(df, self.ts(), data=b'', frag_index=2)
+        df.open()
+
         job = {
             'partition': 0,
             'policy': self.policy,
@@ -5327,12 +6239,6 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         part_nodes = self.policy.object_ring.get_part_nodes(0)
         node = part_nodes[index]
         node['backend_index'] = self.policy.get_backend_index(node['index'])
-        metadata = {
-            'name': '/a/c/o',
-            'Content-Length': 0,
-            'ETag': 'etag',
-            'X-Timestamp': '1234567890.12345',
-        }
 
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data, usedforsecurity=False).hexdigest()
@@ -5351,9 +6257,9 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         called_headers = []
         orig_func = object_reconstructor.ObjectReconstructor._get_response
 
-        def _get_response_hook(self, node, part, path, headers, policy):
+        def _get_response_hook(self, node, policy, part, path, headers):
             called_headers.append(headers)
-            return orig_func(self, node, part, path, headers, policy)
+            return orig_func(self, node, policy, part, path, headers)
 
         # need parity + 1 node failures to reach duplicated fragments
         failed_start_at = (
@@ -5370,7 +6276,7 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, metadata)
+                    job, node, df)
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(

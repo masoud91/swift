@@ -34,6 +34,7 @@ from swift.common.utils import get_logger, renamer, write_pickle, \
 from swift.common.daemon import Daemon
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import split_policy_string, PolicyError
+from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj.diskfile import get_tmp_dir, ASYNCDIR_BASE
 from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR, \
     HTTP_MOVED_PERMANENTLY
@@ -93,7 +94,7 @@ class ObjectUpdater(Daemon):
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.interval = int(conf.get('interval', 300))
+        self.interval = float(conf.get('interval', 300))
         self.container_ring = None
         self.concurrency = int(conf.get('concurrency', 8))
         self.updater_workers = int(conf.get('updater_workers', 1))
@@ -114,8 +115,8 @@ class ObjectUpdater(Daemon):
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.report_interval = float(conf.get('report_interval', 300))
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.rcache = os.path.join(self.recon_cache_path, 'object.recon')
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.rcache = os.path.join(self.recon_cache_path, RECON_OBJECT_FILE)
         self.stats = SweepStats()
 
     def _listdir(self, path):

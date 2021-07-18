@@ -30,12 +30,14 @@ from errno import ENOENT, ENOTEMPTY, ENOTDIR
 from eventlet.green import subprocess
 from eventlet import Timeout, sleep
 
-from test.unit import (debug_logger, patch_policies, make_timestamp_iter,
-                       mocked_http_conn, mock_check_drive, skip_if_no_xattrs)
+from test.debug_logger import debug_logger
+from test.unit import (patch_policies, make_timestamp_iter, mocked_http_conn,
+                       mock_check_drive, skip_if_no_xattrs)
 from swift.common import utils
 from swift.common.utils import (hash_path, mkdirs, normalize_timestamp,
                                 storage_directory)
 from swift.common import ring
+from swift.common.recon import RECON_OBJECT_FILE
 from swift.obj import diskfile, replicator as object_replicator
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
@@ -384,7 +386,7 @@ class TestObjectReplicator(unittest.TestCase):
                     self.assertEqual((start + 1 + cycle) % 10,
                                      replicator.replication_cycle)
 
-        recon_fname = os.path.join(self.recon_cache, "object.recon")
+        recon_fname = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
         with open(recon_fname) as cachefile:
             recon = json.loads(cachefile.read())
             self.assertEqual(1, recon.get('replication_time'))
@@ -1453,7 +1455,7 @@ class TestObjectReplicator(unittest.TestCase):
         # since we weren't operating on everything, but only a subset of
         # storage policies, we didn't dump any recon stats.
         self.assertFalse(os.path.exists(
-            os.path.join(self.recon_cache, 'object.recon')))
+            os.path.join(self.recon_cache, RECON_OBJECT_FILE)))
 
     def test_delete_partition_ssync(self):
         with mock.patch('swift.obj.replicator.http_connect',
@@ -2147,7 +2149,7 @@ class TestObjectReplicator(unittest.TestCase):
                         mock_http_connect(200)), \
                 mock.patch.object(self.replicator, 'rsync_timeout', 0.01), \
                 mock.patch('eventlet.green.subprocess.Popen', new_mock):
-            self.replicator.rsync_error_log_line_length = 20
+            self.replicator.rsync_error_log_line_length = 40
             self.replicator.run_once()
         for proc in mock_procs:
             self.assertEqual(proc._calls, [
@@ -2158,8 +2160,8 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertEqual(len(mock_procs), 2)
         error_lines = self.replicator.logger.get_lines_for_level('error')
         # verify logs are truncated to rsync_error_log_line_length
-        self.assertEqual('Killing long-running', error_lines[0])
-        self.assertEqual('Killing long-running', error_lines[1])
+        self.assertEqual(["Killing long-running rsync after 0s: ['r"] * 2,
+                         error_lines)
 
     def test_replicate_rsync_timeout_wedged(self):
         cur_part = '0'
@@ -2228,7 +2230,7 @@ class TestMultiProcessReplicator(unittest.TestCase):
         self.recon_cache = tempfile.mkdtemp()
         rmtree(self.recon_cache, ignore_errors=1)
         os.mkdir(self.recon_cache)
-        self.recon_file = os.path.join(self.recon_cache, 'object.recon')
+        self.recon_file = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
 
         bind_port = 6200
 

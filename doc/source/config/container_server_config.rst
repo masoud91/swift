@@ -16,6 +16,7 @@ The following configuration sections are available:
 * :ref:`[DEFAULT] <container_server_default_options>`
 * `[container-server]`_
 * `[container-replicator]`_
+* `[container-sharder]`_
 * `[container-updater]`_
 * `[container-auditor]`_
 
@@ -266,6 +267,274 @@ ionice_priority      None                         I/O scheduling priority of
                                                   Ignored if IOPRIO_CLASS_IDLE
                                                   is set.
 ==================== ===========================  =============================
+
+*******************
+[container-sharder]
+*******************
+
+The container-sharder re-uses features of the container-replicator and inherits
+the following configuration options defined for the `[container-replicator]`_:
+
+* interval
+* databases_per_second
+* per_diff
+* max_diffs
+* concurrency
+* node_timeout
+* conn_timeout
+* reclaim_age
+* rsync_compress
+* rsync_module
+* recon_cache_path
+
+Some config options in this section may also be used by the
+:ref:`swift-manage-shard-ranges CLI tool <swift-manage-shard-ranges>`.
+
+================================= =================  =======================================
+Option                            Default            Description
+--------------------------------- -----------------  ---------------------------------------
+log_name                          container-sharder  Label used when logging
+log_facility                      LOG_LOCAL0         Syslog log facility
+log_level                         INFO               Logging level
+log_address                       /dev/log           Logging directory
+
+
+auto_shard                        false               If the auto_shard option
+                                                      is true then the sharder
+                                                      will automatically select
+                                                      containers to shard, scan
+                                                      for shard ranges, and
+                                                      select shards to shrink.
+                                                      Warning: auto-sharding is
+                                                      still under development
+                                                      and should not be used in
+                                                      production; do not set
+                                                      this option to true in a
+                                                      production cluster.
+
+shard_container_threshold         1000000             This defines the
+                                                      object count at which a
+                                                      container with
+                                                      container-sharding
+                                                      enabled will start to
+                                                      shard. This also
+                                                      indirectly determines the
+                                                      the defaults for
+                                                      rows_per_shard,
+                                                      shrink_threshold and
+                                                      expansion_limit.
+
+rows_per_shard                    500000              This defines the initial
+                                                      nominal size of shard
+                                                      containers. The default
+                                                      is shard_container_threshold // 2.
+
+minimum_shard_size                100000              Minimum size of the final
+                                                      shard range. If this is
+                                                      greater than one then the
+                                                      final shard range may be
+                                                      extended to more than
+                                                      rows_per_shard in order
+                                                      to avoid a further shard
+                                                      range with less than
+                                                      minimum_shard_size rows.
+                                                      The default value is
+                                                      rows_per_shard // 5.
+
+shrink_threshold                                      This defines the
+                                                      object count below which
+                                                      a 'donor' shard container
+                                                      will be considered for
+                                                      shrinking into another
+                                                      'acceptor' shard
+                                                      container. The default is
+                                                      determined by
+                                                      shard_shrink_point. If
+                                                      set, shrink_threshold
+                                                      will take precedence over
+                                                      shard_shrink_point.
+
+shard_shrink_point                10                  Deprecated: shrink_threshold
+                                                      is recommended and if set
+                                                      will take precedence over
+                                                      shard_shrink_point.
+                                                      This defines the
+                                                      object count below which
+                                                      a 'donor' shard container
+                                                      will be considered for
+                                                      shrinking into another
+                                                      'acceptor' shard
+                                                      container.
+                                                      shard_shrink_point is a
+                                                      percentage of
+                                                      shard_container_threshold
+                                                      e.g. the default value of
+                                                      10 means 10% of the
+                                                      shard_container_threshold.
+
+expansion_limit                                       This defines the
+                                                      maximum allowed size of
+                                                      an acceptor shard
+                                                      container after having a
+                                                      donor merged into it. The
+                                                      default is determined by
+                                                      shard_shrink_merge_point.
+                                                      If set, expansion_limit
+                                                      will take precedence over
+                                                      shard_shrink_merge_point.
+
+shard_shrink_merge_point          75                  Deprecated: expansion_limit
+                                                      is recommended and if set
+                                                      will take precedence over
+                                                      shard_shrink_merge_point.
+                                                      This defines the
+                                                      maximum allowed size of
+                                                      an acceptor shard
+                                                      container after having a
+                                                      donor merged into it.
+                                                      Shard_shrink_merge_point
+                                                      is a percentage of
+                                                      shard_container_threshold.
+                                                      e.g. the default value of
+                                                      75 means that the
+                                                      projected sum of a donor
+                                                      object count and acceptor
+                                                      count must be less than
+                                                      75% of shard_container_threshold
+                                                      for the donor to be
+                                                      allowed to merge into the
+                                                      acceptor.
+
+                                                      For example, if
+                                                      shard_container_threshold
+                                                      is 1 million,
+                                                      shard_shrink_point is 10,
+                                                      and shard_shrink_merge_point
+                                                      is 75 then a shard will
+                                                      be considered for
+                                                      shrinking if it has less
+                                                      than or equal to 100
+                                                      thousand objects but will
+                                                      only merge into an
+                                                      acceptor if the combined
+                                                      object count would be
+                                                      less than or equal to 750
+                                                      thousand objects.
+
+
+shard_scanner_batch_size          10                  When auto-sharding is
+                                                      enabled this defines the
+                                                      maximum number of shard
+                                                      ranges that will be found
+                                                      each time the sharder
+                                                      daemon visits a sharding
+                                                      container. If necessary
+                                                      the sharder daemon will
+                                                      continue to search for
+                                                      more shard ranges each
+                                                      time it visits the
+                                                      container.
+
+cleave_batch_size                 2                   Defines the number of
+                                                      shard ranges that will be
+                                                      cleaved each time the
+                                                      sharder daemon visits a
+                                                      sharding container.
+
+cleave_row_batch_size             10000               Defines the size of
+                                                      batches of object rows
+                                                      read from a sharding
+                                                      container and merged to a
+                                                      shard container during
+                                                      cleaving.
+
+shard_replication_quorum          auto                Defines the number of
+                                                      successfully replicated
+                                                      shard dbs required when
+                                                      cleaving a previously
+                                                      uncleaved shard range
+                                                      before the sharder will
+                                                      progress to the next
+                                                      shard range. The value
+                                                      should be less than or
+                                                      equal to the container
+                                                      ring replica count. The
+                                                      default of 'auto' causes
+                                                      the container ring quorum
+                                                      value to be used. This
+                                                      option only applies to
+                                                      the container-sharder
+                                                      replication and does not
+                                                      affect the number of
+                                                      shard container replicas
+                                                      that will eventually be
+                                                      replicated by the
+                                                      container-replicator.
+
+
+existing_shard_replication_quorum auto                Defines the number of
+                                                      successfully replicated
+                                                      shard dbs required when
+                                                      cleaving a shard range
+                                                      that has been previously
+                                                      cleaved on another node
+                                                      before the sharder will
+                                                      progress to the next
+                                                      shard range. The value
+                                                      should be less than or
+                                                      equal to the container
+                                                      ring replica count. The
+                                                      default of 'auto' causes
+                                                      the shard_replication_quorum
+                                                      value to be used. This
+                                                      option only applies to
+                                                      the container-sharder
+                                                      replication and does not
+                                                      affect the number of
+                                                      shard container replicas
+                                                      that will eventually be
+                                                      replicated by the
+                                                      container-replicator.
+
+internal_client_conf_path         see description     The sharder uses an
+                                                      internal client to create
+                                                      and make requests to
+                                                      containers. The absolute
+                                                      path to the client config
+                                                      file can be configured.
+                                                      Defaults to
+                                                      /etc/swift/internal-client.conf
+
+request_tries                     3                   The number of time the
+                                                      internal client will
+                                                      retry requests.
+
+recon_candidates_limit            5                   Each time the sharder
+                                                      dumps stats to the recon
+                                                      cache file it includes a
+                                                      list of containers that
+                                                      appear to need sharding
+                                                      but are not yet sharding.
+                                                      By default this list is
+                                                      limited to the top 5
+                                                      containers, ordered by
+                                                      object count. The limit
+                                                      may be changed by setting
+                                                      recon_candidates_limit to
+                                                      an integer value. A
+                                                      negative value implies no
+                                                      limit.
+
+broker_timeout                    60                  Large databases tend to
+                                                      take a while to work
+                                                      with, but we want to make
+                                                      sure we write down our
+                                                      progress. Use a
+                                                      larger-than-normal broker
+                                                      timeout to make us less
+                                                      likely to bomb out on a
+                                                      LockTimeout.
+================================= =================  =======================================
 
 *******************
 [container-updater]

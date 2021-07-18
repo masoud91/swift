@@ -161,25 +161,97 @@ import json
 import os.path
 import sys
 import time
+from contextlib import contextmanager
 
 from six.moves import input
 
-from swift.common.utils import Timestamp, get_logger, ShardRange
+
+from swift.common.utils import Timestamp, get_logger, ShardRange, readconf, \
+    ShardRangeList
 from swift.container.backend import ContainerBroker, UNSHARDED
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
-    CleavingContext
+    CleavingContext, process_compactible_shard_sequences, \
+    find_compactible_shard_sequences, find_overlapping_ranges, \
+    find_paths, rank_paths, finalize_shrinking, DEFAULT_SHARDER_CONF, \
+    ContainerSharderConf
+
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
+EXIT_INVALID_ARGS = 2  # consistent with argparse exit code for invalid args
+EXIT_USER_QUIT = 3
+
+# Some CLI options derive their default values from DEFAULT_SHARDER_CONF if
+# they have not been set. It is therefore important that the CLI parser
+# provides None as a default so that we can detect that no value was set on the
+# command line. We use this alias to act as a reminder.
+USE_SHARDER_DEFAULT = object()
 
 
-def _load_and_validate_shard_data(args):
-    try:
+class ManageShardRangesException(Exception):
+    pass
+
+
+class GapsFoundException(ManageShardRangesException):
+    pass
+
+
+class InvalidStateException(ManageShardRangesException):
+    pass
+
+
+class InvalidSolutionException(ManageShardRangesException):
+    def __init__(self, msg, acceptor_path, overlapping_donors):
+        super(InvalidSolutionException, self).__init__(msg)
+        self.acceptor_path = acceptor_path
+        self.overlapping_donors = overlapping_donors
+
+
+def _proceed(args):
+    if args.dry_run:
+        choice = 'no'
+    elif args.yes:
+        choice = 'yes'
+    else:
+        choice = input('Do you want to apply these changes to the container '
+                       'DB? [yes/N]')
+    if choice != 'yes':
+        print('No changes applied')
+
+    return choice == 'yes'
+
+
+def _print_shard_range(sr, level=0):
+    indent = '  ' * level
+    print(indent + '%r' % sr.name)
+    print(indent + '  objects: %9d, tombstones: %9d, lower: %r'
+          % (sr.object_count, sr.tombstones, sr.lower_str))
+    print(indent + '    state: %9s,                        upper: %r'
+          % (sr.state_text, sr.upper_str))
+
+
+@contextmanager
+def _open_input(args):
+    if args.input == '-':
+        args.input = '<STDIN>'
+        yield sys.stdin
+    else:
         with open(args.input, 'r') as fd:
+            yield fd
+
+
+def _load_and_validate_shard_data(args, require_index=True):
+    required_keys = ['lower', 'upper', 'object_count']
+    if require_index:
+        required_keys.append('index')
+    try:
+        with _open_input(args) as fd:
             try:
                 data = json.load(fd)
                 if not isinstance(data, list):
                     raise ValueError('Shard data must be a list of dicts')
-                for k in ('lower', 'upper', 'index', 'object_count'):
+                for k in required_keys:
                     for shard in data:
-                        shard[k]
+                        shard[k]  # trigger KeyError for missing required key
                 return data
             except (TypeError, ValueError, KeyError) as err:
                 print('Failed to load valid shard range data: %r' % err,
@@ -209,7 +281,7 @@ def _check_shard_ranges(own_shard_range, shard_ranges):
     if reasons:
         print('WARNING: invalid shard ranges: %s.' % reasons)
         print('Aborting.')
-        exit(2)
+        exit(EXIT_ERROR)
 
 
 def _check_own_shard_range(broker, args):
@@ -229,7 +301,8 @@ def _find_ranges(broker, args, status_file=None):
     start = last_report = time.time()
     limit = 5 if status_file else -1
     shard_data, last_found = broker.find_shard_ranges(
-        args.rows_per_shard, limit=limit)
+        args.rows_per_shard, limit=limit,
+        minimum_shard_size=args.minimum_shard_size)
     if shard_data:
         while not last_found:
             if last_report + 10 < time.time():
@@ -239,7 +312,8 @@ def _find_ranges(broker, args, status_file=None):
             # prefix doesn't matter since we aren't persisting it
             found_ranges = make_shard_ranges(broker, shard_data, '.shards_')
             more_shard_data, last_found = broker.find_shard_ranges(
-                args.rows_per_shard, existing_ranges=found_ranges, limit=5)
+                args.rows_per_shard, existing_ranges=found_ranges, limit=5,
+                minimum_shard_size=args.minimum_shard_size)
             shard_data.extend(more_shard_data)
     return shard_data, time.time() - start
 
@@ -251,11 +325,12 @@ def find_ranges(broker, args):
           (len(shard_data), delta_t,
            sum(r['object_count'] for r in shard_data)),
           file=sys.stderr)
-    return 0
+    return EXIT_SUCCESS
 
 
 def show_shard_ranges(broker, args):
     shard_ranges = broker.get_shard_ranges(
+        includes=getattr(args, 'includes', None),
         include_deleted=getattr(args, 'include_deleted', False))
     shard_data = [dict(sr, state=sr.state_text)
                   for sr in shard_ranges]
@@ -269,7 +344,7 @@ def show_shard_ranges(broker, args):
     else:
         print("Existing shard ranges:", file=sys.stderr)
         print(json.dumps(shard_data, sort_keys=True, indent=2))
-    return 0
+    return EXIT_SUCCESS
 
 
 def db_info(broker, args):
@@ -289,13 +364,14 @@ def db_info(broker, args):
     print('Metadata:')
     for k, (v, t) in broker.metadata.items():
         print('  %s = %s' % (k, v))
+    return EXIT_SUCCESS
 
 
 def delete_shard_ranges(broker, args):
     shard_ranges = broker.get_shard_ranges()
     if not shard_ranges:
         print("No shard ranges found to delete.")
-        return 0
+        return EXIT_SUCCESS
 
     while not args.force:
         print('This will delete existing %d shard ranges.' % len(shard_ranges))
@@ -314,7 +390,7 @@ def delete_shard_ranges(broker, args):
             show_shard_ranges(broker, args)
             continue
         elif choice == 'q':
-            return 1
+            return EXIT_USER_QUIT
         elif choice == 'yes':
             break
         else:
@@ -327,7 +403,7 @@ def delete_shard_ranges(broker, args):
         sr.timestamp = now
     broker.merge_shard_ranges(shard_ranges)
     print('Deleted %s existing shard ranges.' % len(shard_ranges))
-    return 0
+    return EXIT_SUCCESS
 
 
 def _replace_shard_ranges(broker, args, shard_data, timeout=0):
@@ -344,7 +420,7 @@ def _replace_shard_ranges(broker, args, shard_data, timeout=0):
     # Crank up the timeout in an effort to *make sure* this succeeds
     with broker.updated_timeout(max(timeout, args.replace_timeout)):
         delete_status = delete_shard_ranges(broker, args)
-        if delete_status != 0:
+        if delete_status != EXIT_SUCCESS:
             return delete_status
         broker.merge_shard_ranges(shard_ranges)
 
@@ -354,7 +430,7 @@ def _replace_shard_ranges(broker, args, shard_data, timeout=0):
         return enable_sharding(broker, args)
     else:
         print('Use the enable sub-command to enable sharding.')
-        return 0
+        return EXIT_SUCCESS
 
 
 def replace_shard_ranges(broker, args):
@@ -404,20 +480,253 @@ def enable_sharding(broker, args):
         print('WARNING: container in state %s (should be active or sharding).'
               % own_shard_range.state_text)
         print('Aborting.')
-        return 2
+        return EXIT_ERROR
 
     print('Run container-sharder on all nodes to shard the container.')
-    return 0
+    return EXIT_SUCCESS
+
+
+def compact_shard_ranges(broker, args):
+    if not broker.is_root_container():
+        print('WARNING: Shard containers cannot be compacted.')
+        print('This command should be used on a root container.')
+        return EXIT_ERROR
+
+    if not broker.is_sharded():
+        print('WARNING: Container is not yet sharded so cannot be compacted.')
+        return EXIT_ERROR
+
+    shard_ranges = broker.get_shard_ranges()
+    if find_overlapping_ranges([sr for sr in shard_ranges if
+                                sr.state != ShardRange.SHRINKING]):
+        print('WARNING: Container has overlapping shard ranges so cannot be '
+              'compacted.')
+        return EXIT_ERROR
+
+    compactible = find_compactible_shard_sequences(broker,
+                                                   args.shrink_threshold,
+                                                   args.expansion_limit,
+                                                   args.max_shrinking,
+                                                   args.max_expanding)
+    if not compactible:
+        print('No shards identified for compaction.')
+        return EXIT_SUCCESS
+
+    for sequence in compactible:
+        if sequence[-1].state not in (ShardRange.ACTIVE, ShardRange.SHARDED):
+            print('ERROR: acceptor not in correct state: %s' % sequence[-1],
+                  file=sys.stderr)
+            return EXIT_ERROR
+
+    for sequence in compactible:
+        acceptor = sequence[-1]
+        donors = sequence[:-1]
+        print('Donor shard range(s) with total of %d rows:'
+              % donors.row_count)
+        for donor in donors:
+            _print_shard_range(donor, level=1)
+        print('can be compacted into acceptor shard range:')
+        _print_shard_range(acceptor, level=1)
+    print('Total of %d shard sequences identified for compaction.'
+          % len(compactible))
+    print('Once applied to the broker these changes will result in shard '
+          'range compaction the next time the sharder runs.')
+
+    if not _proceed(args):
+        return EXIT_USER_QUIT
+
+    process_compactible_shard_sequences(broker, compactible)
+    print('Updated %s shard sequences for compaction.' % len(compactible))
+    print('Run container-replicator to replicate the changes to other '
+          'nodes.')
+    print('Run container-sharder on all nodes to compact shards.')
+    return EXIT_SUCCESS
+
+
+def _find_overlapping_donors(shard_ranges, own_sr, args):
+    shard_ranges = ShardRangeList(shard_ranges)
+    if ShardRange.SHARDING in shard_ranges.states:
+        # This may be over-cautious, but for now we'll avoid dealing with
+        # SHARDING shards (which by design will temporarily overlap with their
+        # sub-shards) and require repair to be re-tried once sharding has
+        # completed. Note that once a shard ranges moves from SHARDING to
+        # SHARDED state and is deleted, some replicas of the shard may still be
+        # in the process of sharding but we cannot detect that at the root.
+        raise InvalidStateException('Found shard ranges in sharding state')
+    if ShardRange.SHRINKING in shard_ranges.states:
+        # Also stop now if there are SHRINKING shard ranges: we would need to
+        # ensure that these were not chosen as acceptors, but for now it is
+        # simpler to require repair to be re-tried once shrinking has
+        # completes.
+        raise InvalidStateException('Found shard ranges in shrinking state')
+
+    paths = find_paths(shard_ranges)
+    ranked_paths = rank_paths(paths, own_sr)
+    if not (ranked_paths and ranked_paths[0].includes(own_sr)):
+        # individual paths do not have gaps within them; if no path spans the
+        # entire namespace then there must be a gap in the shard_ranges
+        raise GapsFoundException
+
+    # simple repair strategy: choose the highest ranked complete sequence and
+    # shrink all other shard ranges into it
+    acceptor_path = ranked_paths[0]
+    acceptor_names = set(sr.name for sr in acceptor_path)
+    overlapping_donors = ShardRangeList([sr for sr in shard_ranges
+                                         if sr.name not in acceptor_names])
+
+    # check that the solution makes sense: if the acceptor path has the most
+    # progressed continuous cleaving, which has reached cleaved_upper, then we
+    # don't expect any shard ranges beyond cleaved_upper to be in states
+    # CLEAVED or ACTIVE, otherwise there should have been a better acceptor
+    # path that reached them.
+    cleaved_states = {ShardRange.CLEAVED, ShardRange.ACTIVE}
+    cleaved_upper = acceptor_path.find_lower(
+        lambda sr: sr.state not in cleaved_states)
+    beyond_cleaved = acceptor_path.filter(marker=cleaved_upper)
+    if beyond_cleaved.states.intersection(cleaved_states):
+        raise InvalidSolutionException(
+            'Isolated cleaved and/or active shard ranges in acceptor path',
+            acceptor_path, overlapping_donors)
+    beyond_cleaved = overlapping_donors.filter(marker=cleaved_upper)
+    if beyond_cleaved.states.intersection(cleaved_states):
+        raise InvalidSolutionException(
+            'Isolated cleaved and/or active shard ranges in donor ranges',
+            acceptor_path, overlapping_donors)
+
+    return acceptor_path, overlapping_donors
+
+
+def print_repair_solution(acceptor_path, overlapping_donors):
+    print('Donors:')
+    for donor in sorted(overlapping_donors):
+        _print_shard_range(donor, level=1)
+    print('Acceptors:')
+    for acceptor in acceptor_path:
+        _print_shard_range(acceptor, level=1)
+
+
+def find_repair_solution(shard_ranges, own_sr, args):
+    try:
+        acceptor_path, overlapping_donors = _find_overlapping_donors(
+            shard_ranges, own_sr, args)
+    except GapsFoundException:
+        print('Found no complete sequence of shard ranges.')
+        print('Repairs necessary to fill gaps.')
+        print('Gap filling not supported by this tool. No repairs performed.')
+        raise
+    except InvalidStateException as exc:
+        print('WARNING: %s' % exc)
+        print('No repairs performed.')
+        raise
+    except InvalidSolutionException as exc:
+        print('ERROR: %s' % exc)
+        print_repair_solution(exc.acceptor_path, exc.overlapping_donors)
+        print('No repairs performed.')
+        raise
+
+    if not overlapping_donors:
+        print('Found one complete sequence of %d shard ranges and no '
+              'overlapping shard ranges.' % len(acceptor_path))
+        print('No repairs necessary.')
+        return None, None
+
+    print('Repairs necessary to remove overlapping shard ranges.')
+    print('Chosen a complete sequence of %d shard ranges with current total '
+          'of %d object records to accept object records from %d overlapping '
+          'donor shard ranges.' %
+          (len(acceptor_path), acceptor_path.object_count,
+           len(overlapping_donors)))
+    if args.verbose:
+        print_repair_solution(acceptor_path, overlapping_donors)
+
+    print('Once applied to the broker these changes will result in:')
+    print('    %d shard ranges being removed.' % len(overlapping_donors))
+    print('    %d object records being moved to the chosen shard ranges.'
+          % overlapping_donors.object_count)
+
+    return acceptor_path, overlapping_donors
+
+
+def repair_shard_ranges(broker, args):
+    if not broker.is_root_container():
+        print('WARNING: Shard containers cannot be repaired.')
+        print('This command should be used on a root container.')
+        return EXIT_ERROR
+
+    shard_ranges = broker.get_shard_ranges()
+    if not shard_ranges:
+        print('No shards found, nothing to do.')
+        return EXIT_SUCCESS
+
+    own_sr = broker.get_own_shard_range()
+    try:
+        acceptor_path, overlapping_donors = find_repair_solution(
+            shard_ranges, own_sr, args)
+    except ManageShardRangesException:
+        return EXIT_ERROR
+
+    if not acceptor_path:
+        return EXIT_SUCCESS
+
+    if not _proceed(args):
+        return EXIT_USER_QUIT
+
+    # merge changes to the broker...
+    # note: acceptors do not need to be modified since they already span the
+    # complete range
+    ts_now = Timestamp.now()
+    finalize_shrinking(broker, [], overlapping_donors, ts_now)
+    print('Updated %s donor shard ranges.' % len(overlapping_donors))
+    print('Run container-replicator to replicate the changes to other nodes.')
+    print('Run container-sharder on all nodes to repair shards.')
+    return EXIT_SUCCESS
+
+
+def analyze_shard_ranges(args):
+    shard_data = _load_and_validate_shard_data(args, require_index=False)
+    for data in shard_data:
+        # allow for incomplete shard range data that may have been scraped from
+        # swift-container-info output
+        data.setdefault('epoch', None)
+    shard_ranges = [ShardRange.from_dict(data) for data in shard_data]
+    whole_sr = ShardRange('whole/namespace', 0)
+    try:
+        find_repair_solution(shard_ranges, whole_sr, args)
+    except ManageShardRangesException:
+        return EXIT_ERROR
+    return EXIT_SUCCESS
+
+
+def _positive_int(arg):
+    val = int(arg)
+    if val <= 0:
+        raise argparse.ArgumentTypeError('must be > 0')
+    return val
 
 
 def _add_find_args(parser):
-    parser.add_argument('rows_per_shard', nargs='?', type=int, default=500000)
+    parser.add_argument(
+        'rows_per_shard', nargs='?', type=int, default=USE_SHARDER_DEFAULT,
+        help='Target number of rows for newly created shards. '
+        'Default is half of the shard_container_threshold value if that is '
+        'given in a conf file specified with --config, otherwise %s.'
+        % DEFAULT_SHARDER_CONF['rows_per_shard'])
+    parser.add_argument(
+        '--minimum-shard-size', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
+        help='Minimum size of the final shard range. If this is greater than '
+        'one then the final shard range may be extended to more than '
+        'rows_per_shard in order to avoid a further shard range with less '
+        'than minimum-shard-size rows.')
 
 
 def _add_replace_args(parser):
     parser.add_argument(
         '--shards_account_prefix', metavar='shards_account_prefix', type=str,
-        required=False, help='Prefix for shards account', default='.shards_')
+        required=False, default='.shards_',
+        help="Prefix for shards account. The default is '.shards_'. This "
+             "should only be changed if the auto_create_account_prefix option "
+             "has been similarly changed in swift.conf.")
     parser.add_argument(
         '--replace-timeout', type=int, default=600,
         help='Minimum DB timeout to use when replacing shard ranges.')
@@ -435,11 +744,42 @@ def _add_enable_args(parser):
         help='DB timeout to use when enabling sharding.')
 
 
+def _add_prompt_args(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--yes', '-y', action='store_true', default=False,
+        help='Apply shard range changes to broker without prompting. '
+             'Cannot be used with --dry-run option.')
+    group.add_argument(
+        '--dry-run', '-n', action='store_true', default=False,
+        help='Do not apply any shard range changes to broker. '
+             'Cannot be used with --yes option.')
+
+
 def _make_parser():
     parser = argparse.ArgumentParser(description='Manage shard ranges')
-    parser.add_argument('container_db')
+    parser.add_argument('path_to_file',
+                        help='Path to a container DB file or, for the analyze '
+                        'subcommand, a shard data file.')
+    parser.add_argument('--config', dest='conf_file', required=False,
+                        help='Path to config file with [container-sharder] '
+                             'section. The following subcommand options will '
+                             'be loaded from a config file if they are not '
+                             'given on the command line: '
+                             'rows_per_shard, '
+                             'max_shrinking, '
+                             'max_expanding, '
+                             'shrink_threshold, '
+                             'expansion_limit')
     parser.add_argument('--verbose', '-v', action='count', default=0,
                         help='Increase output verbosity')
+    # this is useful for probe tests that shard containers with unrealistically
+    # low numbers of objects, of which a significant proportion may still be in
+    # the pending file
+    parser.add_argument(
+        '--force-commits', action='store_true', default=False,
+        help='Force broker to commit pending object updates before finding '
+             'shard ranges. By default the broker will skip commits.')
     subparsers = parser.add_subparsers(
         dest='subcommand', help='Sub-command help', title='Sub-commands')
 
@@ -466,6 +806,8 @@ def _make_parser():
     show_parser.add_argument(
         '--brief', '-b', action='store_true', default=False,
         help='Show only shard range bounds in output.')
+    show_parser.add_argument('--includes',
+                             help='limit shard ranges to include key')
     show_parser.set_defaults(func=show_shard_ranges)
 
     # info
@@ -500,12 +842,68 @@ def _make_parser():
     _add_enable_args(enable_parser)
     enable_parser.set_defaults(func=enable_sharding)
     _add_replace_args(enable_parser)
+
+    # compact
+    compact_parser = subparsers.add_parser(
+        'compact',
+        help='Compact shard ranges with less than the shrink-threshold number '
+             'of rows. This command only works on root containers.')
+    _add_prompt_args(compact_parser)
+    compact_parser.add_argument(
+        '--shrink-threshold', nargs='?', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
+        help='The number of rows below which a shard can qualify for '
+             'shrinking. '
+             'Defaults to %d' % DEFAULT_SHARDER_CONF['shrink_threshold'])
+    compact_parser.add_argument(
+        '--expansion-limit', nargs='?', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
+        help='Maximum number of rows for an expanding shard to have after '
+             'compaction has completed. '
+             'Defaults to %d' % DEFAULT_SHARDER_CONF['expansion_limit'])
+    # If just one donor shard is chosen to shrink to an acceptor then the
+    # expanded acceptor will handle object listings as soon as the donor shard
+    # has shrunk. If more than one donor shard are chosen to shrink to an
+    # acceptor then the acceptor may not handle object listings for some donor
+    # shards that have shrunk until *all* donors have shrunk, resulting in
+    # temporary gap(s) in object listings where the shrunk donors are missing.
+    compact_parser.add_argument('--max-shrinking', nargs='?',
+                                type=_positive_int,
+                                default=USE_SHARDER_DEFAULT,
+                                help='Maximum number of shards that should be '
+                                     'shrunk into each expanding shard. '
+                                     'Defaults to 1. Using values greater '
+                                     'than 1 may result in temporary gaps in '
+                                     'object listings until all selected '
+                                     'shards have shrunk.')
+    compact_parser.add_argument('--max-expanding', nargs='?',
+                                type=_positive_int,
+                                default=USE_SHARDER_DEFAULT,
+                                help='Maximum number of shards that should be '
+                                     'expanded. Defaults to unlimited.')
+    compact_parser.set_defaults(func=compact_shard_ranges)
+
+    # repair
+    repair_parser = subparsers.add_parser(
+        'repair',
+        help='Repair overlapping shard ranges. No action will be taken '
+             'without user confirmation unless the -y option is used.')
+    _add_prompt_args(repair_parser)
+    repair_parser.set_defaults(func=repair_shard_ranges)
+
+    # analyze
+    analyze_parser = subparsers.add_parser(
+        'analyze',
+        help='Analyze shard range json data read from file. Use -v to see '
+             'more detailed analysis.')
+    analyze_parser.set_defaults(func=analyze_shard_ranges)
+
     return parser
 
 
-def main(args=None):
+def main(cli_args=None):
     parser = _make_parser()
-    args = parser.parse_args(args)
+    args = parser.parse_args(cli_args)
     if not args.subcommand:
         # On py2, subparsers are required; on py3 they are not; see
         # https://bugs.python.org/issue9253. py37 added a `required` kwarg
@@ -513,18 +911,50 @@ def main(args=None):
         # the matter. So, check whether the destination was set and bomb
         # out if not.
         parser.print_help()
-        print('\nA sub-command is required.')
-        return 1
+        print('\nA sub-command is required.', file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    try:
+        conf = {}
+        if args.conf_file:
+            conf = readconf(args.conf_file, 'container-sharder')
+        conf.update(dict((k, v) for k, v in vars(args).items()
+                         if v != USE_SHARDER_DEFAULT))
+        conf_args = ContainerSharderConf(conf)
+    except (OSError, IOError) as exc:
+        print('Error opening config file %s: %s' % (args.conf_file, exc),
+              file=sys.stderr)
+        return EXIT_ERROR
+    except (TypeError, ValueError) as exc:
+        print('Error loading config: %s' % exc, file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    for k, v in vars(args).items():
+        # set any un-set cli args from conf_args
+        if v is USE_SHARDER_DEFAULT:
+            setattr(args, k, getattr(conf_args, k))
+
+    try:
+        ContainerSharderConf.validate_conf(args)
+    except ValueError as err:
+        print('Invalid config: %s' % err, file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    if args.func in (analyze_shard_ranges,):
+        args.input = args.path_to_file
+        return args.func(args) or 0
+
     logger = get_logger({}, name='ContainerBroker', log_to_console=True)
-    broker = ContainerBroker(os.path.realpath(args.container_db),
-                             logger=logger, skip_commits=True)
+    broker = ContainerBroker(os.path.realpath(args.path_to_file),
+                             logger=logger,
+                             skip_commits=not args.force_commits)
     try:
         broker.get_info()
     except Exception as exc:
-        print('Error opening container DB %s: %s' % (args.container_db, exc),
+        print('Error opening container DB %s: %s' % (args.path_to_file, exc),
               file=sys.stderr)
-        return 2
-    print('Loaded db broker for %s.' % broker.path, file=sys.stderr)
+        return EXIT_ERROR
+    print('Loaded db broker for %s' % broker.path, file=sys.stderr)
     return args.func(broker, args)
 
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Tests for swift.common.db"""
-
+import contextlib
 import os
 import sys
 import unittest
@@ -41,7 +41,7 @@ from swift.common.constraints import \
     MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE
 from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
-    GreenDBConnection, PICKLE_PROTOCOL, zero_like
+    GreenDBConnection, PICKLE_PROTOCOL, zero_like, TombstoneReclaimer
 from swift.common.utils import normalize_timestamp, mkdirs, Timestamp
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPException
@@ -716,12 +716,13 @@ class TestDatabaseBroker(unittest.TestCase):
                           broker.initialize, normalize_timestamp('1'))
 
     def test_delete_db(self):
+        meta = {'foo': ['bar', normalize_timestamp('0')]}
+
         def init_stub(conn, put_timestamp, **kwargs):
             conn.execute('CREATE TABLE test (one TEXT)')
             conn.execute('''CREATE TABLE test_stat (
                 id TEXT, put_timestamp TEXT, delete_timestamp TEXT,
                 status TEXT, status_changed_at TEXT, metadata TEXT)''')
-            meta = {'foo': ('bar', normalize_timestamp('0'))}
             conn.execute(
                 '''INSERT INTO test_stat (
                     id, put_timestamp, delete_timestamp, status,
@@ -730,35 +731,63 @@ class TestDatabaseBroker(unittest.TestCase):
             conn.execute('INSERT INTO test (one) VALUES ("1")')
             conn.commit()
 
-        broker = DatabaseBroker(':memory:')
-        broker.db_type = 'test'
-        broker._initialize = init_stub
-        # Initializes a good broker for us
-        broker.initialize(normalize_timestamp('1'))
-        info = broker.get_info()
-        self.assertEqual('0', info['delete_timestamp'])
-        self.assertEqual('', info['status'])
-        self.assertIsNotNone(broker.conn)
-        broker.delete_db(normalize_timestamp('2'))
-        info = broker.get_info()
-        self.assertEqual(normalize_timestamp('2'), info['delete_timestamp'])
-        self.assertEqual('DELETED', info['status'])
+        def do_test(expected_metadata, delete_meta_whitelist=None):
+            if not delete_meta_whitelist:
+                delete_meta_whitelist = []
+            broker = DatabaseBroker(':memory:')
+            broker.delete_meta_whitelist = delete_meta_whitelist
+            broker.db_type = 'test'
+            broker._initialize = init_stub
+            # Initializes a good broker for us
+            broker.initialize(normalize_timestamp('1'))
+            info = broker.get_info()
+            self.assertEqual('0', info['delete_timestamp'])
+            self.assertEqual('', info['status'])
+            self.assertIsNotNone(broker.conn)
+            broker.delete_db(normalize_timestamp('2'))
+            info = broker.get_info()
+            self.assertEqual(normalize_timestamp('2'),
+                             info['delete_timestamp'])
+            self.assertEqual('DELETED', info['status'])
 
-        broker = DatabaseBroker(os.path.join(self.testdir, '1.db'))
-        broker.db_type = 'test'
-        broker._initialize = init_stub
-        broker.initialize(normalize_timestamp('1'))
-        info = broker.get_info()
-        self.assertEqual('0', info['delete_timestamp'])
-        self.assertEqual('', info['status'])
-        broker.delete_db(normalize_timestamp('2'))
-        info = broker.get_info()
-        self.assertEqual(normalize_timestamp('2'), info['delete_timestamp'])
-        self.assertEqual('DELETED', info['status'])
+            # check meta
+            m2 = broker.metadata
+            self.assertEqual(m2, expected_metadata)
 
-        # ensure that metadata was cleared
-        m2 = broker.metadata
-        self.assertEqual(m2, {'foo': ['', normalize_timestamp('2')]})
+            broker = DatabaseBroker(os.path.join(self.testdir,
+                                                 '%s.db' % uuid4()))
+            broker.delete_meta_whitelist = delete_meta_whitelist
+            broker.db_type = 'test'
+            broker._initialize = init_stub
+            broker.initialize(normalize_timestamp('1'))
+            info = broker.get_info()
+            self.assertEqual('0', info['delete_timestamp'])
+            self.assertEqual('', info['status'])
+            broker.delete_db(normalize_timestamp('2'))
+            info = broker.get_info()
+            self.assertEqual(normalize_timestamp('2'),
+                             info['delete_timestamp'])
+            self.assertEqual('DELETED', info['status'])
+
+            # check meta
+            m2 = broker.metadata
+            self.assertEqual(m2, expected_metadata)
+
+        # ensure that metadata was cleared by default
+        do_test({'foo': ['', normalize_timestamp('2')]})
+
+        # If the meta is in the brokers delete_meta_whitelist it wont get
+        # cleared up
+        do_test(meta, ['foo'])
+
+        # delete_meta_whitelist things need to be in lower case, as the keys
+        # are lower()'ed before checked
+        meta["X-Container-Meta-Test"] = ['value', normalize_timestamp('0')]
+        meta["X-Something-else"] = ['other', normalize_timestamp('0')]
+        do_test({'foo': ['', normalize_timestamp('2')],
+                 'X-Container-Meta-Test': ['value', normalize_timestamp('0')],
+                 'X-Something-else': ['other', normalize_timestamp('0')]},
+                ['x-container-meta-test', 'x-something-else'])
 
     def test_get(self):
         broker = DatabaseBroker(':memory:')
@@ -1064,6 +1093,7 @@ class TestDatabaseBroker(unittest.TestCase):
         broker = DatabaseBroker(':memory:', account='a')
         broker.db_type = 'test'
         broker.db_contains_type = 'test'
+        broker.db_reclaim_timestamp = 'created_at'
         broker_creation = normalize_timestamp(1)
         broker_uuid = str(uuid4())
         broker_metadata = metadata and json.dumps(
@@ -1154,7 +1184,7 @@ class TestDatabaseBroker(unittest.TestCase):
         return broker
 
     # only testing _reclaim_metadata here
-    @patch.object(DatabaseBroker, '_reclaim', return_value='')
+    @patch.object(TombstoneReclaimer, 'reclaim')
     def test_metadata(self, mock_reclaim):
         # Initializes a good broker for us
         broker = self.get_replication_info_tester(metadata=True)
@@ -1538,6 +1568,159 @@ class TestDatabaseBroker(unittest.TestCase):
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
         self.assertFalse(pending)
+
+
+class TestTombstoneReclaimer(unittest.TestCase):
+    def _make_object(self, broker, obj_name, ts, deleted):
+        if deleted:
+            broker.delete_test(obj_name, ts.internal)
+        else:
+            broker.put_test(obj_name, ts.internal)
+
+    def _count_reclaimable(self, conn, reclaim_age):
+        return conn.execute(
+            "SELECT count(*) FROM test "
+            "WHERE deleted = 1 AND created_at < ?", (reclaim_age,)
+        ).fetchone()[0]
+
+    def _get_reclaimable(self, broker, reclaim_age):
+        with broker.get() as conn:
+            return self._count_reclaimable(conn, reclaim_age)
+
+    def _setup_tombstones(self, reverse_names=True):
+        broker = ExampleBroker(':memory:', account='test_account',
+                               container='test_container')
+        broker.initialize(Timestamp('1').internal, 0)
+        now = time.time()
+        top_of_the_minute = now - (now % 60)
+
+        # namespace if reverse:
+        #  a-* has 70 'active' tombstones followed by 70 reclaimable
+        #  b-* has 70 'active' tombstones followed by 70 reclaimable
+        # else:
+        #  a-* has 70 reclaimable followed by 70 'active' tombstones
+        #  b-* has 70 reclaimable followed by 70 'active' tombstones
+        for i in range(0, 560, 4):
+            self._make_object(
+                broker, 'a_%3d' % (560 - i if reverse_names else i),
+                Timestamp(top_of_the_minute - (i * 60)), True)
+            self._make_object(
+                broker, 'a_%3d' % (559 - i if reverse_names else i + 1),
+                Timestamp(top_of_the_minute - ((i + 1) * 60)), False)
+            self._make_object(
+                broker, 'b_%3d' % (560 - i if reverse_names else i),
+                Timestamp(top_of_the_minute - ((i + 2) * 60)), True)
+            self._make_object(
+                broker, 'b_%3d' % (559 - i if reverse_names else i + 1),
+                Timestamp(top_of_the_minute - ((i + 3) * 60)), False)
+        broker._commit_puts()
+
+        # divide the set of timestamps exactly in half for reclaim
+        reclaim_age = top_of_the_minute + 1 - (560 / 2 * 60)
+        self.assertEqual(140, self._get_reclaimable(broker, reclaim_age))
+
+        tombstones = self._get_reclaimable(broker, top_of_the_minute + 1)
+        self.assertEqual(280, tombstones)
+        return broker, top_of_the_minute, reclaim_age
+
+    @contextlib.contextmanager
+    def _mock_broker_get(self, broker, reclaim_age):
+        # intercept broker.get() calls and capture the current reclaimable
+        # count before returning a conn
+        orig_get = broker.get
+        reclaimable = []
+
+        @contextlib.contextmanager
+        def mock_get():
+            with orig_get() as conn:
+                reclaimable.append(self._count_reclaimable(conn, reclaim_age))
+                yield conn
+        with patch.object(broker, 'get', mock_get):
+            yield reclaimable
+
+    def test_batched_reclaim_several_small_batches(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 50):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140,  # 0 rows fetched
+                                90,  # 50 rows fetched, 50 reclaimed
+                                70,  # 100 rows fetched, 20 reclaimed
+                                60,  # 150 rows fetched, 10 reclaimed
+                                10,  # 200 rows fetched, 50 reclaimed
+                                0,  # 250 rows fetched, 10 reclaimed
+                                ]
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_batched_reclaim_exactly_two_batches(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 140):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140,  # 0 rows fetched
+                                70,  # 140 rows fetched, 70 reclaimed
+                                ]
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_batched_reclaim_one_large_batch(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 1000):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140]  # 0 rows fetched
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_reclaim_get_tombstone_count(self):
+        broker, totm, reclaim_age = self._setup_tombstones(reverse_names=False)
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            reclaimer.reclaim()
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        tombstones = self._get_reclaimable(broker, totm + 1)
+        self.assertEqual(140, tombstones)
+        # in this scenario the reclaim phase finds the remaining tombstone
+        # count (140)
+        self.assertEqual(140, reclaimer.remaining_tombstones)
+        self.assertEqual(140, reclaimer.get_tombstone_count())
+
+    def test_reclaim_get_tombstone_count_with_leftover(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            reclaimer.reclaim()
+
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        tombstones = self._get_reclaimable(broker, totm + 1)
+        self.assertEqual(140, tombstones)
+        # in this scenario the reclaim phase finds a subset (104) of all
+        # tombstones (140)
+        self.assertEqual(104, reclaimer.remaining_tombstones)
+        # get_tombstone_count finds the rest
+        actual = reclaimer.get_tombstone_count()
+        self.assertEqual(140, actual)
+
+    def test_get_tombstone_count_with_leftover(self):
+        # verify that a call to get_tombstone_count() will invoke a reclaim if
+        # reclaim not already invoked
+        broker, totm, reclaim_age = self._setup_tombstones()
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            actual = reclaimer.get_tombstone_count()
+
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        self.assertEqual(140, actual)
 
 
 if __name__ == '__main__':

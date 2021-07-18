@@ -24,8 +24,10 @@ from swift import gettext_ as _
 from swift.common.constraints import check_mount
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, Response
-from swift.common.utils import get_logger, config_true_value, \
-    SWIFT_CONF_FILE, md5_hash_for_file
+from swift.common.utils import get_logger, SWIFT_CONF_FILE, md5_hash_for_file
+from swift.common.recon import RECON_OBJECT_FILE, RECON_CONTAINER_FILE, \
+    RECON_ACCOUNT_FILE, RECON_DRIVE_FILE, RECON_RELINKER_FILE, \
+    DEFAULT_RECON_CACHE_PATH
 
 
 class ReconMiddleware(object):
@@ -35,7 +37,7 @@ class ReconMiddleware(object):
     /recon/load|mem|async... will return various system metrics.
 
     Needs to be added to the pipeline and requires a filter
-    declaration in the object-server.conf:
+    declaration in the [account|container|object]-server conf file:
 
     [filter:recon]
     use = egg:swift#recon
@@ -48,15 +50,17 @@ class ReconMiddleware(object):
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.logger = get_logger(conf, log_route='recon')
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
+                                         DEFAULT_RECON_CACHE_PATH)
         self.object_recon_cache = os.path.join(self.recon_cache_path,
-                                               'object.recon')
+                                               RECON_OBJECT_FILE)
         self.container_recon_cache = os.path.join(self.recon_cache_path,
-                                                  'container.recon')
+                                                  RECON_CONTAINER_FILE)
         self.account_recon_cache = os.path.join(self.recon_cache_path,
-                                                'account.recon')
+                                                RECON_ACCOUNT_FILE)
         self.drive_recon_cache = os.path.join(self.recon_cache_path,
-                                              'drive.recon')
+                                              RECON_DRIVE_FILE)
+        self.relink_recon_cache = os.path.join(self.recon_cache_path,
+                                               RECON_RELINKER_FILE)
         self.account_ring_path = os.path.join(swift_dir, 'account.ring.gz')
         self.container_ring_path = os.path.join(swift_dir, 'container.ring.gz')
 
@@ -66,22 +70,26 @@ class ReconMiddleware(object):
             self.rings.append(os.path.join(swift_dir,
                                            policy.ring_name + '.ring.gz'))
 
-        self.mount_check = config_true_value(conf.get('mount_check', 'true'))
-
-    def _from_recon_cache(self, cache_keys, cache_file, openr=open):
+    def _from_recon_cache(self, cache_keys, cache_file, openr=open,
+                          ignore_missing=False):
         """retrieve values from a recon cache file
 
         :params cache_keys: list of cache items to retrieve
         :params cache_file: cache file to retrieve items from.
         :params openr: open to use [for unittests]
+        :params ignore_missing: Some recon stats are very temporary, in this
+            case it would be better to not log if things are missing.
         :return: dict of cache items and their values or none if not found
         """
         try:
             with openr(cache_file, 'r') as f:
                 recondata = json.load(f)
-                return dict((key, recondata.get(key)) for key in cache_keys)
-        except IOError:
-            self.logger.exception(_('Error reading recon cache file'))
+                return {key: recondata.get(key) for key in cache_keys}
+        except IOError as err:
+            if err.errno == errno.ENOENT and ignore_missing:
+                pass
+            else:
+                self.logger.exception(_('Error reading recon cache file'))
         except ValueError:
             self.logger.exception(_('Error parsing recon cache file'))
         except Exception:
@@ -127,13 +135,20 @@ class ReconMiddleware(object):
 
     def get_async_info(self):
         """get # of async pendings"""
-        return self._from_recon_cache(['async_pending'],
+        return self._from_recon_cache(['async_pending', 'async_pending_last'],
                                       self.object_recon_cache)
 
     def get_driveaudit_error(self):
         """get # of drive audit errors"""
         return self._from_recon_cache(['drive_audit_errors'],
                                       self.drive_recon_cache)
+
+    def get_sharding_info(self):
+        """get sharding info"""
+        return self._from_recon_cache(["sharding_stats",
+                                       "sharding_time",
+                                       "sharding_last"],
+                                      self.container_recon_cache)
 
     def get_replication_info(self, recon_type):
         """get replication info"""
@@ -330,6 +345,14 @@ class ReconMiddleware(object):
 
         return time.time()
 
+    def get_relinker_info(self):
+        """get relinker info, if any"""
+
+        stat_keys = ['devices', 'workers']
+        return self._from_recon_cache(stat_keys,
+                                      self.relink_recon_cache,
+                                      ignore_missing=True)
+
     def GET(self, req):
         root, rcheck, rtype = req.split_path(1, 3, True)
         all_rtypes = ['account', 'container', 'object']
@@ -372,6 +395,10 @@ class ReconMiddleware(object):
             content = self.get_driveaudit_error()
         elif rcheck == "time":
             content = self.get_time()
+        elif rcheck == "sharding":
+            content = self.get_sharding_info()
+        elif rcheck == "relinker":
+            content = self.get_relinker_info()
         else:
             content = "Invalid path: %s" % req.path
             return Response(request=req, status="404 Not Found",

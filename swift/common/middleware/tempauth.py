@@ -54,12 +54,13 @@ in a line like this::
 
     user64_<account_b64>_<user_b64> = <key> [group] [...] [storage_url]
 
-There are two special groups:
+There are three special groups:
 
 * ``.reseller_admin`` -- can do anything to any account for this auth
+* ``.reseller_reader`` -- can GET/HEAD anything in any account for this auth
 * ``.admin`` -- can do anything within the account
 
-If neither of these groups are specified, the user can only access
+If none of these groups are specified, the user can only access
 containers that have been explicitly allowed for them by a ``.admin`` or
 ``.reseller_admin``.
 
@@ -124,8 +125,8 @@ and ``X-Service-Token`` is from the ``glance`` user::
    user_maryacct_mary = marypw .admin
    user_glance_glance = glancepw .service
 
-The name ``.service`` is an example. Unlike ``.admin`` and
-``.reseller_admin`` it is not a reserved name.
+The name ``.service`` is an example. Unlike ``.admin``, ``.reseller_admin``,
+``.reseller_reader`` it is not a reserved name.
 
 Please note that ACLs can be set on service accounts and are matched
 against the identity validated by ``X-Auth-Token``. As such ACLs can grant
@@ -231,7 +232,11 @@ class TempAuth(object):
         self.users = {}
         for conf_key in conf:
             if conf_key.startswith(('user_', 'user64_')):
-                account, username = conf_key.split('_', 1)[1].split('_')
+                try:
+                    account, username = conf_key.split('_', 1)[1].split('_')
+                except ValueError:
+                    raise ValueError("key %s was provided in an "
+                                     "invalid format" % conf_key)
                 if conf_key.startswith('user64_'):
                     # Because trailing equal signs would screw up config file
                     # parsing, we auto-pad with '=' chars.
@@ -566,6 +571,14 @@ class TempAuth(object):
                 not self._dot_account(account):
             req.environ['swift_owner'] = True
             self.logger.debug("User %s has reseller admin authorizing."
+                              % account_user)
+            return None
+
+        if '.reseller_reader' in user_groups and \
+                account not in self.reseller_prefixes and \
+                not self._dot_account(account) and \
+                req.method in ('GET', 'HEAD'):
+            self.logger.debug("User %s has reseller reader authorizing."
                               % account_user)
             return None
 

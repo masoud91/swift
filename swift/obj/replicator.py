@@ -40,6 +40,7 @@ from swift.common.utils import whataremyips, unlink_older_than, \
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
 from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
+from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
 from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter
 from swift.common.storage_policy import POLICIES, REPL_POLICY
@@ -142,13 +143,13 @@ class ObjectReplicator(Daemon):
         self.replicator_workers = int(conf.get('replicator_workers', 0))
         self.policies = [policy for policy in POLICIES
                          if policy.policy_type == REPL_POLICY]
-        self.stats_interval = int(conf.get('stats_interval', '300'))
-        self.ring_check_interval = int(conf.get('ring_check_interval', 15))
+        self.stats_interval = float(conf.get('stats_interval', '300'))
+        self.ring_check_interval = float(conf.get('ring_check_interval', 15))
         self.next_check = time.time() + self.ring_check_interval
         self.replication_cycle = random.randint(0, 9)
         self.partition_times = []
-        self.interval = int(conf.get('interval') or
-                            conf.get('run_pause') or 30)
+        self.interval = float(conf.get('interval') or
+                              conf.get('run_pause') or 30)
         if 'run_pause' in conf:
             if 'interval' in conf:
                 self.logger.warning(
@@ -172,8 +173,8 @@ class ObjectReplicator(Daemon):
             self.rsync_module = '{replication_ip}::object'
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.rcache = os.path.join(self.recon_cache_path, "object.recon")
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.rcache = os.path.join(self.recon_cache_path, RECON_OBJECT_FILE)
         self._next_rcache_update = time.time() + self.stats_interval
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.node_timeout = float(conf.get('node_timeout', 10))
@@ -385,7 +386,8 @@ class ObjectReplicator(Daemon):
         except Timeout:
             self.logger.error(
                 self._limit_rsync_log(
-                    _("Killing long-running rsync: %s") % str(args)))
+                    _("Killing long-running rsync after %ds: %s") % (
+                        self.rsync_timeout, str(args))))
             if proc:
                 proc.kill()
                 try:

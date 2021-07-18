@@ -230,9 +230,9 @@ use = egg:swift#recon
 # daemonize = on
 #
 # Time in seconds to wait between replication passes
-# interval = 30
+# interval = 30.0
 # run_pause is deprecated, use interval instead
-# run_pause = 30
+# run_pause = 30.0
 #
 # Number of concurrent replication jobs to run. This is per-process,
 # so replicator_workers=W and concurrency=C will result in W*C
@@ -244,7 +244,7 @@ use = egg:swift#recon
 # is done in the main process.
 # replicator_workers = 0
 #
-# stats_interval = 300
+# stats_interval = 300.0
 #
 # default is rsync, alternative is ssync
 # sync_method = rsync
@@ -277,7 +277,7 @@ use = egg:swift#recon
 # attempts to kill all workers if nothing replicates for lockup_timeout seconds
 # lockup_timeout = 1800
 #
-# ring_check_interval = 15
+# ring_check_interval = 15.0
 # recon_cache_path = /var/cache/swift
 #
 # limits how long rsync error log lines are
@@ -329,9 +329,9 @@ use = egg:swift#recon
 # daemonize = on
 #
 # Time in seconds to wait between reconstruction passes
-# interval = 30
+# interval = 30.0
 # run_pause is deprecated, use interval instead
-# run_pause = 30
+# run_pause = 30.0
 #
 # Maximum number of worker processes to spawn.  Each worker will handle a
 # subset of devices.  Devices will be assigned evenly among the workers so that
@@ -341,11 +341,11 @@ use = egg:swift#recon
 # reconstructor_workers = 0
 #
 # concurrency = 1
-# stats_interval = 300
+# stats_interval = 300.0
 # node_timeout = 10
 # http_timeout = 60
 # lockup_timeout = 1800
-# ring_check_interval = 15
+# ring_check_interval = 15.0
 # recon_cache_path = /var/cache/swift
 # The handoffs_only mode option is for special case emergency situations during
 # rebalance such as disk full in the cluster.  This option SHOULD NOT BE
@@ -390,6 +390,48 @@ use = egg:swift#recon
 # the environment (default). For more information, see
 # https://bugs.launchpad.net/liberasurecode/+bug/1886088
 # write_legacy_ec_crc =
+#
+# When attempting to reconstruct a missing fragment on another node from a
+# fragment on the local node, the reconstructor may fail to fetch sufficient
+# fragments to reconstruct the missing fragment. This may be because most or
+# all of the remote fragments have been deleted, and the local fragment is
+# stale, in which case the reconstructor will never succeed in reconstructing
+# the apparently missing fragment and will log errors. If the object's
+# tombstones have been reclaimed then the stale fragment will never be deleted
+# (see https://bugs.launchpad.net/swift/+bug/1655608). If an operator suspects
+# that stale fragments have been re-introduced to the cluster and is seeing
+# error logs similar to those in the bug report, then the quarantine_threshold
+# option may be set to a value greater than zero. This enables the
+# reconstructor to quarantine the stale fragments when it fails to fetch more
+# than the quarantine_threshold number of fragments (including the stale
+# fragment) during an attempt to reconstruct. For example, setting the
+# quarantine_threshold to 1 would cause a fragment to be quarantined if no
+# other fragments can be fetched. The value may be reset to zero after the
+# reconstructor has run on all affected nodes and the error logs are no longer
+# seen.
+# Note: the quarantine_threshold applies equally to all policies, but for each
+# policy it is effectively capped at (ec_ndata - 1) so that a fragment is never
+# quarantined when sufficient fragments exist to reconstruct the object.
+# quarantine_threshold = 0
+#
+# Fragments are not quarantined until they are older than
+# quarantine_age, which defaults to the value of reclaim_age.
+# quarantine_age =
+#
+# Sets the maximum number of nodes to which requests will be made before
+# quarantining a fragment. You can use '* replicas' at the end to have it use
+# the number given times the number of replicas for the ring being used for the
+# requests. The minimum number of nodes to which requests are made is the
+# number of replicas for the policy minus 1 (the node on which the fragment is
+# to be rebuilt). The minimum is only exceeded if request_node_count is
+# greater, and only for the purposes of quarantining.
+# request_node_count = 2 * replicas
+#
+# Sets a delay, in seconds, before the reconstructor removes non-durable data
+# files from a handoff node after reverting them to a primary. This gives the
+# object-server a window in which to finish a concurrent PUT on a handoff and
+# mark the data durable.
+# nondurable_purge_delay = 60.0
 
 [object-updater]
 # You can override the default log routing for this app here (don't use set!):
@@ -398,7 +440,7 @@ use = egg:swift#recon
 # log_level = INFO
 # log_address = /dev/log
 #
-# interval = 300
+# interval = 300.0
 # node_timeout = <whatever's in the DEFAULT section or 10>
 #
 # updater_workers controls how many processes the object updater will
@@ -420,7 +462,7 @@ use = egg:swift#recon
 # logging is per-process, so with concurrency > 1, the logs will
 # contain one stats log per worker process every report_interval
 # seconds.
-# report_interval = 300
+# report_interval = 300.0
 #
 # recon_cache_path = /var/cache/swift
 #
@@ -444,7 +486,7 @@ use = egg:swift#recon
 # log_address = /dev/log
 #
 # Time in seconds to wait between auditor passes
-# interval = 30
+# interval = 30.0
 #
 # You can set the disk chunk size that the auditor uses making it larger if
 # you like for more efficient local auditing of larger objects
@@ -495,11 +537,19 @@ use = egg:swift#recon
 #
 # watchers =
 
-# Watcher-specific parameters can he added after "object-auditor:watcher:"
-# like the following (note that entry points are qualified by package#):
+# Watcher-specific parameters can be added in a section with a name
+# [object-auditor:watcher:some_package#some_watcher]. The following
+# example uses the built-in reference watcher.
 #
 # [object-auditor:watcher:swift#dark_data]
+#
+# Action type can be 'log' (default), 'delete', or 'quarantine'.
 # action=log
+#
+# The watcher ignores the objects younger than certain minimum age.
+# This prevents spurious actions upon fresh objects while container
+# listings eventually settle.
+# grace_age=604800
 
 [object-expirer]
 # If this true, this expirer will execute tasks from legacy expirer task queue,
@@ -537,9 +587,9 @@ use = egg:swift#recon
 # log_level = INFO
 # log_address = /dev/log
 #
-# interval = 300
+# interval = 300.0
 #
-# report_interval = 300
+# report_interval = 300.0
 #
 # request_tries is the number of times the expirer's internal client will
 # attempt any given request in the event of failure. The default is 3.
@@ -602,3 +652,23 @@ use = egg:swift#xprofile
 #
 # unwind the iterator of applications
 # unwind = false
+
+[object-relinker]
+# You can override the default log routing for this app here (don't use set!):
+# log_name = object-relinker
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+#
+# Start up to this many sub-processes to process disks in parallel. Each disk
+# will be handled by at most one child process. By default, one process is
+# spawned per disk.
+# workers = auto
+#
+# Target this many relinks/cleanups per second for each worker, to reduce the
+# likelihood that the added I/O from a partition-power increase impacts
+# client traffic. Use zero for unlimited.
+# files_per_second = 0.0
+#
+# stats_interval = 300.0
+# recon_cache_path = /var/cache/swift

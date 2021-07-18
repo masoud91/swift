@@ -34,7 +34,8 @@ from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     HTTP_PARTIAL_CONTENT, HTTP_NOT_MODIFIED, HTTP_PRECONDITION_FAILED, \
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE, HTTP_LENGTH_REQUIRED, \
     HTTP_BAD_REQUEST, HTTP_REQUEST_TIMEOUT, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_TOO_MANY_REQUESTS, HTTP_RATE_LIMITED, is_success
+    HTTP_TOO_MANY_REQUESTS, HTTP_RATE_LIMITED, is_success, \
+    HTTP_CLIENT_CLOSED_REQUEST
 
 from swift.common.constraints import check_utf8
 from swift.proxy.controllers.base import get_container_info
@@ -1310,6 +1311,7 @@ class S3Request(swob.Request):
                     HTTP_LENGTH_REQUIRED: MissingContentLength,
                     HTTP_REQUEST_TIMEOUT: RequestTimeout,
                     HTTP_PRECONDITION_FAILED: PreconditionFailed,
+                    HTTP_CLIENT_CLOSED_REQUEST: RequestTimeout,
                 },
                 'POST': {
                     HTTP_NOT_FOUND: not_found_handler,
@@ -1400,6 +1402,8 @@ class S3Request(swob.Request):
         if status == HTTP_SERVICE_UNAVAILABLE:
             raise ServiceUnavailable()
         if status in (HTTP_RATE_LIMITED, HTTP_TOO_MANY_REQUESTS):
+            if self.conf.ratelimit_as_client_error:
+                raise SlowDown(status='429 Slow Down')
             raise SlowDown()
 
         raise InternalError('unexpected status code %d' % status)
@@ -1548,6 +1552,8 @@ class S3AclRequest(S3Request):
 
         sw_req.environ.get('swift.authorize', lambda req: None)(sw_req)
         self.environ['swift_owner'] = sw_req.environ.get('swift_owner', False)
+        if 'REMOTE_USER' in sw_req.environ:
+            self.environ['REMOTE_USER'] = sw_req.environ['REMOTE_USER']
 
         # Need to skip S3 authorization on subsequent requests to prevent
         # overwriting the account in PATH_INFO

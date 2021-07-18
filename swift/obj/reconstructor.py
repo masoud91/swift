@@ -12,7 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import itertools
 import json
 import errno
 import os
@@ -33,21 +33,24 @@ from swift.common.utils import (
     dump_recon_cache, mkdirs, config_true_value,
     GreenAsyncPile, Timestamp, remove_file,
     load_recon_cache, parse_override_options, distribute_evenly,
-    PrefixLoggerAdapter, remove_directory)
+    PrefixLoggerAdapter, remove_directory, config_request_node_count_value,
+    non_negative_int, non_negative_float)
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
+from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.common.ring.utils import is_local_device
 from swift.obj.ssync_sender import Sender as ssync_sender
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
-    get_tmp_dir
+    get_tmp_dir, DEFAULT_RECLAIM_AGE
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     SuffixSyncError, PartitionLockTimeout
 
 SYNC, REVERT = ('sync_only', 'sync_revert')
+UNKNOWN_RESPONSE_STATUS = 0  # used as response status for timeouts, exceptions
 
 
 def _get_partners(node_index, part_nodes):
@@ -92,6 +95,22 @@ def _full_path(node, part, relative_path, policy):
             'part': part, 'path': relative_path,
             'policy': policy,
         }
+
+
+class ResponseBucket(object):
+    """
+    Encapsulates fragment GET response data related to a single timestamp.
+    """
+    def __init__(self):
+        # count of all responses associated with this Bucket
+        self.num_responses = 0
+        # map {frag_index: response} for subset of responses that could be used
+        # to rebuild the missing fragment
+        self.useful_responses = {}
+        # set if a durable timestamp was seen in responses
+        self.durable = False
+        # etag of the first response associated with the Bucket
+        self.etag = None
 
 
 class RebuildingECDiskFileStream(object):
@@ -162,12 +181,12 @@ class ObjectReconstructor(Daemon):
         self.reconstructor_workers = int(conf.get('reconstructor_workers', 0))
         self.policies = [policy for policy in POLICIES
                          if policy.policy_type == EC_POLICY]
-        self.stats_interval = int(conf.get('stats_interval', '300'))
-        self.ring_check_interval = int(conf.get('ring_check_interval', 15))
+        self.stats_interval = float(conf.get('stats_interval', '300'))
+        self.ring_check_interval = float(conf.get('ring_check_interval', 15))
         self.next_check = time.time() + self.ring_check_interval
         self.partition_times = []
-        self.interval = int(conf.get('interval') or
-                            conf.get('run_pause') or 30)
+        self.interval = float(conf.get('interval') or
+                              conf.get('run_pause') or 30)
         if 'run_pause' in conf:
             if 'interval' in conf:
                 self.logger.warning(
@@ -184,8 +203,8 @@ class ObjectReconstructor(Daemon):
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.rcache = os.path.join(self.recon_cache_path, "object.recon")
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.rcache = os.path.join(self.recon_cache_path, RECON_OBJECT_FILE)
         self._next_rcache_update = time.time() + self.stats_interval
         # defaults subject to change after beta
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
@@ -215,6 +234,15 @@ class ObjectReconstructor(Daemon):
                                 'of handoffs_only.')
         self.rebuild_handoff_node_count = int(conf.get(
             'rebuild_handoff_node_count', 2))
+        self.quarantine_threshold = non_negative_int(
+            conf.get('quarantine_threshold', 0))
+        self.quarantine_age = int(
+            conf.get('quarantine_age',
+                     conf.get('reclaim_age', DEFAULT_RECLAIM_AGE)))
+        self.request_node_count = config_request_node_count_value(
+            conf.get('request_node_count', '2 * replicas'))
+        self.nondurable_purge_delay = non_negative_float(
+            conf.get('nondurable_purge_delay', '60'))
 
         # When upgrading from liberasurecode<=1.5.0, you may want to continue
         # writing legacy CRCs until all nodes are upgraded and capabale of
@@ -351,56 +379,168 @@ class ObjectReconstructor(Daemon):
                 return False
         return True
 
-    def _get_response(self, node, part, path, headers, full_path):
+    def _get_response(self, node, policy, partition, path, headers):
         """
         Helper method for reconstruction that GETs a single EC fragment
         archive
 
         :param node: the node to GET from
-        :param part: the partition
+        :param policy: the job policy
+        :param partition: the partition
         :param path: path of the desired EC archive relative to partition dir
         :param headers: the headers to send
-        :param full_path: full path to desired EC archive
         :returns: response
         """
+        full_path = _full_path(node, partition, path, policy)
         resp = None
         try:
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(node['ip'], node['port'], node['device'],
-                                    part, 'GET', path, headers=headers)
+                                    partition, 'GET', path, headers=headers)
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.full_path = full_path
-            if resp.status not in [HTTP_OK, HTTP_NOT_FOUND]:
-                self.logger.warning(
-                    _("Invalid response %(resp)s from %(full_path)s"),
-                    {'resp': resp.status, 'full_path': full_path})
-                resp = None
-            elif resp.status == HTTP_NOT_FOUND:
-                resp = None
+                resp.node = node
         except (Exception, Timeout):
             self.logger.exception(
                 _("Trying to GET %(full_path)s"), {
                     'full_path': full_path})
         return resp
 
-    def reconstruct_fa(self, job, node, datafile_metadata):
+    def _handle_fragment_response(self, node, policy, partition, fi_to_rebuild,
+                                  path, buckets, error_responses, resp):
         """
-        Reconstructs a fragment archive - this method is called from ssync
-        after a remote node responds that is missing this object - the local
-        diskfile is opened to provide metadata - but to reconstruct the
-        missing fragment archive we must connect to multiple object servers.
+        Place ok responses into a per-timestamp bucket. Append bad responses to
+        a list per-status-code in error_responses.
 
-        :param job: job from ssync_sender
-        :param node: node that we're rebuilding to
-        :param datafile_metadata:  the datafile metadata to attach to
-                                   the rebuilt fragment archive
-        :returns: a DiskFile like class for use by ssync
-        :raises DiskFileError: if the fragment archive cannot be reconstructed
+        :return: the per-timestamp bucket if the response is ok, otherwise
+            None.
         """
-        # don't try and fetch a fragment from the node we're rebuilding to
-        part_nodes = [n for n in job['policy'].object_ring.get_part_nodes(
-            job['partition']) if n['id'] != node['id']]
+        if not resp:
+            error_responses[UNKNOWN_RESPONSE_STATUS].append(resp)
+            return None
+
+        if resp.status not in [HTTP_OK, HTTP_NOT_FOUND]:
+            self.logger.warning(
+                _("Invalid response %(resp)s from %(full_path)s"),
+                {'resp': resp.status, 'full_path': resp.full_path})
+        if resp.status != HTTP_OK:
+            error_responses[resp.status].append(resp)
+            return None
+
+        resp.headers = HeaderKeyDict(resp.getheaders())
+        frag_index = resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+        try:
+            resp_frag_index = int(frag_index)
+        except (TypeError, ValueError):
+            # The successful response should include valid X-Object-
+            # Sysmeta-Ec-Frag-Index but for safety, catching the case either
+            # missing X-Object-Sysmeta-Ec-Frag-Index or invalid frag index to
+            # reconstruct and dump warning log for that
+            self.logger.warning(
+                'Invalid resp from %s '
+                '(invalid X-Object-Sysmeta-Ec-Frag-Index: %r)',
+                resp.full_path, frag_index)
+            error_responses[UNKNOWN_RESPONSE_STATUS].append(resp)
+            return None
+
+        timestamp = resp.headers.get('X-Backend-Data-Timestamp',
+                                     resp.headers.get('X-Backend-Timestamp'))
+        if not timestamp:
+            self.logger.warning(
+                'Invalid resp from %s, frag index %s (missing '
+                'X-Backend-Data-Timestamp and X-Backend-Timestamp)',
+                resp.full_path, resp_frag_index)
+            error_responses[UNKNOWN_RESPONSE_STATUS].append(resp)
+            return None
+        timestamp = Timestamp(timestamp)
+
+        etag = resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+        if not etag:
+            self.logger.warning(
+                'Invalid resp from %s, frag index %s (missing Etag)',
+                resp.full_path, resp_frag_index)
+            error_responses[UNKNOWN_RESPONSE_STATUS].append(resp)
+            return None
+
+        bucket = buckets[timestamp]
+        bucket.num_responses += 1
+        if bucket.etag is None:
+            bucket.etag = etag
+        elif bucket.etag != etag:
+            self.logger.error('Mixed Etag (%s, %s) for %s frag#%s',
+                              etag, bucket.etag,
+                              _full_path(node, partition, path, policy),
+                              fi_to_rebuild)
+            return None
+
+        durable_timestamp = resp.headers.get('X-Backend-Durable-Timestamp')
+        if durable_timestamp:
+            buckets[Timestamp(durable_timestamp)].durable = True
+
+        if resp_frag_index == fi_to_rebuild:
+            # TODO: With duplicated EC frags it's not unreasonable to find the
+            # very fragment we're trying to rebuild exists on another primary
+            # node.  In this case we should stream it directly from the remote
+            # node to our target instead of rebuild.  But instead we ignore it.
+            self.logger.debug(
+                'Found existing frag #%s at %s while rebuilding to %s',
+                fi_to_rebuild, resp.full_path,
+                _full_path(node, partition, path, policy))
+        elif resp_frag_index not in bucket.useful_responses:
+            bucket.useful_responses[resp_frag_index] = resp
+        # else: duplicate frag_index isn't useful for rebuilding
+
+        return bucket
+
+    def _is_quarantine_candidate(self, policy, buckets, error_responses, df):
+        # This condition is deliberately strict because it determines if
+        # more requests will be issued and ultimately if the fragment
+        # will be quarantined.
+        if list(error_responses.keys()) != [404]:
+            # only quarantine if all other responses are 404 so we are
+            # confident there are no other frags on queried nodes
+            return False
+
+        local_timestamp = Timestamp(df.get_datafile_metadata()['X-Timestamp'])
+        if list(buckets.keys()) != [local_timestamp]:
+            # don't quarantine if there's insufficient other timestamp
+            # frags, or no response for the local frag timestamp: we
+            # possibly could quarantine, but this unexpected case may be
+            # worth more investigation
+            return False
+
+        if time.time() - float(local_timestamp) <= self.quarantine_age:
+            # If the fragment has not yet passed reclaim age then it is
+            # likely that a tombstone will be reverted to this node, or
+            # neighbor frags will get reverted from handoffs to *other* nodes
+            # and we'll discover we *do* have enough to reconstruct. Don't
+            # quarantine it yet: better that it is cleaned up 'normally'.
+            return False
+
+        bucket = buckets[local_timestamp]
+        return (bucket.num_responses <= self.quarantine_threshold and
+                bucket.num_responses < policy.ec_ndata and
+                df._frag_index in bucket.useful_responses)
+
+    def _make_fragment_requests(self, job, node, df, buckets, error_responses):
+        """
+        Issue requests for fragments to the list of ``nodes`` and sort the
+        responses into per-timestamp ``buckets`` or per-status
+        ``error_responses``. If any bucket accumulates sufficient responses to
+        rebuild the missing fragment then return that bucket.
+
+        :param job: job from ssync_sender.
+        :param node: node to which we're rebuilding.
+        :param df: an instance of :class:`~swift.obj.diskfile.BaseDiskFile`.
+        :param buckets: dict of per-timestamp buckets for ok responses.
+        :param error_responses: dict of per-status lists of error responses.
+        :return: A per-timestamp with sufficient responses, or None if
+            there is no such bucket.
+        """
+        policy = job['policy']
+        partition = job['partition']
+        datafile_metadata = df.get_datafile_metadata()
 
         # the fragment index we need to reconstruct is the position index
         # of the node we're rebuilding to within the primary part list
@@ -409,126 +549,159 @@ class ObjectReconstructor(Daemon):
         # KISS send out connection requests to all nodes, see what sticks.
         # Use fragment preferences header to tell other nodes that we want
         # fragments at the same timestamp as our fragment, and that they don't
-        # need to be durable.
+        # need to be durable. Accumulate responses into per-timestamp buckets
+        # and if any buckets gets enough responses then use those responses to
+        # rebuild.
         headers = self.headers.copy()
-        headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
+        headers['X-Backend-Storage-Policy-Index'] = int(policy)
         headers['X-Backend-Replication'] = 'True'
-        frag_prefs = [{'timestamp': datafile_metadata['X-Timestamp'],
-                       'exclude': []}]
+        local_timestamp = Timestamp(datafile_metadata['X-Timestamp'])
+        frag_prefs = [{'timestamp': local_timestamp.normal, 'exclude': []}]
         headers['X-Backend-Fragment-Preferences'] = json.dumps(frag_prefs)
-        pile = GreenAsyncPile(len(part_nodes))
         path = datafile_metadata['name']
-        for _node in part_nodes:
-            full_get_path = _full_path(
-                _node, job['partition'], path, job['policy'])
-            pile.spawn(self._get_response, _node, job['partition'],
-                       path, headers, full_get_path)
 
-        buckets = defaultdict(dict)
-        durable_buckets = {}
-        etag_buckets = {}
-        error_resp_count = 0
+        ring = policy.object_ring
+        primary_nodes = ring.get_part_nodes(partition)
+        # primary_node_count is the maximum number of nodes to consume in a
+        # normal rebuild attempt when there is no quarantine candidate,
+        # including the node to which we are rebuilding
+        primary_node_count = len(primary_nodes)
+        # don't try and fetch a fragment from the node we're rebuilding to
+        filtered_primary_nodes = [n for n in primary_nodes
+                                  if n['id'] != node['id']]
+        # concurrency is the number of requests fired off in initial batch
+        concurrency = len(filtered_primary_nodes)
+        # max_node_count is the maximum number of nodes to consume when
+        # verifying a quarantine candidate and is at least primary_node_count
+        max_node_count = max(primary_node_count,
+                             self.request_node_count(primary_node_count))
+
+        pile = GreenAsyncPile(concurrency)
+        for primary_node in filtered_primary_nodes:
+            pile.spawn(self._get_response, primary_node, policy, partition,
+                       path, headers)
+
+        useful_bucket = None
         for resp in pile:
-            if not resp:
-                error_resp_count += 1
-                continue
-            resp.headers = HeaderKeyDict(resp.getheaders())
-            frag_index = resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            try:
-                resp_frag_index = int(frag_index)
-            except (TypeError, ValueError):
-                # The successful response should include valid X-Object-
-                # Sysmeta-Ec-Frag-Index but for safety, catching the case
-                # either missing X-Object-Sysmeta-Ec-Frag-Index or invalid
-                # frag index to reconstruct and dump warning log for that
-                self.logger.warning(
-                    'Invalid resp from %s '
-                    '(invalid X-Object-Sysmeta-Ec-Frag-Index: %r)',
-                    resp.full_path, frag_index)
-                continue
+            bucket = self._handle_fragment_response(
+                node, policy, partition, fi_to_rebuild, path, buckets,
+                error_responses, resp)
+            if bucket and len(bucket.useful_responses) >= policy.ec_ndata:
+                useful_bucket = bucket
+                break
 
-            if fi_to_rebuild == resp_frag_index:
-                # TODO: With duplicated EC frags it's not unreasonable to find
-                # the very fragment we're trying to rebuild exists on another
-                # primary node.  In this case we should stream it directly from
-                # the remote node to our target instead of rebuild.  But
-                # instead we ignore it.
-                self.logger.debug(
-                    'Found existing frag #%s at %s while rebuilding to %s',
-                    fi_to_rebuild, resp.full_path,
-                    _full_path(
-                        node, job['partition'], datafile_metadata['name'],
-                        job['policy']))
-                continue
-
-            timestamp = resp.headers.get('X-Backend-Timestamp')
-            if not timestamp:
-                self.logger.warning('Invalid resp from %s, frag index %s '
-                                    '(missing X-Backend-Timestamp)',
-                                    resp.full_path, resp_frag_index)
-                continue
-            timestamp = Timestamp(timestamp)
-
-            durable = resp.headers.get('X-Backend-Durable-Timestamp')
-            if durable:
-                durable_buckets[Timestamp(durable)] = True
-
-            etag = resp.headers.get('X-Object-Sysmeta-Ec-Etag')
-            if not etag:
-                self.logger.warning('Invalid resp from %s, frag index %s '
-                                    '(missing Etag)',
-                                    resp.full_path, resp_frag_index)
-                continue
-
-            if etag != etag_buckets.setdefault(timestamp, etag):
-                self.logger.error(
-                    'Mixed Etag (%s, %s) for %s frag#%s',
-                    etag, etag_buckets[timestamp],
-                    _full_path(node, job['partition'],
-                               datafile_metadata['name'], job['policy']),
-                    fi_to_rebuild)
-                continue
-
-            if resp_frag_index not in buckets[timestamp]:
-                buckets[timestamp][resp_frag_index] = resp
-                if len(buckets[timestamp]) >= job['policy'].ec_ndata:
-                    responses = list(buckets[timestamp].values())
+        # Once all rebuild nodes have responded, if we have a quarantine
+        # candidate, go beyond primary_node_count and on to handoffs. The
+        # first non-404 response will prevent quarantine, but the expected
+        # common case is all 404 responses so we use some concurrency to get an
+        # outcome faster at the risk of some unnecessary requests in the
+        # uncommon case.
+        if (not useful_bucket and
+                self._is_quarantine_candidate(
+                    policy, buckets, error_responses, df)):
+            node_count = primary_node_count
+            handoff_iter = itertools.islice(ring.get_more_nodes(partition),
+                                            max_node_count - node_count)
+            for handoff_node in itertools.islice(handoff_iter, concurrency):
+                node_count += 1
+                pile.spawn(self._get_response, handoff_node, policy, partition,
+                           path, headers)
+            for resp in pile:
+                bucket = self._handle_fragment_response(
+                    node, policy, partition, fi_to_rebuild, path, buckets,
+                    error_responses, resp)
+                if bucket and len(bucket.useful_responses) >= policy.ec_ndata:
+                    useful_bucket = bucket
                     self.logger.debug(
-                        'Reconstruct frag #%s with frag indexes %s'
-                        % (fi_to_rebuild, list(buckets[timestamp])))
+                        'Reconstructing frag from handoffs, node_count=%d'
+                        % node_count)
                     break
-        else:
-            path = _full_path(node, job['partition'],
-                              datafile_metadata['name'],
-                              job['policy'])
+                elif self._is_quarantine_candidate(
+                        policy, buckets, error_responses, df):
+                    try:
+                        handoff_node = next(handoff_iter)
+                        node_count += 1
+                        pile.spawn(self._get_response, handoff_node, policy,
+                                   partition, path, headers)
+                    except StopIteration:
+                        pass
+                # else: this frag is no longer a quarantine candidate, so we
+                # could break right here and ignore any remaining responses,
+                # but given that we may have actually found another frag we'll
+                # optimistically wait for any remaining responses in case a
+                # useful bucket is assembled.
 
-            for timestamp, resp in sorted(buckets.items()):
-                etag = etag_buckets[timestamp]
-                durable = durable_buckets.get(timestamp)
-                self.logger.error(
-                    'Unable to get enough responses (%s/%s) to reconstruct '
-                    '%s %s frag#%s with ETag %s and timestamp %s' % (
-                        len(resp), job['policy'].ec_ndata,
-                        'durable' if durable else 'non-durable',
-                        path, fi_to_rebuild, etag, timestamp.internal))
+        return useful_bucket
 
-            if error_resp_count:
-                durable = durable_buckets.get(Timestamp(
-                    datafile_metadata['X-Timestamp']))
-                self.logger.error(
-                    'Unable to get enough responses (%s error responses) '
-                    'to reconstruct %s %s frag#%s' % (
-                        error_resp_count,
-                        'durable' if durable else 'non-durable',
-                        path, fi_to_rebuild))
+    def reconstruct_fa(self, job, node, df):
+        """
+        Reconstructs a fragment archive - this method is called from ssync
+        after a remote node responds that is missing this object - the local
+        diskfile is opened to provide metadata - but to reconstruct the
+        missing fragment archive we must connect to multiple object servers.
 
-            raise DiskFileError('Unable to reconstruct EC archive')
+        :param job: job from ssync_sender.
+        :param node: node to which we're rebuilding.
+        :param df: an instance of :class:`~swift.obj.diskfile.BaseDiskFile`.
+        :returns: a DiskFile like class for use by ssync.
+        :raises DiskFileQuarantined: if the fragment archive cannot be
+            reconstructed and has as a result been quarantined.
+        :raises DiskFileError: if the fragment archive cannot be reconstructed.
+        """
+        policy = job['policy']
+        partition = job['partition']
+        # the fragment index we need to reconstruct is the position index
+        # of the node we're rebuilding to within the primary part list
+        fi_to_rebuild = node['backend_index']
+        datafile_metadata = df.get_datafile_metadata()
+        local_timestamp = Timestamp(datafile_metadata['X-Timestamp'])
+        path = datafile_metadata['name']
 
-        rebuilt_fragment_iter = self.make_rebuilt_fragment_iter(
-            responses[:job['policy'].ec_ndata], path, job['policy'],
-            fi_to_rebuild)
-        return RebuildingECDiskFileStream(datafile_metadata, fi_to_rebuild,
-                                          rebuilt_fragment_iter)
+        buckets = defaultdict(ResponseBucket)  # map timestamp -> Bucket
+        error_responses = defaultdict(list)  # map status code -> response list
+
+        # don't try and fetch a fragment from the node we're rebuilding to
+        useful_bucket = self._make_fragment_requests(
+            job, node, df, buckets, error_responses)
+
+        if useful_bucket:
+            frag_indexes = list(useful_bucket.useful_responses.keys())
+            self.logger.debug('Reconstruct frag #%s with frag indexes %s'
+                              % (fi_to_rebuild, frag_indexes))
+            responses = list(useful_bucket.useful_responses.values())
+            rebuilt_fragment_iter = self.make_rebuilt_fragment_iter(
+                responses[:policy.ec_ndata], path, policy, fi_to_rebuild)
+            return RebuildingECDiskFileStream(datafile_metadata, fi_to_rebuild,
+                                              rebuilt_fragment_iter)
+
+        full_path = _full_path(node, partition, path, policy)
+        for timestamp, bucket in sorted(buckets.items()):
+            self.logger.error(
+                'Unable to get enough responses (%s/%s from %s ok responses) '
+                'to reconstruct %s %s frag#%s with ETag %s and timestamp %s' %
+                (len(bucket.useful_responses), policy.ec_ndata,
+                 bucket.num_responses,
+                 'durable' if bucket.durable else 'non-durable',
+                 full_path, fi_to_rebuild, bucket.etag, timestamp.internal))
+
+        if error_responses:
+            durable = buckets[local_timestamp].durable
+            errors = ', '.join(
+                '%s x %s' % (len(responses),
+                             'unknown' if status == UNKNOWN_RESPONSE_STATUS
+                             else status)
+                for status, responses in sorted(error_responses.items()))
+            self.logger.error(
+                'Unable to get enough responses (%s error responses) '
+                'to reconstruct %s %s frag#%s' % (
+                    errors, 'durable' if durable else 'non-durable',
+                    full_path, fi_to_rebuild))
+
+        if self._is_quarantine_candidate(policy, buckets, error_responses, df):
+            raise df._quarantine(
+                df._data_file, "Solitary fragment #%s" % df._frag_index)
+
+        raise DiskFileError('Unable to reconstruct EC archive')
 
     def _reconstruct(self, policy, fragment_payload, frag_index):
         return policy.pyeclib_driver.reconstruct(fragment_payload,
@@ -808,7 +981,14 @@ class ObjectReconstructor(Daemon):
                     job['local_dev']['device'], job['partition'],
                     object_hash, job['policy'],
                     frag_index=frag_index)
-                df.purge(timestamps['ts_data'], frag_index)
+                # legacy durable data files look like modern nondurable data
+                # files; we therefore override nondurable_purge_delay when we
+                # know the data file is durable so that legacy durable data
+                # files get purged
+                nondurable_purge_delay = (0 if timestamps.get('durable')
+                                          else self.nondurable_purge_delay)
+                df.purge(timestamps['ts_data'], frag_index,
+                         nondurable_purge_delay)
             except DiskFileError:
                 self.logger.exception(
                     'Unable to purge DiskFile (%r %r %r)',

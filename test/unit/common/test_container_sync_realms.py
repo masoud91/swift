@@ -20,16 +20,17 @@ import uuid
 
 import six
 
-from mock import patch
+from mock import ANY, patch
 from swift.common.container_sync_realms import ContainerSyncRealms
-from test.unit import FakeLogger, temptree
+from test.debug_logger import debug_logger
+from test.unit import temptree
 
 
 class TestUtils(unittest.TestCase):
 
     def test_no_file_there(self):
         unique = uuid.uuid4().hex
-        logger = FakeLogger()
+        logger = debug_logger()
         csr = ContainerSyncRealms(unique, logger)
         self.assertEqual(
             logger.all_log_lines(),
@@ -43,7 +44,7 @@ class TestUtils(unittest.TestCase):
         fname = 'container-sync-realms.conf'
         fcontents = ''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
 
             def _mock_getmtime(path):
@@ -65,7 +66,7 @@ class TestUtils(unittest.TestCase):
         fname = 'container-sync-realms.conf'
         fcontents = ''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             self.assertEqual(logger.all_log_lines(), {})
@@ -76,7 +77,7 @@ class TestUtils(unittest.TestCase):
         fname = 'container-sync-realms.conf'
         fcontents = 'invalid'
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             if six.PY2:
@@ -103,7 +104,7 @@ key = 9ff3b71c849749dbaec4ccdd3cbab62b
 cluster_dfw1 = http://dfw1.host/v1/
 '''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             self.assertEqual(logger.all_log_lines(), {})
@@ -131,7 +132,7 @@ key2 = f6351bd1cc36413baa43f7ba1b45e51d
 cluster_lon3 = http://lon3.host/v1/
 '''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             self.assertEqual(logger.all_log_lines(), {})
@@ -155,7 +156,7 @@ cluster_lon3 = http://lon3.host/v1/
 [US]
 '''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             self.assertEqual(logger.all_log_lines(), {})
@@ -173,21 +174,23 @@ cluster_lon3 = http://lon3.host/v1/
 mtime_check_interval = invalid
 '''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
-            self.assertEqual(
-                logger.all_log_lines(),
-                {'error': [
-                    "Error in '%s' with mtime_check_interval: invalid literal "
-                    "for int() with base 10: 'invalid'" % fpath]})
+            logs = logger.all_log_lines()
+            self.assertEqual(logs, {'error': [ANY]})
+            line = logs['error'][0]
+            self.assertIn(
+                "Error in '%s' with mtime_check_interval: "
+                "could not convert string to float:" % fpath, line)
+
             self.assertEqual(csr.mtime_check_interval, 300)
 
     def test_get_sig(self):
         fname = 'container-sync-realms.conf'
         fcontents = ''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             self.assertEqual(

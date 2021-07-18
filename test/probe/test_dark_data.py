@@ -60,9 +60,11 @@ class TestDarkDataDeletion(ReplProbeTest):
             config['object-auditor'].update(
                 {'watchers': 'swift#dark_data'})
             # Note that this setdefault business may mean the watcher doesn't
-            # pick up DEFAULT values, but that (probably?) won't matter
+            # pick up DEFAULT values, but that (probably?) won't matter.
+            # We set grace_age to 0 so that tests don't have to deal with time.
             config.setdefault(CONF_SECTION, {}).update(
-                {'action': self.action})
+                {'action': self.action,
+                 'grace_age': "0"})
 
             parser = ConfigParser()
             for section in ('object-auditor', CONF_SECTION):
@@ -173,9 +175,10 @@ class TestDarkDataQuarantining(TestDarkDataDeletion):
             self.assertPathDoesNotExist(file_path)
             # Got quarantined
             parts = file_path.split(os.path.sep)
-            quarantine_dir = parts[:parts.index('objects')] + ['quarantined']
+            policy_dir = get_policy_string('objects', self.policy)
+            quarantine_dir = parts[:parts.index(policy_dir)] + ['quarantined']
             quarantine_path = os.path.sep.join(
-                quarantine_dir + ['objects'] + parts[-2:])
+                quarantine_dir + [policy_dir] + parts[-2:])
             self.assertPathExists(quarantine_path)
 
 

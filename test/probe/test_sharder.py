@@ -40,7 +40,7 @@ from test.probe import PROXY_BASE_URL
 from test.probe.brain import BrainSplitter
 from test.probe.common import ReplProbeTest, get_server_number, \
     wait_for_server_to_hangup
-from test.debug_logger import debug_logger
+import mock
 
 
 MIN_SHARD_CONTAINER_THRESHOLD = 4
@@ -65,8 +65,9 @@ class BaseTestContainerSharding(ReplProbeTest):
 
     def _maybe_skip_test(self):
         try:
-            cont_configs = [utils.readconf(p, 'container-sharder')
-                            for p in self.configs['container-server'].values()]
+            cont_configs = [
+                utils.readconf(p, 'container-sharder')
+                for p in self.configs['container-sharder'].values()]
         except ValueError:
             raise SkipTest('No [container-sharder] section found in '
                            'container-server configs')
@@ -168,13 +169,16 @@ class BaseTestContainerSharding(ReplProbeTest):
             else:
                 conn.delete_object(self.container_name, obj)
 
-    def get_container_shard_ranges(self, account=None, container=None):
+    def get_container_shard_ranges(self, account=None, container=None,
+                                   include_deleted=False):
         account = account if account else self.account
         container = container if container else self.container_to_shard
         path = self.internal_client.make_path(account, container)
+        headers = {'X-Backend-Record-Type': 'shard'}
+        if include_deleted:
+            headers['X-Backend-Include-Deleted'] = 'true'
         resp = self.internal_client.make_request(
-            'GET', path + '?format=json', {'X-Backend-Record-Type': 'shard'},
-            [200])
+            'GET', path + '?format=json', headers, [200])
         return [ShardRange.from_dict(sr) for sr in json.loads(resp.body)]
 
     def direct_get_container_shard_ranges(self, account=None, container=None,
@@ -208,6 +212,13 @@ class BaseTestContainerSharding(ReplProbeTest):
     def get_broker(self, part, node, account=None, container=None):
         return ContainerBroker(
             self.get_db_file(part, node, account, container))
+
+    def get_shard_broker(self, shard_range, node_index=0):
+        shard_part, shard_nodes = self.brain.ring.get_nodes(
+            shard_range.account, shard_range.container)
+        return self.get_broker(
+            shard_part, shard_nodes[node_index], shard_range.account,
+            shard_range.container)
 
     def categorize_container_dir_content(self, account=None, container=None):
         account = account or self.brain.account
@@ -363,6 +374,21 @@ class BaseTestContainerSharding(ReplProbeTest):
             expected_state, headers['X-Backend-Sharding-State'])
         return [ShardRange.from_dict(sr) for sr in shard_ranges]
 
+    def assert_subprocess_success(self, cmd_args):
+        try:
+            subprocess.check_output(cmd_args, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            # why not 'except CalledProcessError'? because in my py3.6 tests
+            # the CalledProcessError wasn't caught by that! despite type(exc)
+            # being a CalledProcessError, isinstance(exc, CalledProcessError)
+            # is False and the type has a different hash - could be
+            # related to https://github.com/eventlet/eventlet/issues/413
+            try:
+                # assume this is a CalledProcessError
+                self.fail('%s with output:\n%s' % (exc, exc.output))
+            except AttributeError:
+                raise exc
+
     def get_part_and_node_numbers(self, shard_range):
         """Return the partition and node numbers for a shard range."""
         part, nodes = self.brain.ring.get_nodes(
@@ -386,6 +412,10 @@ class BaseTestContainerSharding(ReplProbeTest):
         for node_number in node_numbers:
             self.sharders.once(number=node_number,
                                additional_args='--partitions=%s' % part)
+
+    def run_custom_sharder(self, conf_index, custom_conf, **kwargs):
+        return self.run_custom_daemon(ContainerSharder, 'container-sharder',
+                                      conf_index, custom_conf, **kwargs)
 
 
 class TestContainerShardingNonUTF8(BaseTestContainerSharding):
@@ -881,8 +911,10 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_shard_ranges_contiguous(2, orig_root_shard_ranges)
         self.assertEqual([ShardRange.ACTIVE, ShardRange.ACTIVE],
                          [sr['state'] for sr in orig_root_shard_ranges])
-        contexts = list(CleavingContext.load_all(broker))
-        self.assertEqual([], contexts)  # length check
+        # Contexts should still be there, and should be complete
+        contexts = set([ctx.done()
+                        for ctx, _ in CleavingContext.load_all(broker)])
+        self.assertEqual({True}, contexts)
         self.direct_delete_container(expect_failure=True)
 
         self.assertLengthEqual(found['normal_dbs'], 2)
@@ -932,9 +964,10 @@ class TestContainerSharding(BaseTestContainerSharding):
                                         orig['state_timestamp'])
                 self.assertGreaterEqual(updated.meta_timestamp,
                                         orig['meta_timestamp'])
-
-            contexts = list(CleavingContext.load_all(broker))
-            self.assertEqual([], contexts)  # length check
+            # Contexts should still be there, and should be complete
+            contexts = set([ctx.done()
+                            for ctx, _ in CleavingContext.load_all(broker)])
+            self.assertEqual({True}, contexts)
 
         # Check that entire listing is available
         headers, actual_listing = self.assert_container_listing(obj_names)
@@ -1190,9 +1223,11 @@ class TestContainerSharding(BaseTestContainerSharding):
                     [ShardRange.ACTIVE] * 3,
                     [sr.state for sr in broker.get_shard_ranges()])
 
-                # Make sure our cleaving contexts got cleaned up
-                contexts = list(CleavingContext.load_all(broker))
-                self.assertEqual([], contexts)
+                # Contexts should still be there, and should be complete
+                contexts = set([ctx.done()
+                                for ctx, _
+                                in CleavingContext.load_all(broker)])
+                self.assertEqual({True}, contexts)
 
         # check root shard ranges
         root_shard_ranges = self.direct_get_container_shard_ranges()
@@ -1443,14 +1478,32 @@ class TestContainerSharding(BaseTestContainerSharding):
     def test_shrinking(self):
         int_client = self.make_internal_client()
 
-        def check_node_data(node_data, exp_hdrs, exp_obj_count, exp_shards):
+        def check_node_data(node_data, exp_hdrs, exp_obj_count, exp_shards,
+                            exp_sharded_root_range=False):
             hdrs, range_data = node_data
             self.assert_dict_contains(exp_hdrs, hdrs)
-            self.assert_shard_ranges_contiguous(exp_shards, range_data)
-            self.assert_total_object_count(exp_obj_count, range_data)
+            sharded_root_range = False
+            other_range_data = []
+            for data in range_data:
+                sr = ShardRange.from_dict(data)
+                if (sr.account == self.account and
+                        sr.container == self.container_name and
+                        sr.state == ShardRange.SHARDED):
+                    # only expect one root range
+                    self.assertFalse(sharded_root_range, range_data)
+                    sharded_root_range = True
+                    self.assertEqual(ShardRange.MIN, sr.lower, sr)
+                    self.assertEqual(ShardRange.MAX, sr.upper, sr)
+                else:
+                    # include active root range in further assertions
+                    other_range_data.append(data)
+            self.assertEqual(exp_sharded_root_range, sharded_root_range)
+            self.assert_shard_ranges_contiguous(exp_shards, other_range_data)
+            self.assert_total_object_count(exp_obj_count, other_range_data)
 
         def check_shard_nodes_data(node_data, expected_state='unsharded',
-                                   expected_shards=0, exp_obj_count=0):
+                                   expected_shards=0, exp_obj_count=0,
+                                   exp_sharded_root_range=False):
             # checks that shard range is consistent on all nodes
             root_path = '%s/%s' % (self.account, self.container_name)
             exp_shard_hdrs = {
@@ -1462,7 +1515,7 @@ class TestContainerSharding(BaseTestContainerSharding):
                 with annotate_failure('Node id %s.' % node_id):
                     check_node_data(
                         node_data, exp_shard_hdrs, exp_obj_count,
-                        expected_shards)
+                        expected_shards, exp_sharded_root_range)
                 hdrs = node_data[0]
                 object_counts.append(int(hdrs['X-Container-Object-Count']))
                 bytes_used.append(int(hdrs['X-Container-Bytes-Used']))
@@ -1579,6 +1632,7 @@ class TestContainerSharding(BaseTestContainerSharding):
                                     if obj_name > orig_shard_ranges[1].lower]
             self.assert_container_listing(second_shard_objects)
 
+            # put a new object 'alpha' in first shard range
             self.put_objects([alpha])
             second_shard_objects = [obj_name for obj_name in obj_names
                                     if obj_name > orig_shard_ranges[1].lower]
@@ -1623,8 +1677,13 @@ class TestContainerSharding(BaseTestContainerSharding):
                     orig_range_data, range_data,
                     excludes=['meta_timestamp', 'state_timestamp'])
 
-            # ...until the sharders run and update root
-            self.run_sharders(orig_shard_ranges[0])
+            # ...until the sharders run and update root; reclaim tombstones so
+            # that the shard is shrinkable
+            shard_0_part = self.get_part_and_node_numbers(
+                orig_shard_ranges[0])[0]
+            for conf_index in self.configs['container-sharder'].keys():
+                self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                        override_partitions=[shard_0_part])
             exp_obj_count = len(second_shard_objects) + 1
             self.assert_container_object_count(exp_obj_count)
             self.assert_container_listing([alpha] + second_shard_objects)
@@ -1661,10 +1720,13 @@ class TestContainerSharding(BaseTestContainerSharding):
             donor = orig_shard_ranges[0]
             shard_nodes_data = self.direct_get_container_shard_ranges(
                 donor.account, donor.container)
-            # the donor's shard range will have the acceptor's projected stats
+            # the donor's shard range will have the acceptor's projected stats;
+            # donor also has copy of root shard range that will be ignored;
+            # note: expected_shards does not include the sharded root range
             obj_count, bytes_used = check_shard_nodes_data(
                 shard_nodes_data, expected_state='sharded', expected_shards=1,
-                exp_obj_count=len(second_shard_objects) + 1)
+                exp_obj_count=len(second_shard_objects) + 1,
+                exp_sharded_root_range=True)
             # but the donor is empty and so reports zero stats
             self.assertEqual(0, obj_count)
             self.assertEqual(0, bytes_used)
@@ -1686,10 +1748,32 @@ class TestContainerSharding(BaseTestContainerSharding):
 
             self.assert_container_listing([alpha])
 
-            # runs sharders so second range shrinks away, requires up to 3
-            # cycles
-            self.sharders.once()  # shard updates root stats
+            # run sharders: second range should not shrink away yet because it
+            # has tombstones
+            self.sharders.once()  # second shard updates root stats
             self.assert_container_listing([alpha])
+            self.sharders.once()  # root finds shrinkable shard
+            self.assert_container_listing([alpha])
+            self.sharders.once()  # shards shrink themselves
+            self.assert_container_listing([alpha])
+
+            # the acceptor shard is intact...
+            shard_nodes_data = self.direct_get_container_shard_ranges(
+                orig_shard_ranges[1].account, orig_shard_ranges[1].container)
+            obj_count, bytes_used = check_shard_nodes_data(shard_nodes_data)
+            self.assertEqual(1, obj_count)
+
+            # run sharders to reclaim tombstones so that the second shard is
+            # shrinkable
+            shard_1_part = self.get_part_and_node_numbers(
+                orig_shard_ranges[1])[0]
+            for conf_index in self.configs['container-sharder'].keys():
+                self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                        override_partitions=[shard_1_part])
+            self.assert_container_listing([alpha])
+
+            # run sharders so second range shrinks away, requires up to 2
+            # cycles
             self.sharders.once()  # root finds shrinkable shard
             self.assert_container_listing([alpha])
             self.sharders.once()  # shards shrink themselves
@@ -1788,27 +1872,16 @@ class TestContainerSharding(BaseTestContainerSharding):
             conf['reclaim_age'] = 0
             ContainerReplicator(conf).run_once()
 
-        logger = debug_logger('probe')
-
-        # not sure why this doesn't work like replicators?
-        self.assertFalse(self.configs['container-sharder'].values())
-        sharder_conf_files = []
-        for server in Manager(['container-sharder']):
-            sharder_conf_files.extend(server.conf_files())
         # we don't expect warnings from sharder root audits
-        for conf_file in sharder_conf_files:
-            conf = utils.readconf(conf_file, 'container-sharder')
-            ContainerSharder(conf, logger=logger).run_once()
-            self.assertEqual([], logger.get_lines_for_level('warning'))
+        for conf_index in self.configs['container-sharder'].keys():
+            sharder = self.run_custom_sharder(conf_index, {})
+            self.assertEqual([], sharder.logger.get_lines_for_level('warning'))
 
         # until the root wants to start reclaiming but we haven't shrunk yet!
         found_warning = False
-        for conf_file in sharder_conf_files:
-            conf = utils.readconf(conf_file, 'container-sharder')
-            logger = debug_logger('probe')
-            conf['reclaim_age'] = 0
-            ContainerSharder(conf, logger=logger).run_once()
-            warnings = logger.get_lines_for_level('warning')
+        for conf_index in self.configs['container-sharder'].keys():
+            sharder = self.run_custom_sharder(conf_index, {'reclaim_age': 0})
+            warnings = sharder.logger.get_lines_for_level('warning')
             if warnings:
                 self.assertTrue(warnings[0].startswith(
                     'Reclaimable db stuck waiting for shrinking'))
@@ -1993,6 +2066,26 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assertEqual([ShardRange.CLEAVED] * 2 + [ShardRange.CREATED] * 2,
                          [sr.state for sr in shard_ranges])
 
+        # Check the current progress. It shouldn't be complete.
+        recon = direct_client.direct_get_recon(leader_node, "sharding")
+        expected_in_progress = {'all': [{'account': 'AUTH_test',
+                                         'active': 0,
+                                         'cleaved': 2,
+                                         'created': 2,
+                                         'found': 0,
+                                         'db_state': 'sharding',
+                                         'state': 'sharding',
+                                         'error': None,
+                                         'file_size': mock.ANY,
+                                         'meta_timestamp': mock.ANY,
+                                         'node_index': 0,
+                                         'object_count': len(obj_names),
+                                         'container': mock.ANY,
+                                         'path': mock.ANY,
+                                         'root': mock.ANY}]}
+        actual = recon['sharding_stats']['sharding']['sharding_in_progress']
+        self.assertEqual(expected_in_progress, actual)
+
         # stop *all* container servers for third shard range
         sr_part, sr_node_nums = self.get_part_and_node_numbers(shard_ranges[2])
         for node_num in sr_node_nums:
@@ -2049,6 +2142,26 @@ class TestContainerSharding(BaseTestContainerSharding):
         shard_ranges = self.assert_container_state(leader_node, 'sharded', 4)
         self.assertEqual([ShardRange.ACTIVE] * 4,
                          [sr.state for sr in shard_ranges])
+
+        # Check the leader's progress again, this time is should be complete
+        recon = direct_client.direct_get_recon(leader_node, "sharding")
+        expected_in_progress = {'all': [{'account': 'AUTH_test',
+                                         'active': 4,
+                                         'cleaved': 0,
+                                         'created': 0,
+                                         'found': 0,
+                                         'db_state': 'sharded',
+                                         'state': 'sharded',
+                                         'error': None,
+                                         'file_size': mock.ANY,
+                                         'meta_timestamp': mock.ANY,
+                                         'node_index': 0,
+                                         'object_count': len(obj_names),
+                                         'container': mock.ANY,
+                                         'path': mock.ANY,
+                                         'root': mock.ANY}]}
+        actual = recon['sharding_stats']['sharding']['sharding_in_progress']
+        self.assertEqual(expected_in_progress, actual)
 
     def test_sharded_delete(self):
         all_obj_names = self._make_object_names(self.max_shard_size)
@@ -2124,10 +2237,15 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing([])
         self.assert_container_post_ok('has objects')
 
-        # run sharder on shard containers to update root stats
+        # run sharder on shard containers to update root stats; reclaim
+        # the tombstones so that the shards appear to be shrinkable
         shard_ranges = self.get_container_shard_ranges()
         self.assertLengthEqual(shard_ranges, 2)
-        self.run_sharders(shard_ranges)
+        shard_partitions = [self.get_part_and_node_numbers(sr)[0]
+                            for sr in shard_ranges]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=shard_partitions)
         self.assert_container_object_count(0)
 
         # First, test a misplaced object moving from one shard to another.
@@ -2258,8 +2376,12 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing(shard_1_objects)
         self.assert_container_post_ok('has objects')
 
-        # run sharder on first shard container to update root stats
-        self.run_sharders(shard_ranges[0])
+        # run sharder on first shard container to update root stats; reclaim
+        # the tombstones so that the shard appears to be shrinkable
+        shard_0_part = self.get_part_and_node_numbers(shard_ranges[0])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_0_part])
         self.assert_container_object_count(len(shard_1_objects))
 
         # First, test a misplaced object moving from one shard to another.
@@ -2293,10 +2415,13 @@ class TestContainerSharding(BaseTestContainerSharding):
 
         # Now we have just one active shard, test a misplaced object moving
         # from that shard to the root.
-        # delete most objects from second shard range and run sharder on root
-        # to discover second shrink candidate
+        # delete most objects from second shard range, reclaim the tombstones,
+        # and run sharder on root to discover second shrink candidate
         self.delete_objects(shard_1_objects)
-        self.run_sharders(shard_ranges[1])
+        shard_1_part = self.get_part_and_node_numbers(shard_ranges[1])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_1_part])
         self.sharders.once(additional_args='--partitions=%s' % self.brain.part)
         # then run sharder on the shard node to shrink it to root - note this
         # moves alpha to the root db
@@ -2318,6 +2443,96 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing(['beta'])
         self.assert_container_object_count(1)
         self.assert_container_delete_fails()
+
+    def test_misplaced_object_movement_from_deleted_shard(self):
+        def merge_object(shard_range, name, deleted=0):
+            # it's hard to get a test to put a misplaced object into a shard,
+            # so this hack is used force an object record directly into a shard
+            # container db. Note: the actual object won't exist, we're just
+            # using this to test object records in container dbs.
+            shard_part, shard_nodes = self.brain.ring.get_nodes(
+                shard_range.account, shard_range.container)
+            shard_broker = self.get_shard_broker(shard_range)
+            # In this test we want to merge into a deleted container shard
+            shard_broker.delete_db(Timestamp.now().internal)
+            shard_broker.merge_items(
+                [{'name': name, 'created_at': Timestamp.now().internal,
+                  'size': 0, 'content_type': 'text/plain',
+                  'etag': md5(usedforsecurity=False).hexdigest(),
+                  'deleted': deleted,
+                  'storage_policy_index': shard_broker.storage_policy_index}])
+            return shard_nodes[0]
+
+        all_obj_names = self._make_object_names(self.max_shard_size)
+        self.put_objects(all_obj_names)
+        # Shard the container
+        client.post_container(self.url, self.admin_token, self.container_name,
+                              headers={'X-Container-Sharding': 'on'})
+        for n in self.brain.node_numbers:
+            self.sharders.once(
+                number=n, additional_args='--partitions=%s' % self.brain.part)
+        # sanity checks
+        for node in self.brain.nodes:
+            self.assert_container_state(node, 'sharded', 2)
+        self.assert_container_delete_fails()
+        self.assert_container_has_shard_sysmeta()
+        self.assert_container_post_ok('sharded')
+        self.assert_container_listing(all_obj_names)
+
+        # delete all objects in first shard range - updates redirected to shard
+        shard_ranges = self.get_container_shard_ranges()
+        self.assertLengthEqual(shard_ranges, 2)
+        shard_0_objects = [name for name in all_obj_names
+                           if name in shard_ranges[0]]
+        shard_1_objects = [name for name in all_obj_names
+                           if name in shard_ranges[1]]
+        self.delete_objects(shard_0_objects)
+        self.assert_container_listing(shard_1_objects)
+        self.assert_container_post_ok('has objects')
+
+        # run sharder on first shard container to update root stats
+        shard_0_part = self.get_part_and_node_numbers(shard_ranges[0])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_0_part])
+        self.assert_container_object_count(len(shard_1_objects))
+
+        # First, test a misplaced object moving from one shard to another.
+        # run sharder on root to discover first shrink candidate
+        self.sharders.once(additional_args='--partitions=%s' % self.brain.part)
+        # then run sharder on first shard range to shrink it
+        self.run_sharders(shard_ranges[0])
+        # force a misplaced object into the shrunken shard range to simulate
+        # a client put that was in flight when it started to shrink
+        misplaced_node = merge_object(shard_ranges[0], 'alpha', deleted=0)
+        # root sees first shard has shrunk, only second shard range used for
+        # listing so alpha object not in listing
+        self.assertLengthEqual(self.get_container_shard_ranges(), 1)
+        self.assert_container_listing(shard_1_objects)
+        self.assert_container_object_count(len(shard_1_objects))
+        # until sharder runs on that node to move the misplaced object to the
+        # second shard range
+        shard_part, shard_nodes_numbers = self.get_part_and_node_numbers(
+            shard_ranges[0])
+        self.sharders.once(additional_args='--partitions=%s' % shard_part,
+                           number=misplaced_node['id'] + 1)
+        self.assert_container_listing(['alpha'] + shard_1_objects)
+        # root not yet updated
+        self.assert_container_object_count(len(shard_1_objects))
+
+        # check the deleted shard did not push the wrong root path into the
+        # other container
+        for replica in 0, 1, 2:
+            shard_x_broker = self.get_shard_broker(shard_ranges[1], replica)
+            self.assertEqual("%s/%s" % (self.account, self.container_name),
+                             shard_x_broker.root_path)
+
+        # run the sharder of the existing shard to update the root stats
+        # to prove the misplaced object was moved to the other shard _and_
+        # the other shard still has the correct root because it updates root's
+        # stats
+        self.run_sharders(shard_ranges[1])
+        self.assert_container_object_count(len(shard_1_objects) + 1)
 
     def test_replication_to_sharded_container_from_unsharded_old_primary(self):
         primary_ids = [n['id'] for n in self.brain.nodes]
@@ -2574,7 +2789,7 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         self.sharders.once(**kwargs)
 
     def test_manage_shard_ranges(self):
-        obj_names = self._make_object_names(4)
+        obj_names = self._make_object_names(7)
         self.put_objects(obj_names)
 
         client.post_container(self.url, self.admin_token, self.container_name,
@@ -2589,10 +2804,10 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
                            additional_args='--partitions=%s' % self.brain.part)
         self.assert_container_state(self.brain.nodes[0], 'unsharded', 0)
 
-        subprocess.check_output([
+        self.assert_subprocess_success([
             'swift-manage-shard-ranges',
             self.get_db_file(self.brain.part, self.brain.nodes[0]),
-            'find_and_replace', '2', '--enable'], stderr=subprocess.STDOUT)
+            'find_and_replace', '3', '--enable', '--minimum-shard-size', '2'])
         self.assert_container_state(self.brain.nodes[0], 'unsharded', 2)
 
         # "Run container-replicator to replicate them to other nodes."
@@ -2606,8 +2821,81 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         self.assert_container_state(self.brain.nodes[2], 'sharded', 2)
         self.assert_container_listing(obj_names)
 
-    def test_manage_shard_ranges_used_poorly(self):
+    def test_manage_shard_ranges_compact(self):
+        # verify shard range compaction using swift-manage-shard-ranges
         obj_names = self._make_object_names(8)
+        self.put_objects(obj_names)
+        client.post_container(self.url, self.admin_token, self.container_name,
+                              headers={'X-Container-Sharding': 'on'})
+        # run replicators first time to get sync points set, and get container
+        # sharded into 4 shards
+        self.replicators.once()
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_db_file(self.brain.part, self.brain.nodes[0]),
+            'find_and_replace', '2', '--enable'])
+        self.assert_container_state(self.brain.nodes[0], 'unsharded', 4)
+        self.replicators.once()
+        # run sharders twice to cleave all 4 shard ranges
+        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.assert_container_state(self.brain.nodes[0], 'sharded', 4)
+        self.assert_container_state(self.brain.nodes[1], 'sharded', 4)
+        self.assert_container_state(self.brain.nodes[2], 'sharded', 4)
+        self.assert_container_listing(obj_names)
+
+        # now compact some ranges; use --max-shrinking to allow 2 shrinking
+        # shards
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_db_file(self.brain.part, self.brain.nodes[0]),
+            'compact', '--max-expanding', '1', '--max-shrinking', '2',
+            '--yes'])
+        shard_ranges = self.assert_container_state(
+            self.brain.nodes[0], 'sharded', 4)
+        self.assertEqual([ShardRange.SHRINKING] * 2 + [ShardRange.ACTIVE] * 2,
+                         [sr.state for sr in shard_ranges])
+        self.replicators.once()
+        self.sharders_once()
+        # check there's now just 2 remaining shard ranges
+        shard_ranges = self.assert_container_state(
+            self.brain.nodes[0], 'sharded', 2)
+        self.assertEqual([ShardRange.ACTIVE] * 2,
+                         [sr.state for sr in shard_ranges])
+        self.assert_container_listing(obj_names, req_hdrs={'X-Newest': 'True'})
+
+        # root container own shard range should still be SHARDED
+        for i, node in enumerate(self.brain.nodes):
+            with annotate_failure('node[%d]' % i):
+                broker = self.get_broker(self.brain.part, self.brain.nodes[0])
+                self.assertEqual(ShardRange.SHARDED,
+                                 broker.get_own_shard_range().state)
+
+        # now compact the final two shard ranges to the root; use
+        # --max-shrinking to allow 2 shrinking shards
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_db_file(self.brain.part, self.brain.nodes[0]),
+            'compact', '--yes', '--max-shrinking', '2'])
+        shard_ranges = self.assert_container_state(
+            self.brain.nodes[0], 'sharded', 2)
+        self.assertEqual([ShardRange.SHRINKING] * 2,
+                         [sr.state for sr in shard_ranges])
+        self.replicators.once()
+        self.sharders_once()
+        self.assert_container_state(self.brain.nodes[0], 'collapsed', 0)
+        self.assert_container_listing(obj_names, req_hdrs={'X-Newest': 'True'})
+
+        # root container own shard range should now be ACTIVE
+        for i, node in enumerate(self.brain.nodes):
+            with annotate_failure('node[%d]' % i):
+                broker = self.get_broker(self.brain.part, self.brain.nodes[0])
+                self.assertEqual(ShardRange.ACTIVE,
+                                 broker.get_own_shard_range().state)
+
+    def test_manage_shard_ranges_repair_root(self):
+        # provoke overlaps in root container and repair
+        obj_names = self._make_object_names(16)
         self.put_objects(obj_names)
 
         client.post_container(self.url, self.admin_token, self.container_name,
@@ -2618,38 +2906,39 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
 
         # find 4 shard ranges on nodes[0] - let's denote these ranges 0.0, 0.1,
         # 0.2 and 0.3 that are installed with epoch_0
-        subprocess.check_output([
+        self.assert_subprocess_success([
             'swift-manage-shard-ranges',
             self.get_db_file(self.brain.part, self.brain.nodes[0]),
-            'find_and_replace', '2', '--enable'], stderr=subprocess.STDOUT)
+            'find_and_replace', '4', '--enable'])
         shard_ranges_0 = self.assert_container_state(self.brain.nodes[0],
                                                      'unsharded', 4)
 
         # *Also* go find 3 shard ranges on *another node*, like a dumb-dumb -
         # let's denote these ranges 1.0, 1.1 and 1.2 that are installed with
         # epoch_1
-        subprocess.check_output([
+        self.assert_subprocess_success([
             'swift-manage-shard-ranges',
             self.get_db_file(self.brain.part, self.brain.nodes[1]),
-            'find_and_replace', '3', '--enable'], stderr=subprocess.STDOUT)
+            'find_and_replace', '7', '--enable'])
         shard_ranges_1 = self.assert_container_state(self.brain.nodes[1],
                                                      'unsharded', 3)
 
         # Run sharder in specific order so that the replica with the older
         # epoch_0 starts sharding first - this will prove problematic later!
         # On first pass the first replica passes audit, creates shards and then
-        # syncs shard ranges with the other replicas. It proceeds to cleave
-        # shard 0.0, but after 0.0 cleaving stalls because it will now have
-        # shard range 1.0 in 'found' state from the other replica that it
-        # cannot yet cleave.
+        # syncs shard ranges with the other replicas, so it has a mix of 0.*
+        # shard ranges in CLEAVED state and 1.* ranges in FOUND state. It
+        # proceeds to cleave shard 0.0, but after 0.0 cleaving stalls because
+        # next in iteration is shard range 1.0 in FOUND state from the other
+        # replica that it cannot yet cleave.
         self.sharders_once(number=self.brain.node_numbers[0],
                            additional_args='--partitions=%s' % self.brain.part)
 
         # On first pass the second replica passes audit (it has its own found
-        # ranges and the first replicas created shard ranges but none in the
+        # ranges and the first replica's created shard ranges but none in the
         # same state overlap), creates its shards and then syncs shard ranges
         # with the other replicas. All of the 7 shard ranges on this replica
-        # are now in created state so it proceeds to cleave the first two shard
+        # are now in CREATED state so it proceeds to cleave the first two shard
         # ranges, 0.1 and 1.0.
         self.sharders_once(number=self.brain.node_numbers[1],
                            additional_args='--partitions=%s' % self.brain.part)
@@ -2671,32 +2960,53 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # possibly cleaved during first pass before the sharding got stalled
         shard_ranges = self.assert_container_state(self.brain.nodes[0],
                                                    'sharding', 7)
-        for sr in shard_ranges:
-            self.assertIn(sr.state, (ShardRange.CREATED, ShardRange.CLEAVED))
+        self.assertEqual([ShardRange.CLEAVED] * 2 + [ShardRange.CREATED] * 5,
+                         [sr.state for sr in shard_ranges])
         shard_ranges = self.assert_container_state(self.brain.nodes[1],
                                                    'sharding', 7)
-        for sr in shard_ranges:
-            self.assertIn(sr.state, (ShardRange.CREATED, ShardRange.CLEAVED))
-
+        self.assertEqual([ShardRange.CLEAVED] * 2 + [ShardRange.CREATED] * 5,
+                         [sr.state for sr in shard_ranges])
         # But hey, at least listings still work! They're just going to get
         # horribly out of date as more objects are added
         self.assert_container_listing(obj_names)
 
-        # Let's pretend that some actor in the system has determined that the
-        # second set of 3 shard ranges (1.*) are correct and the first set of 4
-        # (0.*) are not desired, so shrink shard ranges 0.*. We've already
-        # checked they are in cleaved or created state so it's ok to move them
-        # to shrinking.
-        # TODO: replace this db manipulation if/when manage_shard_ranges can
-        # manage shrinking...
-        for sr in shard_ranges_0:
-            self.assertTrue(sr.update_state(ShardRange.SHRINKING))
-            sr.epoch = sr.state_timestamp = Timestamp.now()
-        broker = self.get_broker(self.brain.part, self.brain.nodes[0])
-        broker.merge_shard_ranges(shard_ranges_0)
+        # 'swift-manage-shard-ranges repair' will choose the second set of 3
+        # shard ranges (1.*) over the first set of 4 (0.*) because that's the
+        # path with most cleaving progress, and so shrink shard ranges 0.*.
+        db_file = self.get_db_file(self.brain.part, self.brain.nodes[0])
+        self.assert_subprocess_success(
+            ['swift-manage-shard-ranges', db_file, 'repair', '--yes'])
 
         # make sure all root replicas now sync their shard ranges
         self.replicators.once()
+        # Run sharder on the shrinking shards. This should not change the state
+        # of any of the acceptors, particularly the ones that have yet to have
+        # object cleaved from the roots, because we don't want the as yet
+        # uncleaved acceptors becoming prematurely active and creating 'holes'
+        # in listings. The shrinking shard ranges should however get deleted in
+        # root container table.
+        self.run_sharders(shard_ranges_0)
+
+        shard_ranges = self.assert_container_state(self.brain.nodes[1],
+                                                   'sharding', 3)
+        self.assertEqual([ShardRange.CLEAVED] * 1 + [ShardRange.CREATED] * 2,
+                         [sr.state for sr in shard_ranges])
+        self.assert_container_listing(obj_names)
+        # check the unwanted shards did shrink away...
+        for shard_range in shard_ranges_0:
+            with annotate_failure(shard_range):
+                found_for_shard = self.categorize_container_dir_content(
+                    shard_range.account, shard_range.container)
+                self.assertLengthEqual(found_for_shard['shard_dbs'], 3)
+                actual = []
+                for shard_db in found_for_shard['shard_dbs']:
+                    broker = ContainerBroker(shard_db)
+                    own_sr = broker.get_own_shard_range()
+                    actual.append(
+                        (broker.get_db_state(), own_sr.state, own_sr.deleted))
+                self.assertEqual([(SHARDED, ShardRange.SHRUNK, True)] * 3,
+                                 actual)
+
         # At this point one of the first two replicas may have done some useful
         # cleaving of 1.* shards, the other may have only cleaved 0.* shards,
         # and the third replica may have cleaved no shards. We therefore need
@@ -2708,8 +3018,12 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # now we expect all replicas to have just the three 1.* shards, with
         # the 0.* shards all deleted
         brokers = {}
-        orig_shard_ranges = sorted(shard_ranges_0 + shard_ranges_1,
-                                   key=ShardRange.sort_key)
+        exp_shard_ranges = sorted(
+            [sr.copy(state=ShardRange.SHRUNK, deleted=True)
+             for sr in shard_ranges_0] +
+            [sr.copy(state=ShardRange.ACTIVE)
+             for sr in shard_ranges_1],
+            key=ShardRange.sort_key)
         for node in (0, 1, 2):
             with annotate_failure('node %s' % node):
                 broker = self.get_broker(self.brain.part,
@@ -2718,12 +3032,14 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
                 shard_ranges = broker.get_shard_ranges()
                 self.assertEqual(shard_ranges_1, shard_ranges)
                 shard_ranges = broker.get_shard_ranges(include_deleted=True)
-                self.assertLengthEqual(shard_ranges, len(orig_shard_ranges))
-                self.assertEqual(orig_shard_ranges, shard_ranges)
+                self.assertLengthEqual(shard_ranges, len(exp_shard_ranges))
+                self.maxDiff = None
+                self.assertEqual(exp_shard_ranges, shard_ranges)
                 self.assertEqual(ShardRange.SHARDED,
                                  broker._own_shard_range().state)
-        # Sadly, the first replica to start sharding us still reporting its db
-        # state to be 'unsharded' because, although it has sharded, it's shard
+
+        # Sadly, the first replica to start sharding is still reporting its db
+        # state to be 'unsharded' because, although it has sharded, its shard
         # db epoch (epoch_0) does not match its own shard range epoch
         # (epoch_1), and that is because the second replica (with epoch_1)
         # updated the own shard range and replicated it to all other replicas.
@@ -2740,21 +3056,6 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # not return shard ranges for listings, but has no objects, so it's
         # luck of the draw whether we get a listing or not at this point :(
 
-        # check the unwanted shards did shrink away...
-        for shard_range in shard_ranges_0:
-            with annotate_failure(shard_range):
-                found_for_shard = self.categorize_container_dir_content(
-                    shard_range.account, shard_range.container)
-                self.assertLengthEqual(found_for_shard['shard_dbs'], 3)
-                actual = []
-                for shard_db in found_for_shard['shard_dbs']:
-                    broker = ContainerBroker(shard_db)
-                    own_sr = broker.get_own_shard_range()
-                    actual.append(
-                        (broker.get_db_state(), own_sr.state, own_sr.deleted))
-                self.assertEqual([(SHARDED, ShardRange.SHRUNK, True)] * 3,
-                                 actual)
-
         # Run the sharders again: the first replica that is still 'unsharded'
         # because of the older epoch_0 in its db filename will now start to
         # shard again with a newer epoch_1 db, and will start to re-cleave the
@@ -2768,8 +3069,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
                 shard_ranges = broker.get_shard_ranges()
                 self.assertEqual(shard_ranges_1, shard_ranges)
                 shard_ranges = broker.get_shard_ranges(include_deleted=True)
-                self.assertLengthEqual(shard_ranges, len(orig_shard_ranges))
-                self.assertEqual(orig_shard_ranges, shard_ranges)
+                self.assertLengthEqual(shard_ranges, len(exp_shard_ranges))
+                self.assertEqual(exp_shard_ranges, shard_ranges)
                 self.assertEqual(ShardRange.SHARDED,
                                  broker._own_shard_range().state)
                 self.assertEqual(epoch_1, broker.db_epoch)
@@ -2812,8 +3113,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
                 shard_ranges = broker.get_shard_ranges()
                 self.assertEqual(shard_ranges_1, shard_ranges)
                 shard_ranges = broker.get_shard_ranges(include_deleted=True)
-                self.assertLengthEqual(shard_ranges, len(orig_shard_ranges))
-                self.assertEqual(orig_shard_ranges, shard_ranges)
+                self.assertLengthEqual(shard_ranges, len(exp_shard_ranges))
+                self.assertEqual(exp_shard_ranges, shard_ranges)
                 self.assertEqual(ShardRange.SHARDED,
                                  broker._own_shard_range().state)
                 self.assertEqual(epoch_1, broker.db_epoch)
@@ -2822,3 +3123,137 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # Finally, with all root replicas in a consistent state, the listing
         # will be be predictably correct
         self.assert_container_listing(obj_names)
+
+    def test_manage_shard_ranges_repair_shard(self):
+        # provoke overlaps in a shard container and repair them
+        obj_names = self._make_object_names(24)
+        initial_obj_names = obj_names[::2]
+        # put 12 objects in container
+        self.put_objects(initial_obj_names)
+        client.post_container(self.url, self.admin_token, self.container_name,
+                              headers={'X-Container-Sharding': 'on'})
+        # run replicators first time to get sync points set
+        self.replicators.once()
+        # find 3 shard ranges on root nodes[0] and get the root sharded
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_db_file(self.brain.part, self.brain.nodes[0]),
+            'find_and_replace', '4', '--enable'])
+        self.replicators.once()
+        # cleave first two shards
+        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        # cleave third shard
+        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        # ensure all shards learn their ACTIVE state from root
+        self.sharders_once()
+        for node in (0, 1, 2):
+            with annotate_failure('node %d' % node):
+                shard_ranges = self.assert_container_state(
+                    self.brain.nodes[node], 'sharded', 3)
+                for sr in shard_ranges:
+                    self.assertEqual(ShardRange.ACTIVE, sr.state)
+        self.assert_container_listing(initial_obj_names)
+
+        # add objects to second shard range so it has 8 objects ; this range
+        # has bounds (obj-0006,obj-0014]
+        root_shard_ranges = self.get_container_shard_ranges()
+        self.assertEqual(3, len(root_shard_ranges))
+        shard_1 = root_shard_ranges[1]
+        self.assertEqual(obj_names[6], shard_1.lower)
+        self.assertEqual(obj_names[14], shard_1.upper)
+        more_obj_names = obj_names[7:15:2]
+        self.put_objects(more_obj_names)
+        expected_obj_names = sorted(initial_obj_names + more_obj_names)
+        self.assert_container_listing(expected_obj_names)
+
+        shard_1_part, shard_1_nodes = self.brain.ring.get_nodes(
+            shard_1.account, shard_1.container)
+
+        # find 3 sub-shards on one shard node; use --force-commits to ensure
+        # the recently PUT objects are included when finding the shard range
+        # pivot points
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges', '--force-commits',
+            self.get_db_file(shard_1_part, shard_1_nodes[1], shard_1.account,
+                             shard_1.container),
+            'find_and_replace', '3', '--enable'])
+        # ... and mistakenly find 4 shard ranges on a different shard node :(
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges', '--force-commits',
+            self.get_db_file(shard_1_part, shard_1_nodes[2], shard_1.account,
+                             shard_1.container),
+            'find_and_replace', '2', '--enable'])
+        # replicate the muddle of shard ranges between shard replicas, merged
+        # result is:
+        # '' - 6  shard     ACTIVE
+        #  6 - 8  sub-shard FOUND
+        #  6 - 9  sub-shard FOUND
+        #  8 - 10 sub-shard FOUND
+        #  9 - 12 sub-shard FOUND
+        # 10 - 12 sub-shard FOUND
+        # 12 - 14 sub-shard FOUND
+        # 12 - 14 sub-shard FOUND
+        #  6 - 14 shard     SHARDING
+        # 14 - '' shard     ACTIVE
+        self.replicators.once()
+
+        # try hard to shard the shard...
+        self.sharders_once(additional_args='--partitions=%s' % shard_1_part)
+        self.sharders_once(additional_args='--partitions=%s' % shard_1_part)
+        self.sharders_once(additional_args='--partitions=%s' % shard_1_part)
+        # sharding hasn't completed and there's overlaps in the shard and root:
+        # the sub-shards will have been cleaved in the order listed above, but
+        # sub-shards (10 -12) and one of (12 - 14) will be overlooked because
+        # the cleave cursor will have moved past their namespace before they
+        # were yielded by the shard range iterator, so we now have:
+        # '' - 6  shard     ACTIVE
+        #  6 - 8  sub-shard ACTIVE
+        #  6 - 9  sub-shard ACTIVE
+        #  8 - 10 sub-shard ACTIVE
+        # 10 - 12 sub-shard CREATED
+        #  9 - 12 sub-shard ACTIVE
+        # 12 - 14 sub-shard CREATED
+        # 12 - 14 sub-shard ACTIVE
+        # 14 - '' shard     ACTIVE
+        sub_shard_ranges = self.get_container_shard_ranges(
+            shard_1.account, shard_1.container)
+        self.assertEqual(7, len(sub_shard_ranges), sub_shard_ranges)
+        root_shard_ranges = self.get_container_shard_ranges()
+        self.assertEqual(9, len(root_shard_ranges), root_shard_ranges)
+        self.assertEqual([ShardRange.ACTIVE] * 4 +
+                         [ShardRange.CREATED, ShardRange.ACTIVE] * 2 +
+                         [ShardRange.ACTIVE],
+                         [sr.state for sr in root_shard_ranges])
+
+        # fix the overlaps - a set of 3 ACTIVE sub-shards will be chosen and 4
+        # other sub-shards will be shrunk away; apply the fix at the root
+        # container
+        db_file = self.get_db_file(self.brain.part, self.brain.nodes[0])
+        self.assert_subprocess_success(
+            ['swift-manage-shard-ranges', db_file, 'repair', '--yes'])
+        self.replicators.once()
+        self.sharders_once()
+        self.sharders_once()
+
+        # check root now has just 5 shard ranges
+        root_shard_ranges = self.get_container_shard_ranges()
+        self.assertEqual(5, len(root_shard_ranges), root_shard_ranges)
+        self.assertEqual([ShardRange.ACTIVE] * 5,
+                         [sr.state for sr in root_shard_ranges])
+        # check there are 1 sharded shard and 4 shrunk sub-shard ranges in the
+        # root (note, shard_1's shard ranges aren't updated once it has sharded
+        # because the sub-shards report their state to the root; we cannot make
+        # assertions about shrunk states in shard_1's shard range table)
+        root_shard_ranges = self.get_container_shard_ranges(
+            include_deleted=True)
+        self.assertEqual(10, len(root_shard_ranges), root_shard_ranges)
+        shrunk_shard_ranges = [sr for sr in root_shard_ranges
+                               if sr.state == ShardRange.SHRUNK]
+        self.assertEqual(4, len(shrunk_shard_ranges), root_shard_ranges)
+        self.assertEqual([True] * 4,
+                         [sr.deleted for sr in shrunk_shard_ranges])
+        sharded_shard_ranges = [sr for sr in root_shard_ranges
+                                if sr.state == ShardRange.SHARDED]
+        self.assertEqual(1, len(sharded_shard_ranges), root_shard_ranges)
+
+        self.assert_container_listing(expected_obj_names)

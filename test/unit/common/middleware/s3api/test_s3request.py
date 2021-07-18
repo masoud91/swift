@@ -35,7 +35,7 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, BadDigest
 from swift.common.utils import md5
 
-from test.unit import DebugLogger
+from test.debug_logger import debug_logger
 
 Fake_ACL_MAP = {
     # HEAD Bucket
@@ -110,7 +110,7 @@ class TestRequest(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         s3_req = req_klass(req.environ, conf=self.s3api.conf)
         s3_req.set_acl_handler(
-            get_acl_handler(s3_req.controller_name)(s3_req, DebugLogger()))
+            get_acl_handler(s3_req.controller_name)(s3_req, debug_logger()))
         with patch('swift.common.middleware.s3api.s3request.S3Request.'
                    '_get_response') as mock_get_resp, \
                 patch('swift.common.middleware.s3api.subresource.ACL.'
@@ -396,8 +396,10 @@ class TestRequest(S3ApiTestCase):
 
         if 'X-Amz-Date' in date_header:
             included_header = 'x-amz-date'
+            scope_date = date_header['X-Amz-Date'].split('T', 1)[0]
         elif 'Date' in date_header:
             included_header = 'date'
+            scope_date = self.get_v4_amz_date_header().split('T', 1)[0]
         else:
             self.fail('Invalid date header specified as test')
 
@@ -407,7 +409,7 @@ class TestRequest(S3ApiTestCase):
                 'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=%s,'
                 'Signature=X' % (
-                    self.get_v4_amz_date_header().split('T', 1)[0],
+                    scope_date,
                     ';'.join(sorted(['host', included_header]))),
             'X-Amz-Content-SHA256': '0123456789'}
 

@@ -16,7 +16,7 @@
 import os
 
 from errno import EEXIST
-from shutil import copyfile
+from shutil import copyfile, move
 from tempfile import mkstemp
 from time import time
 from unittest import main
@@ -24,10 +24,10 @@ from uuid import uuid4
 
 from swiftclient import client
 
-from swift.cli.relinker import relink, cleanup
-from swift.common.manager import Manager
+from swift.cli.relinker import main as relinker_main
+from swift.common.manager import Manager, Server
 from swift.common.ring import RingBuilder
-from swift.common.utils import replace_partition_in_path
+from swift.common.utils import replace_partition_in_path, readconf
 from swift.obj.diskfile import get_data_dir
 from test.probe.common import ECProbeTest, ProbeTest, ReplProbeTest
 
@@ -49,10 +49,9 @@ class TestPartPowerIncrease(ProbeTest):
         # Ensure the test object will be erasure coded
         self.data = ' ' * getattr(self.policy, 'ec_segment_size', 1)
 
-        self.devices = [
-            self.device_dir({'ip': ip, 'port': port, 'device': ''})
-            for ip, port in {(dev['ip'], dev['port'])
-                             for dev in self.object_ring.devs}]
+        self.conf_files = Server('object').conf_files()
+        self.devices = [readconf(conf_file)['app:object-server']['devices']
+                        for conf_file in self.conf_files]
 
     def tearDown(self):
         # Keep a backup copy of the modified .builder file
@@ -69,10 +68,8 @@ class TestPartPowerIncrease(ProbeTest):
         copyfile(self.builder_file, backup_name)
 
         # Restore original ring
-        os.system('sudo mv %s %s' % (
-            self.ring_file_backup, self.ring_file))
-        os.system('sudo mv %s %s' % (
-            self.builder_file_backup, self.builder_file))
+        move(self.ring_file_backup, self.ring_file)
+        move(self.builder_file_backup, self.builder_file)
 
     def _find_objs_ondisk(self, container, obj):
         locations = []
@@ -116,8 +113,8 @@ class TestPartPowerIncrease(ProbeTest):
         client.head_object(self.url, self.token, container, obj)
 
         # Relink existing objects
-        for device in self.devices:
-            self.assertEqual(0, relink(skip_mount_check=True, devices=device))
+        for conf in self.conf_files:
+            self.assertEqual(0, relinker_main(['relink', conf]))
 
         # Create second object after relinking and ensure it is accessible
         client.put_object(self.url, self.token, container, obj2, self.data)
@@ -130,8 +127,13 @@ class TestPartPowerIncrease(ProbeTest):
         # Remember the new object locations
         new_locations = []
         for loc in org_locations:
+            for dev_root in self.devices:
+                if loc.startswith(dev_root):
+                    break
+            else:
+                self.fail('Unable to find device for %s' % loc)
             new_locations.append(replace_partition_in_path(
-                str(loc), self.object_ring.part_power + 1))
+                dev_root, str(loc), self.object_ring.part_power + 1))
 
         # Overwrite existing object - to ensure that older timestamp files
         # will be cleaned up properly later
@@ -163,8 +165,8 @@ class TestPartPowerIncrease(ProbeTest):
         client.put_object(self.url, self.token, container, obj, self.data)
 
         # Cleanup old objects in the wrong location
-        for device in self.devices:
-            self.assertEqual(0, cleanup(skip_mount_check=True, devices=device))
+        for conf in self.conf_files:
+            self.assertEqual(0, relinker_main(['cleanup', conf]))
 
         # Ensure objects are still accessible
         client.head_object(self.url, self.token, container, obj)

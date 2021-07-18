@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import array
+import contextlib
+
 import six.moves.cPickle as pickle
 import json
 from collections import defaultdict
@@ -35,7 +37,12 @@ from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.utils import tiers_for_dev
 
 
+DEFAULT_RELOAD_TIME = 15
+
+
 def calc_replica_count(replica2part2dev_id):
+    if not replica2part2dev_id:
+        return 0
     base = len(replica2part2dev_id) - 1
     extra = 1.0 * len(replica2part2dev_id[-1]) / len(replica2part2dev_id[0])
     return base + extra
@@ -171,22 +178,21 @@ class RingData(object):
         :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
-        gz_file = RingReader(filename)
-
-        # See if the file is in the new format
-        magic = gz_file.read(4)
-        if magic == b'R1NG':
-            format_version, = struct.unpack('!H', gz_file.read(2))
-            if format_version == 1:
-                ring_data = cls.deserialize_v1(
-                    gz_file, metadata_only=metadata_only)
+        with contextlib.closing(RingReader(filename)) as gz_file:
+            # See if the file is in the new format
+            magic = gz_file.read(4)
+            if magic == b'R1NG':
+                format_version, = struct.unpack('!H', gz_file.read(2))
+                if format_version == 1:
+                    ring_data = cls.deserialize_v1(
+                        gz_file, metadata_only=metadata_only)
+                else:
+                    raise Exception('Unknown ring format version %d' %
+                                    format_version)
             else:
-                raise Exception('Unknown ring format version %d' %
-                                format_version)
-        else:
-            # Assume old-style pickled ring
-            gz_file.seek(0)
-            ring_data = pickle.load(gz_file)
+                # Assume old-style pickled ring
+                gz_file.seek(0)
+                ring_data = pickle.load(gz_file)
 
         if not hasattr(ring_data, 'devs'):
             ring_data = RingData(ring_data['replica2part2dev_id'],
@@ -269,7 +275,7 @@ class Ring(object):
     :raises RingLoadError: if the loaded ring data violates its constraint
     """
 
-    def __init__(self, serialized_path, reload_time=15, ring_name=None,
+    def __init__(self, serialized_path, reload_time=None, ring_name=None,
                  validation_hook=lambda ring_data: None):
         # can't use the ring unless HASH_PATH_SUFFIX is set
         validate_configuration()
@@ -278,7 +284,8 @@ class Ring(object):
                                                 ring_name + '.ring.gz')
         else:
             self.serialized_path = os.path.join(serialized_path)
-        self.reload_time = reload_time
+        self.reload_time = (DEFAULT_RELOAD_TIME if reload_time is None
+                            else reload_time)
         self._validation_hook = validation_hook
         self._reload(force=True)
 
@@ -359,6 +366,8 @@ class Ring(object):
 
     @property
     def next_part_power(self):
+        if time() > self._rtime:
+            self._reload()
         return self._next_part_power
 
     @property

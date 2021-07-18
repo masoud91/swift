@@ -35,6 +35,7 @@ import mock
 import unittest
 import hashlib
 import six
+from six.moves.urllib.parse import quote
 from time import time, strftime, gmtime
 
 from swift.common.middleware import tempauth, tempurl
@@ -350,7 +351,7 @@ class TestTempURL(unittest.TestCase):
         key = b'abc'
         hmac_body = ('%s\n%i\n%s' % (method, expires, path)).encode('utf-8')
         sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
-        req = self._make_request(path, keys=[key], environ={
+        req = self._make_request(quote(path), keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
@@ -472,6 +473,42 @@ class TestTempURL(unittest.TestCase):
                      'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                          sig, expires)})
         resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    def test_put_response_headers_in_list(self):
+        class Validator(object):
+            def __init__(self, app):
+                self.app = app
+                self.status = None
+                self.headers = None
+                self.exc_info = None
+
+            def start_response(self, status, headers, exc_info=None):
+                self.status = status
+                self.headers = headers
+                self.exc_info = exc_info
+
+            def __call__(self, env, start_response):
+                resp_iter = self.app(env, self.start_response)
+                start_response(self.status, self.headers, self.exc_info)
+                return resp_iter
+
+        method = 'PUT'
+        expires = int(time() + 86400)
+        path = '/v1/a/c/o'
+        key = b'abc'
+        hmac_body = ('%s\n%i\n%s' % (method, expires, path)).encode('utf-8')
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(
+            path, keys=[key],
+            environ={'REQUEST_METHOD': 'PUT',
+                     'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
+                         sig, expires)})
+        validator = Validator(self.tempurl)
+        resp = req.get_response(validator)
+        self.assertIsInstance(validator.headers, list)
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')

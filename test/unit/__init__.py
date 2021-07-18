@@ -49,8 +49,7 @@ from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
 from swift.common.utils import Timestamp, md5
 from test import get_config
-# import to namespace for backward compat
-from test.debug_logger import debug_logger, DebugLogger, FakeLogger  # noqa
+from test.debug_logger import FakeLogger
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.ring import Ring, RingData, RingBuilder
 from swift.obj import server
@@ -216,7 +215,8 @@ class PatchPolicies(object):
 class FakeRing(Ring):
 
     def __init__(self, replicas=3, max_more_nodes=0, part_power=0,
-                 base_port=1000, separate_replication=False):
+                 base_port=1000, separate_replication=False,
+                 next_part_power=None, reload_time=15):
         self.serialized_path = '/foo/bar/object.ring.gz'
         self._base_port = base_port
         self.max_more_nodes = max_more_nodes
@@ -225,7 +225,9 @@ class FakeRing(Ring):
         self.separate_replication = separate_replication
         # 9 total nodes (6 more past the initial 3) is the cap, no matter if
         # this is set higher, or R^2 for R replicas
+        self.reload_time = reload_time
         self.set_replicas(replicas)
+        self._next_part_power = next_part_power
         self._reload()
 
     def has_changed(self):
@@ -933,9 +935,15 @@ def fake_http_connect(*code_iter, **kwargs):
 
         if 'give_connect' in kwargs:
             give_conn_fn = kwargs['give_connect']
-            argspec = inspect.getargspec(give_conn_fn)
-            if argspec.keywords or 'connection_id' in argspec.args:
-                ckwargs['connection_id'] = i
+
+            if six.PY2:
+                argspec = inspect.getargspec(give_conn_fn)
+                if argspec.keywords or 'connection_id' in argspec.args:
+                    ckwargs['connection_id'] = i
+            else:
+                argspec = inspect.getfullargspec(give_conn_fn)
+                if argspec.varkw or 'connection_id' in argspec.args:
+                    ckwargs['connection_id'] = i
             give_conn_fn(*args, **ckwargs)
         etag = next(etag_iter)
         headers = next(headers_iter)
@@ -1010,6 +1018,13 @@ def mock_timestamp_now(now=None):
         yield now
 
 
+@contextmanager
+def mock_timestamp_now_with_iter(ts_iter):
+    with mocklib.patch('swift.common.utils.Timestamp.now',
+                       side_effect=ts_iter):
+        yield
+
+
 class Timeout(object):
     def __init__(self, seconds):
         self.seconds = seconds
@@ -1038,15 +1053,28 @@ def requires_o_tmpfile_support_in_tmp(func):
 
 class StubResponse(object):
 
-    def __init__(self, status, body=b'', headers=None, frag_index=None):
+    def __init__(self, status, body=b'', headers=None, frag_index=None,
+                 slowdown=None):
         self.status = status
         self.body = body
         self.readable = BytesIO(body)
+        try:
+            self._slowdown = iter(slowdown)
+        except TypeError:
+            self._slowdown = iter([slowdown])
         self.headers = HeaderKeyDict(headers)
         if frag_index is not None:
             self.headers['X-Object-Sysmeta-Ec-Frag-Index'] = frag_index
         fake_reason = ('Fake', 'This response is a lie.')
         self.reason = swob.RESPONSE_REASONS.get(status, fake_reason)[0]
+
+    def slowdown(self):
+        try:
+            wait = next(self._slowdown)
+        except StopIteration:
+            wait = None
+        if wait is not None:
+            eventlet.sleep(wait)
 
     def nuke_from_orbit(self):
         if hasattr(self, 'swift_conn'):
@@ -1061,7 +1089,12 @@ class StubResponse(object):
         return self.headers.items()
 
     def read(self, amt=0):
+        self.slowdown()
         return self.readable.read(amt)
+
+    def readline(self, size=-1):
+        self.slowdown()
+        return self.readable.readline(size)
 
     def __repr__(self):
         info = ['Status: %s' % self.status]

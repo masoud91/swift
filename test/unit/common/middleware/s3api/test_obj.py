@@ -16,6 +16,7 @@
 import binascii
 import unittest
 from datetime import datetime
+import functools
 from hashlib import sha256
 import os
 from os.path import join
@@ -307,6 +308,19 @@ class TestS3ApiObj(S3ApiTestCase):
                                        swob.HTTPServiceUnavailable)
         self.assertEqual(code, 'ServiceUnavailable')
 
+        code = self._test_method_error(
+            'GET', '/bucket/object',
+            functools.partial(swob.Response, status='498 Rate Limited'),
+            expected_status='503 Slow Down')
+        self.assertEqual(code, 'SlowDown')
+
+        with patch.object(self.s3api.conf, 'ratelimit_as_client_error', True):
+            code = self._test_method_error(
+                'GET', '/bucket/object',
+                functools.partial(swob.Response, status='498 Rate Limited'),
+                expected_status='429 Slow Down')
+            self.assertEqual(code, 'SlowDown')
+
     @s3acl
     def test_object_GET(self):
         self._test_object_GETorHEAD('GET')
@@ -561,6 +575,10 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertEqual(code, 'InvalidArgument')
         code = self._test_method_error('PUT', '/bucket/object',
                                        swob.HTTPRequestTimeout)
+        self.assertEqual(code, 'RequestTimeout')
+        code = self._test_method_error('PUT', '/bucket/object',
+                                       swob.HTTPClientDisconnect,
+                                       {})
         self.assertEqual(code, 'RequestTimeout')
 
     def test_object_PUT_with_version(self):
@@ -1723,6 +1741,120 @@ class TestS3ApiObj(S3ApiTestCase):
         status, headers, body = self._test_object_copy_for_s3acl(
             'test:write', 'READ', src_path='')
         self.assertEqual(status.split()[0], '400')
+
+    def test_cors_preflight(self):
+        req = Request.blank(
+            '/bucket/cors-object',
+            environ={'REQUEST_METHOD': 'OPTIONS'},
+            headers={'Origin': 'http://example.com',
+                     'Access-Control-Request-Method': 'GET',
+                     'Access-Control-Request-Headers': 'authorization'})
+        self.s3api.conf.cors_preflight_allow_origin = ['*']
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertDictEqual(headers, {
+            'Allow': 'GET, HEAD, PUT, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Origin': 'http://example.com',
+            'Access-Control-Allow-Methods': ('GET, HEAD, PUT, POST, DELETE, '
+                                             'OPTIONS'),
+            'Access-Control-Allow-Headers': 'authorization',
+            'Vary': 'Origin, Access-Control-Request-Headers',
+        })
+
+        # test more allow_origins
+        self.s3api.conf.cors_preflight_allow_origin = ['http://example.com',
+                                                       'http://other.com']
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertDictEqual(headers, {
+            'Allow': 'GET, HEAD, PUT, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Origin': 'http://example.com',
+            'Access-Control-Allow-Methods': ('GET, HEAD, PUT, POST, DELETE, '
+                                             'OPTIONS'),
+            'Access-Control-Allow-Headers': 'authorization',
+            'Vary': 'Origin, Access-Control-Request-Headers',
+        })
+
+        # Wrong protocol
+        self.s3api.conf.cors_preflight_allow_origin = ['https://example.com']
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '401 Unauthorized')
+        self.assertEqual(headers, {
+            'Allow': 'GET, HEAD, PUT, POST, DELETE, OPTIONS',
+        })
+
+    def test_cors_headers(self):
+        # note: Access-Control-Allow-Methods would normally be expected in
+        # response to an OPTIONS request but its included here in GET/PUT tests
+        # to check that it is always passed back in S3Response
+        cors_headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': ('GET, PUT, POST, COPY, '
+                                             'DELETE, PUT, OPTIONS'),
+            'Access-Control-Expose-Headers':
+                'x-object-meta-test, x-object-meta-test=5funderscore, etag',
+        }
+        get_resp_headers = self.response_headers
+        get_resp_headers['x-object-meta-test=5funderscore'] = 'underscored'
+        self.swift.register(
+            'GET', '/v1/AUTH_test/bucket/cors-object', swob.HTTPOk,
+            dict(get_resp_headers, **cors_headers),
+            self.object_body)
+        self.swift.register(
+            'PUT', '/v1/AUTH_test/bucket/cors-object', swob.HTTPCreated,
+            dict({'etag': self.etag,
+                  'last-modified': self.last_modified,
+                  'x-object-meta-something': 'oh hai',
+                  'x-object-meta-test=5funderscore': 'underscored'},
+                 **cors_headers),
+            None)
+
+        req = Request.blank(
+            '/bucket/cors-object',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'Origin': 'http://example.com',
+                     'Access-Control-Request-Method': 'GET',
+                     'Access-Control-Request-Headers': 'authorization'})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertIn('Access-Control-Allow-Origin', headers)
+        self.assertEqual(headers['Access-Control-Allow-Origin'], '*')
+        self.assertIn('Access-Control-Expose-Headers', headers)
+        self.assertEqual(
+            headers['Access-Control-Expose-Headers'],
+            'x-amz-meta-test, x-amz-meta-test_underscore, etag, '
+            'x-amz-request-id, x-amz-id-2')
+        self.assertIn('Access-Control-Allow-Methods', headers)
+        self.assertEqual(
+            headers['Access-Control-Allow-Methods'],
+            'GET, PUT, POST, DELETE, PUT, OPTIONS')
+        self.assertIn('x-amz-meta-test_underscore', headers)
+        self.assertEqual('underscored', headers['x-amz-meta-test_underscore'])
+
+        req = Request.blank(
+            '/bucket/cors-object',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'Origin': 'http://example.com',
+                     'Access-Control-Request-Method': 'PUT',
+                     'Access-Control-Request-Headers': 'authorization'})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertIn('Access-Control-Allow-Origin', headers)
+        self.assertEqual(headers['Access-Control-Allow-Origin'], '*')
+        self.assertIn('Access-Control-Expose-Headers', headers)
+        self.assertEqual(
+            headers['Access-Control-Expose-Headers'],
+            'x-amz-meta-test, x-amz-meta-test_underscore, etag, '
+            'x-amz-request-id, x-amz-id-2')
+        self.assertIn('Access-Control-Allow-Methods', headers)
+        self.assertEqual(
+            headers['Access-Control-Allow-Methods'],
+            'GET, PUT, POST, DELETE, PUT, OPTIONS')
+        self.assertEqual('underscored', headers['x-amz-meta-test_underscore'])
 
 
 class TestS3ApiObjNonUTC(TestS3ApiObj):

@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import random
+from argparse import Namespace
 
 import eventlet
 import os
@@ -38,14 +39,18 @@ from swift.container import replicator
 from swift.container.backend import ContainerBroker, UNSHARDED, SHARDING, \
     SHARDED, DATADIR
 from swift.container.sharder import ContainerSharder, sharding_enabled, \
-    CleavingContext, DEFAULT_SHARD_SHRINK_POINT, \
-    DEFAULT_SHARD_CONTAINER_THRESHOLD
+    CleavingContext, DEFAULT_SHARDER_CONF, finalize_shrinking, \
+    find_shrinking_candidates, process_compactible_shard_sequences, \
+    find_compactible_shard_sequences, is_shrinking_candidate, \
+    is_sharding_candidate, find_paths, rank_paths, ContainerSharderConf, \
+    CLEAVE_FAILED
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5
 from test import annotate_failure
 
-from test.unit import debug_logger, FakeRing, \
-    make_timestamp_iter, unlink_files, mocked_http_conn, mock_timestamp_now, \
+from test.debug_logger import debug_logger
+from test.unit import FakeRing, make_timestamp_iter, unlink_files, \
+    mocked_http_conn, mock_timestamp_now, mock_timestamp_now_with_iter, \
     attach_fake_replication_rpc
 
 
@@ -69,7 +74,7 @@ class BaseTestSharder(unittest.TestCase):
         datadir = os.path.join(
             self.tempdir, device, 'containers', str(part), hash_[-3:], hash_)
         if epoch:
-            filename = '%s_%s.db' % (hash, epoch)
+            filename = '%s_%s.db' % (hash_, epoch)
         else:
             filename = hash_ + '.db'
         db_file = os.path.join(datadir, filename)
@@ -109,14 +114,14 @@ class BaseTestSharder(unittest.TestCase):
         return broker
 
     def _make_shard_ranges(self, bounds, state=None, object_count=0,
-                           timestamp=Timestamp.now()):
+                           timestamp=Timestamp.now(), **kwargs):
         if not isinstance(state, (tuple, list)):
             state = [state] * len(bounds)
         state_iter = iter(state)
-        return [ShardRange('.shards_a/c_%s' % upper, timestamp,
+        return [ShardRange('.shards_a/c_%s_%s' % (upper, index), timestamp,
                            lower, upper, state=next(state_iter),
-                           object_count=object_count)
-                for lower, upper in bounds]
+                           object_count=object_count, **kwargs)
+                for index, (lower, upper) in enumerate(bounds)]
 
     def ts_encoded(self):
         # make a unique timestamp string with multiple timestamps encoded;
@@ -127,27 +132,29 @@ class BaseTestSharder(unittest.TestCase):
 
 
 class TestSharder(BaseTestSharder):
-    def test_init(self):
-        def do_test(conf, expected, logger=self.logger):
-            if logger:
-                logger.clear()
-            with mock.patch(
-                    'swift.container.sharder.internal_client.InternalClient') \
-                    as mock_ic:
-                with mock.patch('swift.common.db_replicator.ring.Ring') \
-                        as mock_ring:
-                    mock_ring.return_value = mock.MagicMock()
-                    mock_ring.return_value.replica_count = 3
-                    sharder = ContainerSharder(conf, logger=logger)
-            mock_ring.assert_called_once_with(
-                '/etc/swift', ring_name='container')
-            for k, v in expected.items():
-                self.assertTrue(hasattr(sharder, k), 'Missing attr %s' % k)
-                self.assertEqual(v, getattr(sharder, k),
-                                 'Incorrect value: expected %s=%s but got %s' %
-                                 (k, v, getattr(sharder, k)))
-            return sharder, mock_ic
+    def _do_test_init(self, conf, expected, use_logger=True):
+        logger = self.logger if use_logger else None
+        if logger:
+            logger.clear()
+        with mock.patch(
+                'swift.container.sharder.internal_client.InternalClient') \
+                as mock_ic:
+            with mock.patch('swift.common.db_replicator.ring.Ring') \
+                    as mock_ring:
+                mock_ring.return_value = mock.MagicMock()
+                mock_ring.return_value.replica_count = 3
+                sharder = ContainerSharder(conf, logger=logger)
+        mock_ring.assert_called_once_with(
+            '/etc/swift', ring_name='container')
+        for k, v in expected.items():
+            self.assertTrue(hasattr(sharder, k), 'Missing attr %s' % k)
+            self.assertEqual(v, getattr(sharder, k),
+                             'Incorrect value: expected %s=%s but got %s' %
+                             (k, v, getattr(sharder, k)))
+        return sharder, mock_ic
 
+    def test_init(self):
+        # default values
         expected = {
             'mount_check': True, 'bind_ip': '0.0.0.0', 'port': 6201,
             'per_diff': 1000, 'max_diffs': 100, 'interval': 30,
@@ -157,20 +164,23 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': False,
             'rsync_module': '{replication_ip}::container',
             'reclaim_age': 86400 * 7,
-            'shard_shrink_point': 0.25,
-            'shrink_merge_point': 0.75,
             'shard_container_threshold': 1000000,
-            'split_size': 500000,
+            'rows_per_shard': 500000,
+            'shrink_threshold': 100000,
+            'expansion_limit': 750000,
             'cleave_batch_size': 2,
-            'scanner_batch_size': 10,
+            'shard_scanner_batch_size': 10,
             'rcache': '/var/cache/swift/container.recon',
             'shards_account_prefix': '.shards_',
             'auto_shard': False,
             'recon_candidates_limit': 5,
+            'recon_sharded_timeout': 43200,
             'shard_replication_quorum': 2,
-            'existing_shard_replication_quorum': 2
+            'existing_shard_replication_quorum': 2,
+            'max_shrinking': 1,
+            'max_expanding': -1
         }
-        sharder, mock_ic = do_test({}, expected, logger=None)
+        sharder, mock_ic = self._do_test_init({}, expected, use_logger=False)
         self.assertEqual(
             'container-sharder', sharder.logger.logger.name)
         mock_ic.assert_called_once_with(
@@ -178,6 +188,21 @@ class TestSharder(BaseTestSharder):
             allow_modify_pipeline=False,
             use_replication_network=True)
 
+        # non-default shard_container_threshold influences other defaults
+        conf = {'shard_container_threshold': 20000000}
+        expected.update({
+            'shard_container_threshold': 20000000,
+            'shrink_threshold': 2000000,
+            'expansion_limit': 15000000,
+            'rows_per_shard': 10000000
+        })
+        sharder, mock_ic = self._do_test_init(conf, expected)
+        mock_ic.assert_called_once_with(
+            '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
+            allow_modify_pipeline=False,
+            use_replication_network=True)
+
+        # non-default values
         conf = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'bind_port': 62010,
             'per_diff': 2000, 'max_diffs': 200, 'interval': 60,
@@ -187,8 +212,8 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': True,
             'rsync_module': '{replication_ip}::container_sda/',
             'reclaim_age': 86400 * 14,
-            'shard_shrink_point': 35,
-            'shard_shrink_merge_point': 85,
+            'shrink_threshold': 2000000,
+            'expansion_limit': 17000000,
             'shard_container_threshold': 20000000,
             'cleave_batch_size': 4,
             'shard_scanner_batch_size': 8,
@@ -198,8 +223,12 @@ class TestSharder(BaseTestSharder):
             'auto_create_account_prefix': '...',
             'auto_shard': 'yes',
             'recon_candidates_limit': 10,
+            'recon_sharded_timeout': 7200,
             'shard_replication_quorum': 1,
-            'existing_shard_replication_quorum': 0
+            'existing_shard_replication_quorum': 0,
+            'max_shrinking': 5,
+            'max_expanding': 4,
+            'rows_per_shard': 13000000
         }
         expected = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'port': 62010,
@@ -210,20 +239,23 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': True,
             'rsync_module': '{replication_ip}::container_sda',
             'reclaim_age': 86400 * 14,
-            'shard_shrink_point': 0.35,
-            'shrink_merge_point': 0.85,
             'shard_container_threshold': 20000000,
-            'split_size': 10000000,
+            'rows_per_shard': 13000000,
+            'shrink_threshold': 2000000,
+            'expansion_limit': 17000000,
             'cleave_batch_size': 4,
-            'scanner_batch_size': 8,
+            'shard_scanner_batch_size': 8,
             'rcache': '/var/cache/swift-alt/container.recon',
             'shards_account_prefix': '...shards_',
             'auto_shard': True,
             'recon_candidates_limit': 10,
+            'recon_sharded_timeout': 7200,
             'shard_replication_quorum': 1,
-            'existing_shard_replication_quorum': 0
+            'existing_shard_replication_quorum': 0,
+            'max_shrinking': 5,
+            'max_expanding': 4
         }
-        sharder, mock_ic = do_test(conf, expected)
+        sharder, mock_ic = self._do_test_init(conf, expected)
         mock_ic.assert_called_once_with(
             '/etc/swift/my-sharder-ic.conf', 'Swift Container Sharder', 2,
             allow_modify_pipeline=False,
@@ -238,7 +270,7 @@ class TestSharder(BaseTestSharder):
                          'existing_shard_replication_quorum': 3})
         conf.update({'shard_replication_quorum': 4,
                      'existing_shard_replication_quorum': 4})
-        do_test(conf, expected)
+        self._do_test_init(conf, expected)
         warnings = self.logger.get_lines_for_level('warning')
         self.assertEqual(warnings[:1], [
             'Option auto_create_account_prefix is deprecated. '
@@ -253,16 +285,80 @@ class TestSharder(BaseTestSharder):
         ])
 
         with self.assertRaises(ValueError) as cm:
-            do_test({'shard_shrink_point': 101}, {})
+            self._do_test_init({'shard_shrink_point': 101}, {})
         self.assertIn(
             'greater than 0, less than 100, not "101"', str(cm.exception))
-        self.assertIn('shard_shrink_point', str(cm.exception))
 
         with self.assertRaises(ValueError) as cm:
-            do_test({'shard_shrink_merge_point': 101}, {})
+            self._do_test_init({'shard_shrink_merge_point': 101}, {})
         self.assertIn(
             'greater than 0, less than 100, not "101"', str(cm.exception))
-        self.assertIn('shard_shrink_merge_point', str(cm.exception))
+
+    def test_init_deprecated_options(self):
+        # percent values applied if absolute values not given
+        conf = {
+            'shard_shrink_point': 7,  # trumps shrink_threshold
+            'shard_shrink_merge_point': 95,  # trumps expansion_limit
+            'shard_container_threshold': 20000000,
+        }
+        expected = {
+            'mount_check': True, 'bind_ip': '0.0.0.0', 'port': 6201,
+            'per_diff': 1000, 'max_diffs': 100, 'interval': 30,
+            'databases_per_second': 50,
+            'cleave_row_batch_size': 10000,
+            'node_timeout': 10, 'conn_timeout': 5,
+            'rsync_compress': False,
+            'rsync_module': '{replication_ip}::container',
+            'reclaim_age': 86400 * 7,
+            'shard_container_threshold': 20000000,
+            'rows_per_shard': 10000000,
+            'shrink_threshold': 1400000,
+            'expansion_limit': 19000000,
+            'cleave_batch_size': 2,
+            'shard_scanner_batch_size': 10,
+            'rcache': '/var/cache/swift/container.recon',
+            'shards_account_prefix': '.shards_',
+            'auto_shard': False,
+            'recon_candidates_limit': 5,
+            'shard_replication_quorum': 2,
+            'existing_shard_replication_quorum': 2,
+            'max_shrinking': 1,
+            'max_expanding': -1
+        }
+        self._do_test_init(conf, expected)
+        # absolute values override percent values
+        conf = {
+            'shard_shrink_point': 7,
+            'shrink_threshold': 1300000,  # trumps shard_shrink_point
+            'shard_shrink_merge_point': 95,
+            'expansion_limit': 17000000,  # trumps shard_shrink_merge_point
+            'shard_container_threshold': 20000000,
+        }
+        expected = {
+            'mount_check': True, 'bind_ip': '0.0.0.0', 'port': 6201,
+            'per_diff': 1000, 'max_diffs': 100, 'interval': 30,
+            'databases_per_second': 50,
+            'cleave_row_batch_size': 10000,
+            'node_timeout': 10, 'conn_timeout': 5,
+            'rsync_compress': False,
+            'rsync_module': '{replication_ip}::container',
+            'reclaim_age': 86400 * 7,
+            'shard_container_threshold': 20000000,
+            'rows_per_shard': 10000000,
+            'shrink_threshold': 1300000,
+            'expansion_limit': 17000000,
+            'cleave_batch_size': 2,
+            'shard_scanner_batch_size': 10,
+            'rcache': '/var/cache/swift/container.recon',
+            'shards_account_prefix': '.shards_',
+            'auto_shard': False,
+            'recon_candidates_limit': 5,
+            'shard_replication_quorum': 2,
+            'existing_shard_replication_quorum': 2,
+            'max_shrinking': 1,
+            'max_expanding': -1
+        }
+        self._do_test_init(conf, expected)
 
     def test_init_internal_client_conf_loading_error(self):
         with mock.patch('swift.common.db_replicator.ring.Ring') \
@@ -357,7 +453,8 @@ class TestSharder(BaseTestSharder):
                             'min_time': 0.01, 'max_time': 1.3},
                 'misplaced': {'attempted': 1, 'success': 1, 'failure': 0,
                               'found': 1, 'placed': 1, 'unplaced': 0},
-                'audit_root': {'attempted': 5, 'success': 4, 'failure': 1},
+                'audit_root': {'attempted': 5, 'success': 4, 'failure': 1,
+                               'num_overlap': 0, "has_overlap": 0},
                 'audit_shard': {'attempted': 2, 'success': 2, 'failure': 0},
             }
             # NB these are time increments not absolute times...
@@ -464,6 +561,12 @@ class TestSharder(BaseTestSharder):
                     'found': 2,
                     'top': [stats_for_candidate(call[0])
                             for call in fake_process_broker_calls[:2]]
+                }
+            })
+            fake_stats.update({
+                'shrinking_candidates': {
+                    'found': 0,
+                    'top': []
                 }
             })
             check_recon(recon_data[0], sum(fake_periods[1:3]),
@@ -685,6 +788,137 @@ class TestSharder(BaseTestSharder):
                 expected_candidate_stats, sharder, 'sharding_candidates')
             self._assert_recon_stats(None, sharder, 'sharding_progress')
 
+            # let's progress broker 1 (broker[0])
+            brokers[0].enable_sharding(next(self.ts_iter))
+            brokers[0].set_sharding_state()
+            shard_ranges = brokers[0].get_shard_ranges()
+            for sr in shard_ranges[:-1]:
+                sr.update_state(ShardRange.CLEAVED)
+            brokers[0].merge_shard_ranges(shard_ranges)
+
+            with mock.patch('eventlet.sleep'), mock.patch.object(
+                    sharder, '_process_broker'
+            ) as mock_process_broker:
+                sharder._local_device_ids = {999}
+                sharder._one_shard_cycle(Everything(), Everything())
+
+            expected_in_progress_stats = {
+                'all': [{'object_count': 0, 'account': 'a', 'container': 'c0',
+                         'meta_timestamp': mock.ANY,
+                         'file_size': os.stat(brokers[0].db_file).st_size,
+                         'path': brokers[0].db_file, 'root': 'a/c0',
+                         'node_index': 0,
+                         'found': 1, 'created': 0, 'cleaved': 3, 'active': 1,
+                         'state': 'sharding', 'db_state': 'sharding',
+                         'error': None},
+                        {'object_count': 0, 'account': 'a', 'container': 'c1',
+                         'meta_timestamp': mock.ANY,
+                         'file_size': os.stat(brokers[1].db_file).st_size,
+                         'path': brokers[1].db_file, 'root': 'a/c1',
+                         'node_index': 1,
+                         'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'state': 'sharding', 'db_state': 'unsharded',
+                         'error': None}]}
+            self._assert_stats(
+                expected_in_progress_stats, sharder, 'sharding_in_progress')
+
+            # Now complete sharding broker 1.
+            shard_ranges[-1].update_state(ShardRange.CLEAVED)
+            own_sr = brokers[0].get_own_shard_range()
+            own_sr.update_state(ShardRange.SHARDED)
+            brokers[0].merge_shard_ranges(shard_ranges + [own_sr])
+            # make and complete a cleave context, this is used for the
+            # recon_sharded_timeout timer.
+            cxt = CleavingContext.load(brokers[0])
+            cxt.misplaced_done = cxt.cleaving_done = True
+            ts_now = next(self.ts_iter)
+            with mock_timestamp_now(ts_now):
+                cxt.store(brokers[0])
+            self.assertTrue(brokers[0].set_sharded_state())
+
+            with mock.patch('eventlet.sleep'), \
+                    mock.patch.object(sharder, '_process_broker') \
+                    as mock_process_broker, mock_timestamp_now(ts_now):
+                sharder._local_device_ids = {999}
+                sharder._one_shard_cycle(Everything(), Everything())
+
+            expected_in_progress_stats = {
+                'all': [{'object_count': 0, 'account': 'a', 'container': 'c0',
+                         'meta_timestamp': mock.ANY,
+                         'file_size': os.stat(brokers[0].db_file).st_size,
+                         'path': brokers[0].db_file, 'root': 'a/c0',
+                         'node_index': 0,
+                         'found': 0, 'created': 0, 'cleaved': 4, 'active': 1,
+                         'state': 'sharded', 'db_state': 'sharded',
+                         'error': None},
+                        {'object_count': 0, 'account': 'a', 'container': 'c1',
+                         'meta_timestamp': mock.ANY,
+                         'file_size': os.stat(brokers[1].db_file).st_size,
+                         'path': brokers[1].db_file, 'root': 'a/c1',
+                         'node_index': 1,
+                         'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'state': 'sharding', 'db_state': 'unsharded',
+                         'error': None}]}
+            self._assert_stats(
+                expected_in_progress_stats, sharder, 'sharding_in_progress')
+
+            # one more cycle at recon_sharded_timeout seconds into the
+            # future to check that the completed broker is still reported
+            ts_now = Timestamp(ts_now.timestamp +
+                               sharder.recon_sharded_timeout)
+            with mock.patch('eventlet.sleep'), \
+                    mock.patch.object(sharder, '_process_broker') \
+                    as mock_process_broker, mock_timestamp_now(ts_now):
+                sharder._local_device_ids = {999}
+                sharder._one_shard_cycle(Everything(), Everything())
+            self._assert_stats(
+                expected_in_progress_stats, sharder, 'sharding_in_progress')
+
+            # when we move recon_sharded_timeout + 1 seconds into the future,
+            # broker 1 will be removed from the progress report
+            ts_now = Timestamp(ts_now.timestamp +
+                               sharder.recon_sharded_timeout + 1)
+            with mock.patch('eventlet.sleep'), \
+                    mock.patch.object(sharder, '_process_broker') \
+                    as mock_process_broker, mock_timestamp_now(ts_now):
+                sharder._local_device_ids = {999}
+                sharder._one_shard_cycle(Everything(), Everything())
+
+            expected_in_progress_stats = {
+                'all': [{'object_count': 0, 'account': 'a', 'container': 'c1',
+                         'meta_timestamp': mock.ANY,
+                         'file_size': os.stat(brokers[1].db_file).st_size,
+                         'path': brokers[1].db_file, 'root': 'a/c1',
+                         'node_index': 1,
+                         'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'state': 'sharding', 'db_state': 'unsharded',
+                         'error': None}]}
+            self._assert_stats(
+                expected_in_progress_stats, sharder, 'sharding_in_progress')
+
+    def test_one_shard_cycle_no_containers(self):
+        conf = {'recon_cache_path': self.tempdir,
+                'devices': self.tempdir,
+                'mount_check': False}
+
+        with self._mock_sharder(conf) as sharder:
+            for dev in sharder.ring.devs:
+                os.mkdir(os.path.join(self.tempdir, dev['device']))
+            with mock.patch('swift.container.sharder.is_local_device',
+                            return_value=True):
+                sharder._one_shard_cycle(Everything(), Everything())
+        self.assertEqual([], sharder.logger.get_lines_for_level('warning'))
+        self.assertIn('Found no containers directories',
+                      sharder.logger.get_lines_for_level('info'))
+        with self._mock_sharder(conf) as sharder:
+            os.mkdir(os.path.join(self.tempdir, dev['device'], 'containers'))
+            with mock.patch('swift.container.sharder.is_local_device',
+                            return_value=True):
+                sharder._one_shard_cycle(Everything(), Everything())
+        self.assertEqual([], sharder.logger.get_lines_for_level('warning'))
+        self.assertNotIn('Found no containers directories',
+                         sharder.logger.get_lines_for_level('info'))
+
     def test_ratelimited_roundrobin(self):
         n_databases = 100
 
@@ -756,9 +990,12 @@ class TestSharder(BaseTestSharder):
             10, '', '', '', '', include_deleted=None, all_policies=True,
             transform_func=lambda record: record)]
 
-    def _check_objects(self, expected_objs, shard_db):
-        shard_broker = ContainerBroker(shard_db)
-        shard_objs = self._get_raw_object_records(shard_broker)
+    def _check_objects(self, expected_objs, shard_dbs):
+        shard_dbs = shard_dbs if isinstance(shard_dbs, list) else [shard_dbs]
+        shard_objs = []
+        for shard_db in shard_dbs:
+            shard_broker = ContainerBroker(shard_db)
+            shard_objs.extend(self._get_raw_object_records(shard_broker))
         expected_objs = [list(obj) for obj in expected_objs]
         self.assertEqual(expected_objs, shard_objs)
 
@@ -933,6 +1170,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -955,6 +1193,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1012,6 +1251,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('here', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1048,6 +1288,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('here', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1112,6 +1353,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('where', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1167,6 +1409,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('yonder', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1231,6 +1474,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertTrue(context.cleaving_done)
+        self.assertTrue(context.done())
         self.assertEqual('', context.cursor)
         self.assertEqual(9, context.cleave_to_row)
         self.assertEqual(9, context.max_row)
@@ -1293,6 +1537,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual(shard_ranges[1].upper_str, context.cursor)
         self.assertEqual(8, context.cleave_to_row)
         self.assertEqual(8, context.max_row)
@@ -1326,6 +1571,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual(shard_ranges[1].upper_str, context.cursor)
         self.assertEqual(8, context.cleave_to_row)
         self.assertEqual(8, context.max_row)
@@ -1358,6 +1604,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertTrue(context.cleaving_done)
+        self.assertTrue(context.done())
         self.assertEqual(shard_ranges[2].upper_str, context.cursor)
         self.assertEqual(8, context.cleave_to_row)
         self.assertEqual(8, context.max_row)
@@ -1420,6 +1667,27 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(cleaving_context.ranges_done, 1)
         self.assertEqual(cleaving_context.ranges_todo, 2)
         self.assertFalse(cleaving_context.cleaving_done)
+
+    def test_cleave_shard_range_no_own_shard_range(self):
+        broker = self._make_sharding_broker()
+        obj = {'name': 'obj', 'created_at': next(self.ts_iter).internal,
+               'size': 14, 'content_type': 'text/plain', 'etag': 'an etag',
+               'deleted': 0}
+        broker.get_brokers()[0].merge_items([obj])
+        self.assertEqual(2, len(broker.db_files))  # sanity check
+        context = CleavingContext.load(broker)
+        shard_range = broker.get_shard_ranges()[0]
+
+        with self._mock_sharder() as sharder, mock.patch(
+                'swift.container.backend.ContainerBroker.get_own_shard_range',
+                return_value=None):
+            self.assertEqual(
+                sharder._cleave_shard_range(broker, context, shard_range),
+                CLEAVE_FAILED)
+        self.assertEqual(SHARDING, broker.get_db_state())
+        warning_lines = sharder.logger.get_lines_for_level('warning')
+        self.assertEqual(warning_lines[0],
+                         'Failed to get own_shard_range for a/c')
 
     def test_cleave_shard(self):
         broker = self._make_broker(account='.shards_a', container='shard_c')
@@ -1561,62 +1829,169 @@ class TestSharder(BaseTestSharder):
         self.assertFalse(os.path.exists(misplaced_dbs[1]))
 
     def test_cleave_shard_shrinking(self):
-        broker = self._make_broker(account='.shards_a', container='shard_c')
-        own_shard_range = ShardRange(
-            broker.path, next(self.ts_iter), 'here', 'where',
-            state=ShardRange.SHRINKING, epoch=next(self.ts_iter))
-        broker.merge_shard_ranges([own_shard_range])
-        broker.set_sharding_sysmeta('Root', 'a/c')
-        self.assertFalse(broker.is_root_container())  # sanity check
+        unique = [0]
 
-        objects = [
-            ('there', self.ts_encoded(), 3, 'text/plain', 'etag_there', 0, 0),
-            ('where', self.ts_encoded(), 100, 'text/plain', 'etag_where', 0,
-             0),
-        ]
-        for obj in objects:
-            broker.put_object(*obj)
-        acceptor_epoch = next(self.ts_iter)
-        acceptor = ShardRange('.shards_a/acceptor', Timestamp.now(),
-                              'here', 'yonder', '1000', '11111',
-                              state=ShardRange.ACTIVE, epoch=acceptor_epoch)
-        db_hash = hash_path(acceptor.account, acceptor.container)
-        # NB expected cleave db includes acceptor epoch
-        expected_shard_db = os.path.join(
-            self.tempdir, 'sda', 'containers', '0', db_hash[-3:], db_hash,
-            '%s_%s.db' % (db_hash, acceptor_epoch.internal))
+        def do_test(acceptor_state, acceptor_bounds, expect_delete,
+                    exp_progress_bounds=None):
+            # 'unique' ensures fresh dbs on each test iteration
+            unique[0] += 1
 
-        broker.merge_shard_ranges([acceptor])
-        broker.set_sharding_state()
+            broker = self._make_broker(account='.shards_a',
+                                       container='donor_%s' % unique[0])
+            own_shard_range = ShardRange(
+                broker.path, next(self.ts_iter), 'h', 'w',
+                state=ShardRange.SHRINKING, epoch=next(self.ts_iter))
+            broker.merge_shard_ranges([own_shard_range])
+            broker.set_sharding_sysmeta('Root', 'a/c')
+            self.assertFalse(broker.is_root_container())  # sanity check
 
-        # run cleave
-        with self._mock_sharder() as sharder:
-            self.assertTrue(sharder._cleave(broker))
+            objects = [
+                ('i', self.ts_encoded(), 3, 'text/plain', 'etag_t', 0, 0),
+                ('m', self.ts_encoded(), 33, 'text/plain', 'etag_m', 0, 0),
+                ('w', self.ts_encoded(), 100, 'text/plain', 'etag_w', 0, 0),
+            ]
+            for obj in objects:
+                broker.put_object(*obj)
+            acceptor_epoch = next(self.ts_iter)
+            acceptors = [
+                ShardRange('.shards_a/acceptor_%s_%s' % (unique[0], bounds[1]),
+                           Timestamp.now(), bounds[0], bounds[1],
+                           '1000', '11111',
+                           state=acceptor_state, epoch=acceptor_epoch)
+                for bounds in acceptor_bounds]
+            # by default expect cleaving to progress through all acceptors
+            if exp_progress_bounds is None:
+                exp_progress_acceptors = acceptors
+            else:
+                exp_progress_acceptors = [
+                    ShardRange(
+                        '.shards_a/acceptor_%s_%s' % (unique[0], bounds[1]),
+                        Timestamp.now(), bounds[0], bounds[1], '1000', '11111',
+                        state=acceptor_state, epoch=acceptor_epoch)
+                    for bounds in exp_progress_bounds]
+            expected_acceptor_dbs = []
+            for acceptor in exp_progress_acceptors:
+                db_hash = hash_path(acceptor.account,
+                                    acceptor.container)
+                # NB expected cleaved db name includes acceptor epoch
+                db_name = '%s_%s.db' % (db_hash, acceptor_epoch.internal)
+                expected_acceptor_dbs.append(
+                    os.path.join(self.tempdir, 'sda', 'containers', '0',
+                                 db_hash[-3:], db_hash, db_name))
 
-        context = CleavingContext.load(broker)
-        self.assertTrue(context.misplaced_done)
-        self.assertTrue(context.cleaving_done)
-        self.assertEqual(acceptor.upper_str, context.cursor)
-        self.assertEqual(2, context.cleave_to_row)
-        self.assertEqual(2, context.max_row)
+            broker.merge_shard_ranges(acceptors)
+            broker.set_sharding_state()
 
-        self.assertEqual(SHARDING, broker.get_db_state())
-        sharder._replicate_object.assert_has_calls(
-            [mock.call(0, expected_shard_db, 0)])
-        shard_broker = ContainerBroker(expected_shard_db)
-        # NB when cleaving a shard container to a larger acceptor namespace
-        # then expect the shard broker's own shard range to reflect that of the
-        # acceptor shard range rather than being set to CLEAVED.
-        self.assertEqual(
-            ShardRange.ACTIVE, shard_broker.get_own_shard_range().state)
+            # run cleave
+            with mock_timestamp_now_with_iter(self.ts_iter):
+                with self._mock_sharder() as sharder:
+                    sharder.cleave_batch_size = 3
+                    self.assertEqual(expect_delete, sharder._cleave(broker))
 
-        updated_shard_ranges = broker.get_shard_ranges()
-        self.assertEqual(1, len(updated_shard_ranges))
-        self.assertEqual(dict(acceptor), dict(updated_shard_ranges[0]))
+            # check the cleave context and source broker
+            context = CleavingContext.load(broker)
+            self.assertTrue(context.misplaced_done)
+            self.assertEqual(expect_delete, context.cleaving_done)
+            if exp_progress_acceptors:
+                expected_cursor = exp_progress_acceptors[-1].upper_str
+            else:
+                expected_cursor = own_shard_range.lower_str
+            self.assertEqual(expected_cursor, context.cursor)
+            self.assertEqual(3, context.cleave_to_row)
+            self.assertEqual(3, context.max_row)
+            self.assertEqual(SHARDING, broker.get_db_state())
+            own_sr = broker.get_own_shard_range()
+            if expect_delete and len(acceptor_bounds) == 1:
+                self.assertTrue(own_sr.deleted)
+                self.assertEqual(ShardRange.SHRUNK, own_sr.state)
+            else:
+                self.assertFalse(own_sr.deleted)
+                self.assertEqual(ShardRange.SHRINKING, own_sr.state)
 
-        # shard range should have unmodified acceptor, bytes used and
-        # meta_timestamp
-        self._check_objects(objects, expected_shard_db)
+            # check the acceptor db's
+            sharder._replicate_object.assert_has_calls(
+                [mock.call(0, acceptor_db, 0)
+                 for acceptor_db in expected_acceptor_dbs])
+            for acceptor_db in expected_acceptor_dbs:
+                self.assertTrue(os.path.exists(acceptor_db))
+                # NB when *shrinking* a shard container then expect the
+                # acceptor broker's own shard range state to remain in the
+                # original state of the acceptor shard range rather than being
+                # set to CLEAVED as it would when *sharding*.
+                acceptor_broker = ContainerBroker(acceptor_db)
+                self.assertEqual(acceptor_state,
+                                 acceptor_broker.get_own_shard_range().state)
+                acceptor_ranges = acceptor_broker.get_shard_ranges(
+                    include_deleted=True)
+                if expect_delete and len(acceptor_bounds) == 1:
+                    # special case when deleted shrinking shard range is
+                    # forwarded to single enclosing acceptor
+                    self.assertEqual([own_sr], acceptor_ranges)
+                    self.assertTrue(acceptor_ranges[0].deleted)
+                    self.assertEqual(ShardRange.SHRUNK,
+                                     acceptor_ranges[0].state)
+                else:
+                    self.assertEqual([], acceptor_ranges)
+
+            expected_objects = [
+                obj for obj in objects
+                if any(acceptor.lower < obj[0] <= acceptor.upper
+                       for acceptor in exp_progress_acceptors)
+            ]
+            self._check_objects(expected_objects, expected_acceptor_dbs)
+
+            # check that *shrinking* shard's copies of acceptor ranges are not
+            # updated as they would be if *sharding*
+            updated_shard_ranges = broker.get_shard_ranges()
+            self.assertEqual([dict(sr) for sr in acceptors],
+                             [dict(sr) for sr in updated_shard_ranges])
+
+            # check that *shrinking* shard's copies of acceptor ranges are not
+            # updated when completing sharding as they would be if *sharding*
+            with mock_timestamp_now_with_iter(self.ts_iter):
+                sharder._complete_sharding(broker)
+
+            updated_shard_ranges = broker.get_shard_ranges()
+            self.assertEqual([dict(sr) for sr in acceptors],
+                             [dict(sr) for sr in updated_shard_ranges])
+            own_sr = broker.get_own_shard_range()
+            self.assertEqual(expect_delete, own_sr.deleted)
+            if expect_delete:
+                self.assertEqual(ShardRange.SHRUNK, own_sr.state)
+            else:
+                self.assertEqual(ShardRange.SHRINKING, own_sr.state)
+
+        # note: shrinking shard bounds are (h, w)
+        # shrinking to a single acceptor with enclosing namespace
+        expect_delete = True
+        do_test(ShardRange.CREATED, (('h', ''),), expect_delete)
+        do_test(ShardRange.CLEAVED, (('h', ''),), expect_delete)
+        do_test(ShardRange.ACTIVE, (('h', ''),), expect_delete)
+
+        # shrinking to multiple acceptors that enclose namespace
+        do_test(ShardRange.CREATED, (('d', 'k'), ('k', '')), expect_delete)
+        do_test(ShardRange.CLEAVED, (('d', 'k'), ('k', '')), expect_delete)
+        do_test(ShardRange.ACTIVE, (('d', 'k'), ('k', '')), expect_delete)
+        do_test(ShardRange.CLEAVED, (('d', 'k'), ('k', 't'), ('t', '')),
+                expect_delete)
+        do_test(ShardRange.CREATED, (('d', 'k'), ('k', 't'), ('t', '')),
+                expect_delete)
+        do_test(ShardRange.ACTIVE, (('d', 'k'), ('k', 't'), ('t', '')),
+                expect_delete)
+
+        # shrinking to incomplete acceptors, gap at end of namespace
+        expect_delete = False
+        do_test(ShardRange.CREATED, (('d', 'k'),), expect_delete)
+        do_test(ShardRange.CLEAVED, (('d', 'k'), ('k', 't')), expect_delete)
+        # shrinking to incomplete acceptors, gap at start and end of namespace
+        do_test(ShardRange.CREATED, (('k', 't'),), expect_delete,
+                exp_progress_bounds=())
+        # shrinking to incomplete acceptors, gap at start of namespace
+        do_test(ShardRange.CLEAVED, (('k', 't'), ('t', '')), expect_delete,
+                exp_progress_bounds=())
+        # shrinking to incomplete acceptors, gap in middle - some progress
+        do_test(ShardRange.CLEAVED, (('d', 'k'), ('t', '')), expect_delete,
+                exp_progress_bounds=(('d', 'k'),))
 
     def test_cleave_repeated(self):
         # verify that if new objects are merged into retiring db after cleaving
@@ -1695,6 +2070,7 @@ class TestSharder(BaseTestSharder):
         context = CleavingContext.load(broker)
         self.assertFalse(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
+        self.assertFalse(context.done())
         self.assertEqual('', context.cursor)
         self.assertEqual(10, context.cleave_to_row)
         self.assertEqual(12, context.max_row)  # note that max row increased
@@ -2258,14 +2634,14 @@ class TestSharder(BaseTestSharder):
         self.assertTrue(broker.set_sharding_state())
 
         # run cleave - first batch is cleaved, shrinking range doesn't count
-        # towards batch size of 2 but does count towards ranges_done
+        # towards batch size of 2 nor towards ranges_done
         with self._mock_sharder() as sharder:
             self.assertFalse(sharder._cleave(broker))
         context = CleavingContext.load(broker)
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
         self.assertEqual(shard_ranges[2].upper_str, context.cursor)
-        self.assertEqual(3, context.ranges_done)
+        self.assertEqual(2, context.ranges_done)
         self.assertEqual(2, context.ranges_todo)
 
         # run cleave - stops at shard range in FOUND state
@@ -2275,7 +2651,7 @@ class TestSharder(BaseTestSharder):
         self.assertTrue(context.misplaced_done)
         self.assertFalse(context.cleaving_done)
         self.assertEqual(shard_ranges[3].upper_str, context.cursor)
-        self.assertEqual(4, context.ranges_done)
+        self.assertEqual(3, context.ranges_done)
         self.assertEqual(1, context.ranges_todo)
 
         # run cleave - final shard range in CREATED state, cleaving proceeds
@@ -2288,8 +2664,148 @@ class TestSharder(BaseTestSharder):
         self.assertTrue(context.misplaced_done)
         self.assertTrue(context.cleaving_done)
         self.assertEqual(shard_ranges[4].upper_str, context.cursor)
-        self.assertEqual(5, context.ranges_done)
+        self.assertEqual(4, context.ranges_done)
         self.assertEqual(0, context.ranges_todo)
+
+    def test_cleave_shrinking_to_active_root_range(self):
+        broker = self._make_broker(account='.shards_a', container='shard_c')
+        broker.put_object(
+            'here_a', next(self.ts_iter), 10, 'text/plain', 'etag_a', 0, 0)
+        # a donor previously shrunk to own...
+        deleted_range = ShardRange(
+            '.shards/other', next(self.ts_iter), 'here', 'there', deleted=True,
+            state=ShardRange.SHRUNK, epoch=next(self.ts_iter))
+        own_shard_range = ShardRange(
+            broker.path, next(self.ts_iter), 'here', '',
+            state=ShardRange.SHRINKING, epoch=next(self.ts_iter))
+        # root is the acceptor...
+        root = ShardRange(
+            'a/c', next(self.ts_iter), '', '',
+            state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        broker.merge_shard_ranges([deleted_range, own_shard_range, root])
+        broker.set_sharding_sysmeta('Root', 'a/c')
+        self.assertFalse(broker.is_root_container())  # sanity check
+        self.assertTrue(broker.set_sharding_state())
+
+        # expect cleave to the root
+        with self._mock_sharder() as sharder:
+            self.assertTrue(sharder._cleave(broker))
+        context = CleavingContext.load(broker)
+        self.assertTrue(context.misplaced_done)
+        self.assertTrue(context.cleaving_done)
+        self.assertEqual(root.upper_str, context.cursor)
+        self.assertEqual(1, context.ranges_done)
+        self.assertEqual(0, context.ranges_todo)
+
+    def test_cleave_shrinking_to_active_acceptor_with_sharded_root_range(self):
+        broker = self._make_broker(account='.shards_a', container='shard_c')
+        broker.put_object(
+            'here_a', next(self.ts_iter), 10, 'text/plain', 'etag_a', 0, 0)
+        own_shard_range = ShardRange(
+            broker.path, next(self.ts_iter), 'here', 'there',
+            state=ShardRange.SHARDING, epoch=next(self.ts_iter))
+        # the intended acceptor...
+        acceptor = ShardRange(
+            '.shards_a/shard_d', next(self.ts_iter), 'here', '',
+            state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        # root range also gets pulled from root during audit...
+        root = ShardRange(
+            'a/c', next(self.ts_iter), '', '',
+            state=ShardRange.SHARDED, epoch=next(self.ts_iter))
+        broker.merge_shard_ranges([own_shard_range, acceptor, root])
+        broker.set_sharding_sysmeta('Root', 'a/c')
+        self.assertFalse(broker.is_root_container())  # sanity check
+        self.assertTrue(broker.set_sharding_state())
+
+        # sharded root range should always sort after an active acceptor so
+        # expect cleave to acceptor first then cleaving completes
+        with self._mock_sharder() as sharder:
+            self.assertTrue(sharder._cleave(broker))
+        context = CleavingContext.load(broker)
+        self.assertTrue(context.misplaced_done)
+        self.assertTrue(context.cleaving_done)
+        self.assertEqual(acceptor.upper_str, context.cursor)
+        self.assertEqual(1, context.ranges_done)  # cleaved the acceptor
+        self.assertEqual(1, context.ranges_todo)  # never reached sharded root
+
+    def test_cleave_shrinking_to_active_root_range_with_active_acceptor(self):
+        # if shrinking shard has both active root and active other acceptor,
+        # verify that shard only cleaves to one of them;
+        # root will sort before acceptor if acceptor.upper==MAX
+        broker = self._make_broker(account='.shards_a', container='shard_c')
+        broker.put_object(
+            'here_a', next(self.ts_iter), 10, 'text/plain', 'etag_a', 0, 0)
+        own_shard_range = ShardRange(
+            broker.path, next(self.ts_iter), 'here', 'there',
+            state=ShardRange.SHRINKING, epoch=next(self.ts_iter))
+        # active acceptor with upper bound == MAX
+        acceptor = ShardRange(
+            '.shards/other', next(self.ts_iter), 'here', '', deleted=False,
+            state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        # root is also active
+        root = ShardRange(
+            'a/c', next(self.ts_iter), '', '',
+            state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        broker.merge_shard_ranges([own_shard_range, acceptor, root])
+        broker.set_sharding_sysmeta('Root', 'a/c')
+        self.assertFalse(broker.is_root_container())  # sanity check
+        self.assertTrue(broker.set_sharding_state())
+
+        # expect cleave to the root
+        acceptor.upper = ''
+        acceptor.timestamp = next(self.ts_iter)
+        broker.merge_shard_ranges([acceptor])
+        with self._mock_sharder() as sharder:
+            self.assertTrue(sharder._cleave(broker))
+        context = CleavingContext.load(broker)
+        self.assertTrue(context.misplaced_done)
+        self.assertTrue(context.cleaving_done)
+        self.assertEqual(root.upper_str, context.cursor)
+        self.assertEqual(1, context.ranges_done)
+        self.assertEqual(1, context.ranges_todo)
+        info = [
+            line for line in self.logger.get_lines_for_level('info')
+            if line.startswith('Replicating new shard container a/c')
+        ]
+        self.assertEqual(1, len(info))
+
+    def test_cleave_shrinking_to_active_acceptor_with_active_root_range(self):
+        # if shrinking shard has both active root and active other acceptor,
+        # verify that shard only cleaves to one of them;
+        # root will sort after acceptor if acceptor.upper<MAX
+        broker = self._make_broker(account='.shards_a', container='shard_c')
+        broker.put_object(
+            'here_a', next(self.ts_iter), 10, 'text/plain', 'etag_a', 0, 0)
+        own_shard_range = ShardRange(
+            broker.path, next(self.ts_iter), 'here', 'there',
+            state=ShardRange.SHRINKING, epoch=next(self.ts_iter))
+        # active acceptor with upper bound < MAX
+        acceptor = ShardRange(
+            '.shards/other', next(self.ts_iter), 'here', 'where',
+            deleted=False, state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        # root is also active
+        root = ShardRange(
+            'a/c', next(self.ts_iter), '', '',
+            state=ShardRange.ACTIVE, epoch=next(self.ts_iter))
+        broker.merge_shard_ranges([own_shard_range, acceptor, root])
+        broker.set_sharding_sysmeta('Root', 'a/c')
+        self.assertFalse(broker.is_root_container())  # sanity check
+        self.assertTrue(broker.set_sharding_state())
+
+        # expect cleave to the acceptor
+        with self._mock_sharder() as sharder:
+            self.assertTrue(sharder._cleave(broker))
+        context = CleavingContext.load(broker)
+        self.assertTrue(context.misplaced_done)
+        self.assertTrue(context.cleaving_done)
+        self.assertEqual(acceptor.upper_str, context.cursor)
+        self.assertEqual(1, context.ranges_done)
+        self.assertEqual(1, context.ranges_todo)
+        info = [
+            line for line in self.logger.get_lines_for_level('info')
+            if line.startswith('Replicating new shard container .shards/other')
+        ]
+        self.assertEqual(1, len(info))
 
     def _check_complete_sharding(self, account, container, shard_bounds):
         broker = self._make_sharding_broker(
@@ -2382,6 +2898,49 @@ class TestSharder(BaseTestSharder):
         broker = self._check_complete_sharding(
             '.shards_', 'shard_c', (('l', 'mid'), ('mid', 'u')))
         self.assertEqual(1, broker.get_own_shard_range().deleted)
+
+    def test_complete_sharding_missing_own_shard_range(self):
+        broker = self._make_sharding_broker()
+        obj = {'name': 'obj', 'created_at': next(self.ts_iter).internal,
+               'size': 14, 'content_type': 'text/plain', 'etag': 'an etag',
+               'deleted': 0}
+        broker.get_brokers()[0].merge_items([obj])
+        self.assertEqual(2, len(broker.db_files))  # sanity check
+
+        # Make cleaving context_done
+        context = CleavingContext.load(broker)
+        self.assertEqual(1, context.max_row)
+        context.cleave_to_row = 1  # pretend all rows have been cleaved
+        context.cleaving_done = True
+        context.misplaced_done = True
+        context.store(broker)
+
+        with self._mock_sharder() as sharder, mock.patch(
+                'swift.container.backend.ContainerBroker.get_own_shard_range',
+                return_value=None):
+            self.assertFalse(sharder._complete_sharding(broker))
+        self.assertEqual(SHARDING, broker.get_db_state())
+        warning_lines = sharder.logger.get_lines_for_level('warning')
+        self.assertEqual(warning_lines[0],
+                         'Failed to get own_shard_range for a/c')
+
+    def test_sharded_record_sharding_progress_missing_contexts(self):
+        broker = self._check_complete_sharding(
+            'a', 'c', (('', 'mid'), ('mid', '')))
+
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(sharder, '_append_stat') as mocked:
+                sharder._record_sharding_progress(broker, {}, None)
+        mocked.assert_called_once_with('sharding_in_progress', 'all', mock.ANY)
+
+        # clear the contexts then run _record_sharding_progress
+        for context, _ in CleavingContext.load_all(broker):
+            context.delete(broker)
+
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(sharder, '_append_stat') as mocked:
+                sharder._record_sharding_progress(broker, {}, None)
+        mocked.assert_not_called()
 
     def test_identify_sharding_old_style_candidate(self):
         brokers = [self._make_broker(container='c%03d' % i) for i in range(6)]
@@ -3663,7 +4222,7 @@ class TestSharder(BaseTestSharder):
     def _check_old_style_find_shard_ranges_none_found(self, broker, objects):
         with self._mock_sharder() as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertGreater(sharder.split_size, len(objects))
+        self.assertGreater(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -3675,7 +4234,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder(
                 conf={'shard_container_threshold': 200}) as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(sharder.split_size, len(objects))
+        self.assertEqual(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -3712,11 +4271,13 @@ class TestSharder(BaseTestSharder):
         broker, objects = self._setup_old_style_find_ranges(
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
+                                      'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(99, sharder.split_size)
+        self.assertEqual(99, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         check_ranges()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
@@ -3727,6 +4288,8 @@ class TestSharder(BaseTestSharder):
 
         # second invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
+                                      'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
@@ -3763,7 +4326,7 @@ class TestSharder(BaseTestSharder):
     def _check_find_shard_ranges_none_found(self, broker, objects):
         with self._mock_sharder() as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertGreater(sharder.split_size, len(objects))
+        self.assertGreater(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -3775,7 +4338,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder(
                 conf={'shard_container_threshold': 200}) as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(sharder.split_size, len(objects))
+        self.assertEqual(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -3807,15 +4370,17 @@ class TestSharder(BaseTestSharder):
             self._assert_shard_ranges_equal(expected_ranges,
                                             broker.get_shard_ranges())
 
-        # first invocation finds both ranges
+        # first invocation finds both ranges, sizes 99 and 1
         broker, objects = self._setup_find_ranges(
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
+                                      'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(99, sharder.split_size)
+        self.assertEqual(99, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         check_ranges()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
@@ -3861,12 +4426,14 @@ class TestSharder(BaseTestSharder):
                 now, objects[89][0], upper, 10),
         ]
         # first invocation finds 2 ranges
+        # (third shard range will be > minimum_shard_size)
         with self._mock_sharder(
                 conf={'shard_container_threshold': 90,
-                      'shard_scanner_batch_size': 2}) as sharder:
+                      'shard_scanner_batch_size': 2,
+                      'minimum_shard_size': 10}) as sharder:
             with mock_timestamp_now(now):
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(45, sharder.split_size)
+        self.assertEqual(45, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         self.assertEqual(2, len(broker.get_shard_ranges()))
         self._assert_shard_ranges_equal(expected_ranges[:2],
@@ -3878,8 +4445,9 @@ class TestSharder(BaseTestSharder):
         self.assertGreaterEqual(stats['max_time'], stats['min_time'])
 
         # second invocation finds third shard range
-        with self._mock_sharder(conf={'shard_container_threshold': 199,
-                                      'shard_scanner_batch_size': 2}
+        with self._mock_sharder(conf={'shard_container_threshold': 90,
+                                      'shard_scanner_batch_size': 2,
+                                      'minimum_shard_size': 10}
                                 ) as sharder:
             with mock_timestamp_now(now):
                 num_found = sharder._find_shard_ranges(broker)
@@ -3895,7 +4463,9 @@ class TestSharder(BaseTestSharder):
 
         # third invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
-                                      'shard_scanner_batch_size': 2}
+                                      'shard_scanner_batch_size': 2,
+                                      'shrink_threshold': 0,
+                                      'minimum_shard_size': 10}
                                 ) as sharder:
             sharder._send_shard_ranges = mock.MagicMock(return_value=True)
             num_found = sharder._find_shard_ranges(broker)
@@ -3914,6 +4484,41 @@ class TestSharder(BaseTestSharder):
 
     def test_find_shard_ranges_finds_three_shard(self):
         self._check_find_shard_ranges_finds_three('.shards_a', 'c_', 'l', 'u')
+
+    def test_find_shard_ranges_with_minimum_size(self):
+        cont = 'c_'
+        lower = 'l'
+        upper = 'u'
+        broker, objects = self._setup_find_ranges(
+            '.shards_a', 'c_', lower, upper)
+        now = Timestamp.now()
+        expected_ranges = [
+            ShardRange(
+                ShardRange.make_path('.shards_a', 'c', cont, now, 0),
+                now, lower, objects[44][0], 45),
+            ShardRange(
+                ShardRange.make_path('.shards_a', 'c', cont, now, 1),
+                now, objects[44][0], upper, 55),
+        ]
+        # first invocation finds 2 ranges - second has been extended to avoid
+        # final shard range < minimum_size
+        with self._mock_sharder(
+                conf={'shard_container_threshold': 90,
+                      'shard_scanner_batch_size': 2,
+                      'minimum_shard_size': 11}) as sharder:
+            with mock_timestamp_now(now):
+                num_found = sharder._find_shard_ranges(broker)
+        self.assertEqual(45, sharder.rows_per_shard)
+        self.assertEqual(11, sharder.minimum_shard_size)
+        self.assertEqual(2, num_found)
+        self.assertEqual(2, len(broker.get_shard_ranges()))
+        self._assert_shard_ranges_equal(expected_ranges[:2],
+                                        broker.get_shard_ranges())
+        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
+                          'found': 2, 'min_time': mock.ANY,
+                          'max_time': mock.ANY}
+        stats = self._assert_stats(expected_stats, sharder, 'scanned')
+        self.assertGreaterEqual(stats['max_time'], stats['min_time'])
 
     def test_sharding_enabled(self):
         broker = self._make_broker()
@@ -4259,12 +4864,14 @@ class TestSharder(BaseTestSharder):
     def check_shard_ranges_sent(self, broker, expected_sent):
         bodies = []
         servers = []
+        referers = []
 
         def capture_send(conn, data):
             bodies.append(data)
 
-        def capture_connect(host, port, *a, **kw):
+        def capture_connect(host, port, _method, _path, headers, *a, **kw):
             servers.append((host, port))
+            referers.append(headers.get('Referer'))
 
         self.assertFalse(broker.get_own_shard_range().reported)  # sanity
         with self._mock_sharder() as sharder:
@@ -4283,6 +4890,7 @@ class TestSharder(BaseTestSharder):
             ('10.0.1.1', 1101),
             ('10.0.1.2', 1102),
         ])
+        self.assertEqual([broker.path] * 3, referers)
         self.assertTrue(broker.get_own_shard_range().reported)
 
     def test_update_root_container_own_range(self):
@@ -4312,9 +4920,38 @@ class TestSharder(BaseTestSharder):
                          bytes_used=own_shard_range.bytes_used + 1)]
                 self.check_shard_ranges_sent(broker, expected_sent)
 
+        # initialise tombstones
+        with mock_timestamp_now(next(self.ts_iter)):
+            own_shard_range = broker.get_own_shard_range()
+            own_shard_range.update_tombstones(0)
+            broker.merge_shard_ranges([own_shard_range])
+
         for state in ShardRange.STATES:
             with annotate_failure(state):
                 check_only_own_shard_range_sent(state)
+
+        def check_tombstones_sent(state):
+            own_shard_range = broker.get_own_shard_range()
+            self.assertTrue(own_shard_range.update_state(
+                state, state_timestamp=next(self.ts_iter)))
+            broker.merge_shard_ranges([own_shard_range])
+            # delete an object, expect to see it reflected in the own shard
+            # range that is sent
+            broker.delete_object(str(own_shard_range.object_count),
+                                 next(self.ts_iter).internal)
+            with mock_timestamp_now() as now:
+                # force own shard range meta updates to be at fixed timestamp
+                expected_sent = [
+                    dict(own_shard_range,
+                         meta_timestamp=now.internal,
+                         object_count=own_shard_range.object_count - 1,
+                         bytes_used=own_shard_range.bytes_used - 1,
+                         tombstones=own_shard_range.tombstones + 1)]
+                self.check_shard_ranges_sent(broker, expected_sent)
+
+        for state in ShardRange.STATES:
+            with annotate_failure(state):
+                check_tombstones_sent(state)
 
     def test_update_root_container_already_reported(self):
         broker = self._make_broker()
@@ -4337,6 +4974,12 @@ class TestSharder(BaseTestSharder):
                 with mocked_http_conn() as mock_conn:
                     sharder._update_root_container(broker)
             self.assertFalse(mock_conn.requests)
+
+        # initialise tombstones
+        with mock_timestamp_now(next(self.ts_iter)):
+            own_shard_range = broker.get_own_shard_range()
+            own_shard_range.update_tombstones(0)
+            broker.merge_shard_ranges([own_shard_range])
 
         for state in ShardRange.STATES:
             with annotate_failure(state):
@@ -4369,7 +5012,8 @@ class TestSharder(BaseTestSharder):
                     own_shard_range.copy(
                         meta_timestamp=now.internal,
                         object_count=own_shard_range.object_count + 1,
-                        bytes_used=own_shard_range.bytes_used + 1)] +
+                        bytes_used=own_shard_range.bytes_used + 1,
+                        tombstones=0)] +
                     shard_ranges,
                     key=lambda sr: (sr.upper, sr.state, sr.lower))
                 self.check_shard_ranges_sent(
@@ -4379,10 +5023,48 @@ class TestSharder(BaseTestSharder):
             with annotate_failure(state):
                 check_all_shard_ranges_sent(state)
 
+    def test_audit_root_container_reset_epoch(self):
+        epoch = next(self.ts_iter)
+        broker = self._make_broker(epoch=epoch.normal)
+        shard_bounds = (('', 'j'), ('j', 'k'), ('k', 's'),
+                        ('s', 'y'), ('y', ''))
+        shard_ranges = self._make_shard_ranges(shard_bounds,
+                                               ShardRange.ACTIVE,
+                                               timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges)
+        own_shard_range = broker.get_own_shard_range()
+        own_shard_range.update_state(ShardRange.SHARDED, next(self.ts_iter))
+        own_shard_range.epoch = epoch
+        broker.merge_shard_ranges(own_shard_range)
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(
+                    sharder, '_audit_shard_container') as mocked:
+                sharder._audit_container(broker)
+        self.assertFalse(sharder.logger.get_lines_for_level('warning'))
+        self.assertFalse(sharder.logger.get_lines_for_level('error'))
+        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+                           sharder, 'audit_root')
+        mocked.assert_not_called()
+
+        # test for a reset epoch
+        own_shard_range = broker.get_own_shard_range()
+        own_shard_range.epoch = None
+        own_shard_range.state_timestamp = next(self.ts_iter)
+        broker.merge_shard_ranges(own_shard_range)
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(
+                    sharder, '_audit_shard_container') as mocked:
+                sharder._audit_container(broker)
+        lines = sharder.logger.get_lines_for_level('warning')
+
+        self.assertIn("own_shard_range reset to None should be %s"
+                      % broker.db_epoch, lines[0])
+
     def test_audit_root_container(self):
         broker = self._make_broker()
 
-        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0}
+        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
+                          'has_overlap': 0, 'num_overlap': 0}
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
@@ -4396,11 +5078,15 @@ class TestSharder(BaseTestSharder):
             self.assertIn(
                 'Audit failed for root %s' % broker.db_file, line)
             self.assertIn(
-                'overlapping ranges in state %s: k-t s-z' % state_text,
-                line)
+                'overlapping ranges in state %r: k-t s-y, y-z y-z'
+                % state_text, line)
+            # check for no duplicates in reversed order
+            self.assertNotIn('s-z k-t', line)
 
-        expected_stats = {'attempted': 1, 'success': 0, 'failure': 1}
-        shard_bounds = (('a', 'j'), ('k', 't'), ('s', 'z'))
+        expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
+                          'has_overlap': 1, 'num_overlap': 2}
+        shard_bounds = (('a', 'j'), ('k', 't'), ('s', 'y'),
+                        ('y', 'z'), ('y', 'z'))
         for state, state_text in ShardRange.STATES.items():
             if state in (ShardRange.SHRINKING,
                          ShardRange.SHARDED,
@@ -4430,7 +5116,8 @@ class TestSharder(BaseTestSharder):
                 sharder._audit_container(broker)
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
-        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
+                            'has_overlap': 0, 'num_overlap': 0},
                            sharder, 'audit_root')
         mocked.assert_not_called()
 
@@ -4446,7 +5133,8 @@ class TestSharder(BaseTestSharder):
                     sharder._audit_container(broker)
             self.assertFalse(sharder.logger.get_lines_for_level('warning'))
             self.assertFalse(sharder.logger.get_lines_for_level('error'))
-            self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+            self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
+                                'has_overlap': 0, 'num_overlap': 0},
                                sharder, 'audit_root')
             mocked.assert_not_called()
 
@@ -4499,6 +5187,7 @@ class TestSharder(BaseTestSharder):
                 mock_response = mock.MagicMock()
                 mock_response.headers = {'x-backend-record-type':
                                          'shard'}
+                shard_ranges.sort(key=ShardRange.sort_key)
                 mock_response.body = json.dumps(
                     [dict(sr) for sr in shard_ranges])
                 mock_swift.make_request.return_value = mock_response
@@ -4520,7 +5209,8 @@ class TestSharder(BaseTestSharder):
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
                             'X-Backend-Override-Deleted': 'true'}
-        params = {'format': 'json', 'marker': marker, 'end_marker': end_marker}
+        params = {'format': 'json', 'marker': marker, 'end_marker': end_marker,
+                  'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
             'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
             params=params)
@@ -4591,7 +5281,8 @@ class TestSharder(BaseTestSharder):
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
                             'X-Backend-Override-Deleted': 'true'}
-        params = {'format': 'json', 'marker': 'j', 'end_marker': 'k'}
+        params = {'format': 'json', 'marker': 'j', 'end_marker': 'k',
+                  'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
             'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
             params=params)
@@ -4605,7 +5296,7 @@ class TestSharder(BaseTestSharder):
         self.assertEqual([own_shard_range],
                          broker.get_shard_ranges(include_own=True))
 
-        # move root shard range to shrinking state
+        # move root version of own shard range to shrinking state
         root_ts = next(self.ts_iter)
         self.assertTrue(shard_ranges[1].update_state(ShardRange.SHRINKING,
                                                      state_timestamp=root_ts))
@@ -4626,7 +5317,8 @@ class TestSharder(BaseTestSharder):
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
                             'X-Backend-Override-Deleted': 'true'}
-        params = {'format': 'json', 'marker': 'k', 'end_marker': 't'}
+        params = {'format': 'json', 'marker': 'k', 'end_marker': 't',
+                  'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
             'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
             params=params)
@@ -4659,7 +5351,8 @@ class TestSharder(BaseTestSharder):
         self.assertFalse(lines[2:])
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
         self.assertFalse(broker.is_deleted())
-        params = {'format': 'json', 'marker': 'j', 'end_marker': 'k'}
+        params = {'format': 'json', 'marker': 'j', 'end_marker': 'k',
+                  'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
             'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
             params=params)
@@ -4788,7 +5481,8 @@ class TestSharder(BaseTestSharder):
                                 'X-Newest': 'true',
                                 'X-Backend-Include-Deleted': 'True',
                                 'X-Backend-Override-Deleted': 'true'}
-            params = {'format': 'json', 'marker': 'k', 'end_marker': 't'}
+            params = {'format': 'json', 'marker': 'k', 'end_marker': 't',
+                      'states': 'auditing'}
             mock_swift.make_request.assert_called_once_with(
                 'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
                 params=params)
@@ -4844,6 +5538,61 @@ class TestSharder(BaseTestSharder):
     def test_audit_shard_container_merge_other_ranges(self):
         self._do_test_audit_shard_container_merge_other_ranges('Quoted-Root',
                                                                'a/c')
+
+    def _do_test_audit_shard_container_with_root_ranges(self, *args):
+        # shards may merge acceptors and the root range when shrinking; verify
+        # that shard audit is ok with merged ranges
+        def check_audit(own_state, acceptor_state, root_state):
+            broker = self._make_broker(
+                account='.shards_a',
+                container='shard_c_%s' % next(self.ts_iter).normal)
+            broker.set_sharding_sysmeta(*args)
+            own_sr = broker.get_own_shard_range().copy(
+                state=own_state, state_timestamp=next(self.ts_iter),
+                lower='a', upper='b', timestamp=next(self.ts_iter))
+            broker.merge_shard_ranges([own_sr])
+
+            # make acceptor and root ranges that overlap with the shard
+            overlaps = self._make_shard_ranges([('a', 'c'), ('', '')],
+                                               [acceptor_state, root_state])
+            sharder, mock_swift = self.call_audit_container(
+                broker, [own_sr] + overlaps)
+            expected_headers = {'X-Backend-Record-Type': 'shard',
+                                'X-Newest': 'true',
+                                'X-Backend-Include-Deleted': 'True',
+                                'X-Backend-Override-Deleted': 'true'}
+            params = {'format': 'json', 'marker': 'a', 'end_marker': 'b',
+                      'states': 'auditing'}
+            mock_swift.make_request.assert_called_once_with(
+                'GET', '/v1/a/c', expected_headers, acceptable_statuses=(2,),
+                params=params)
+            if own_state in (ShardRange.SHRINKING, ShardRange.SHRUNK):
+                # check acceptor & root are merged into audited shard
+                self.assertEqual(
+                    [dict(sr) for sr in overlaps],
+                    [dict(sr) for sr in broker.get_shard_ranges()])
+            return sharder
+
+        def assert_ok(own_state, acceptor_state, root_state):
+            sharder = check_audit(own_state, acceptor_state, root_state)
+            expected_stats = {'attempted': 1, 'success': 1, 'failure': 0}
+            with annotate_failure('with states %s %s %s'
+                                  % (own_state, acceptor_state, root_state)):
+                self._assert_stats(expected_stats, sharder, 'audit_shard')
+                self.assertFalse(sharder.logger.get_lines_for_level('warning'))
+                self.assertFalse(sharder.logger.get_lines_for_level('error'))
+
+        for own_state in ShardRange.STATES:
+            for acceptor_state in ShardRange.STATES:
+                for root_state in ShardRange.STATES:
+                    assert_ok(own_state, acceptor_state, root_state)
+
+    def test_audit_old_style_shard_container_with_root_ranges(self):
+        self._do_test_audit_shard_container_with_root_ranges('Root', 'a/c')
+
+    def test_audit_shard_container_with_root_ranges(self):
+        self._do_test_audit_shard_container_with_root_ranges('Quoted-Root',
+                                                             'a/c')
 
     def test_audit_deleted_range_in_root_container(self):
         broker = self._make_broker(account='.shards_a', container='shard_c')
@@ -4951,13 +5700,14 @@ class TestSharder(BaseTestSharder):
     def test_find_and_enable_sharding_candidates_bootstrap(self):
         broker = self._make_broker()
         with self._mock_sharder(
-                conf={'shard_container_threshold': 1}) as sharder:
+                conf={'shard_container_threshold': 2}) as sharder:
             sharder._find_and_enable_sharding_candidates(broker)
         self.assertEqual(ShardRange.ACTIVE, broker.get_own_shard_range().state)
-        broker.put_object('obj', next(self.ts_iter).internal, 1, '', '')
-        self.assertEqual(1, broker.get_info()['object_count'])
+        broker.put_object('obj1', next(self.ts_iter).internal, 1, '', '')
+        broker.put_object('obj2', next(self.ts_iter).internal, 1, '', '')
+        self.assertEqual(2, broker.get_info()['object_count'])
         with self._mock_sharder(
-                conf={'shard_container_threshold': 1}) as sharder:
+                conf={'shard_container_threshold': 2}) as sharder:
             with mock_timestamp_now() as now:
                 sharder._find_and_enable_sharding_candidates(
                     broker, [broker.get_own_shard_range()])
@@ -4968,7 +5718,7 @@ class TestSharder(BaseTestSharder):
 
         # check idempotency
         with self._mock_sharder(
-                conf={'shard_container_threshold': 1}) as sharder:
+                conf={'shard_container_threshold': 2}) as sharder:
             with mock_timestamp_now():
                 sharder._find_and_enable_sharding_candidates(
                     broker, [broker.get_own_shard_range()])
@@ -4981,11 +5731,15 @@ class TestSharder(BaseTestSharder):
         broker = self._make_broker()
         broker.enable_sharding(next(self.ts_iter))
         shard_bounds = (('', 'here'), ('here', 'there'), ('there', ''))
-        size = (DEFAULT_SHARD_SHRINK_POINT *
-                DEFAULT_SHARD_CONTAINER_THRESHOLD / 100)
+        size = (DEFAULT_SHARDER_CONF['shrink_threshold'])
+
+        # all shard ranges too big to shrink
         shard_ranges = self._make_shard_ranges(
-            shard_bounds, state=ShardRange.ACTIVE, object_count=size)
-        broker.merge_shard_ranges(shard_ranges)
+            shard_bounds, state=ShardRange.ACTIVE, object_count=size - 1,
+            tombstones=1)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED, Timestamp.now())
+        broker.merge_shard_ranges(shard_ranges + [own_sr])
         self.assertTrue(broker.set_sharding_state())
         self.assertTrue(broker.set_sharded_state())
         with self._mock_sharder() as sharder:
@@ -4994,7 +5748,7 @@ class TestSharder(BaseTestSharder):
                                         broker.get_shard_ranges())
 
         # one range just below threshold
-        shard_ranges[0].update_meta(size - 1, 0)
+        shard_ranges[0].update_meta(size - 2, 0)
         broker.merge_shard_ranges(shard_ranges[0])
         with self._mock_sharder() as sharder:
             with mock_timestamp_now() as now:
@@ -5078,6 +5832,52 @@ class TestSharder(BaseTestSharder):
                        [final_donor, broker.get_own_shard_range()])]
         )
 
+    def test_find_and_enable_multiple_shrinking_candidates(self):
+        broker = self._make_broker()
+        broker.enable_sharding(next(self.ts_iter))
+        shard_bounds = (('', 'a'), ('a', 'b'), ('b', 'c'),
+                        ('c', 'd'), ('d', 'e'), ('e', ''))
+        size = (DEFAULT_SHARDER_CONF['shrink_threshold'])
+        shard_ranges = self._make_shard_ranges(
+            shard_bounds, state=ShardRange.ACTIVE, object_count=size)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED, Timestamp.now())
+        broker.merge_shard_ranges(shard_ranges + [own_sr])
+        self.assertTrue(broker.set_sharding_state())
+        self.assertTrue(broker.set_sharded_state())
+        with self._mock_sharder() as sharder:
+            sharder._find_and_enable_shrinking_candidates(broker)
+        self._assert_shard_ranges_equal(shard_ranges,
+                                        broker.get_shard_ranges())
+
+        # three ranges just below threshold
+        shard_ranges = broker.get_shard_ranges()  # get timestamps updated
+        shard_ranges[0].update_meta(size - 1, 0)
+        shard_ranges[1].update_meta(size - 1, 0)
+        shard_ranges[3].update_meta(size - 1, 0)
+        broker.merge_shard_ranges(shard_ranges)
+        with self._mock_sharder() as sharder:
+            with mock_timestamp_now() as now:
+                sharder._send_shard_ranges = mock.MagicMock()
+                sharder._find_and_enable_shrinking_candidates(broker)
+        # 0 shrinks into 1 (only one donor per acceptor is allowed)
+        shard_ranges[0].update_state(ShardRange.SHRINKING, state_timestamp=now)
+        shard_ranges[0].epoch = now
+        shard_ranges[1].lower = shard_ranges[0].lower
+        shard_ranges[1].timestamp = now
+        # 3 shrinks into 4
+        shard_ranges[3].update_state(ShardRange.SHRINKING, state_timestamp=now)
+        shard_ranges[3].epoch = now
+        shard_ranges[4].lower = shard_ranges[3].lower
+        shard_ranges[4].timestamp = now
+        self._assert_shard_ranges_equal(shard_ranges,
+                                        broker.get_shard_ranges())
+        for donor, acceptor in (shard_ranges[:2], shard_ranges[3:5]):
+            sharder._send_shard_ranges.assert_has_calls(
+                [mock.call(acceptor.account, acceptor.container, [acceptor]),
+                 mock.call(donor.account, donor.container, [donor, acceptor])]
+            )
+
     def test_partition_and_device_filters(self):
         # verify partitions and devices kwargs result in filtering of processed
         # containers but not of the local device ids.
@@ -5156,21 +5956,21 @@ class TestSharder(BaseTestSharder):
 
     def test_audit_cleave_contexts(self):
 
-        def add_cleave_context(id, last_modified):
+        def add_cleave_context(id, last_modified, cleaving_done):
             params = {'ref': id,
                       'cursor': 'curs',
                       'max_row': 2,
                       'cleave_to_row': 2,
                       'last_cleave_to_row': 1,
-                      'cleaving_done': False,
+                      'cleaving_done': cleaving_done,
                       'misplaced_done': True,
                       'ranges_done': 2,
                       'ranges_todo': 4}
             key = 'X-Container-Sysmeta-Shard-Context-%s' % id
-            with mock_timestamp_now(Timestamp(last_modified)):
+            with mock_timestamp_now(last_modified):
                 broker.update_metadata(
                     {key: (json.dumps(params),
-                           Timestamp(last_modified).internal)})
+                           last_modified.internal)})
 
         def get_context(id, broker):
             data = broker.get_sharding_sysmeta().get('Context-%s' % id)
@@ -5179,6 +5979,7 @@ class TestSharder(BaseTestSharder):
             return data
 
         reclaim_age = 100
+        recon_sharded_timeout = 50
         broker = self._make_broker()
 
         # sanity check
@@ -5186,30 +5987,273 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(UNSHARDED, broker.get_db_state())
 
         # Setup some cleaving contexts
-        id_old, id_newish = [str(uuid4()) for _ in range(2)]
-        contexts = ((id_old, 1),
-                    (id_newish, reclaim_age // 2))
-        for id, last_modified in contexts:
-            add_cleave_context(id, last_modified)
+        id_old, id_newish, id_complete = [str(uuid4()) for _ in range(3)]
+        ts_old, ts_newish, ts_complete = (
+            Timestamp(1),
+            Timestamp(reclaim_age // 2),
+            Timestamp(reclaim_age - recon_sharded_timeout))
+        contexts = ((id_old, ts_old, False),
+                    (id_newish, ts_newish, False),
+                    (id_complete, ts_complete, True))
+        for id, last_modified, cleaving_done in contexts:
+            add_cleave_context(id, last_modified, cleaving_done)
 
-        with self._mock_sharder({'reclaim_age': str(reclaim_age)}) as sharder:
+        sharder_conf = {'reclaim_age': str(reclaim_age),
+                        'recon_sharded_timeout': str(recon_sharded_timeout)}
+
+        with self._mock_sharder(sharder_conf) as sharder:
             with mock_timestamp_now(Timestamp(reclaim_age + 2)):
                 sharder._audit_cleave_contexts(broker)
 
+        # old context is stale, ie last modified reached reclaim_age and was
+        # never completed (done).
         old_ctx = get_context(id_old, broker)
         self.assertEqual(old_ctx, "")
 
+        # Newish context is almost stale, as in it's been 1/2 reclaim age since
+        # it was last modified yet it's not completed. So it haven't been
+        # cleaned up.
         newish_ctx = get_context(id_newish, broker)
         self.assertEqual(newish_ctx.ref, id_newish)
 
-        # If we push time another reclaim age later, and they all be removed
-        # minus id_missing_lm as it has a later last_modified.
-        with self._mock_sharder({'reclaim_age': str(reclaim_age)}) as sharder:
+        # Complete context is complete (done) and it's been
+        # recon_sharded_timeout time since it was marked completed so it's
+        # been removed
+        complete_ctx = get_context(id_complete, broker)
+        self.assertEqual(complete_ctx, "")
+
+        # If we push time another reclaim age later, they are all removed
+        with self._mock_sharder(sharder_conf) as sharder:
             with mock_timestamp_now(Timestamp(reclaim_age * 2)):
                 sharder._audit_cleave_contexts(broker)
 
         newish_ctx = get_context(id_newish, broker)
         self.assertEqual(newish_ctx, "")
+
+    def test_shrinking_candidate_recon_dump(self):
+        conf = {'recon_cache_path': self.tempdir,
+                'devices': self.tempdir}
+
+        shard_bounds = (
+            ('', 'd'), ('d', 'g'), ('g', 'l'), ('l', 'o'), ('o', 't'),
+            ('t', 'x'), ('x', ''))
+
+        with self._mock_sharder(conf) as sharder:
+            brokers = []
+            shard_ranges = []
+            C1, C2, C3 = 0, 1, 2
+
+            for container in ('c1', 'c2', 'c3'):
+                broker = self._make_broker(
+                    container=container, hash_=container + 'hash',
+                    device=sharder.ring.devs[0]['device'], part=0)
+                broker.update_metadata({'X-Container-Sysmeta-Sharding':
+                                        ('true', next(self.ts_iter).internal)})
+                my_sr = broker.get_own_shard_range()
+                my_sr.epoch = Timestamp.now()
+                broker.merge_shard_ranges([my_sr])
+                brokers.append(broker)
+                shard_ranges.append(self._make_shard_ranges(
+                    shard_bounds, state=ShardRange.ACTIVE,
+                    object_count=(
+                        DEFAULT_SHARDER_CONF['shard_container_threshold'] / 2),
+                    timestamp=next(self.ts_iter)))
+
+            # we want c2 to have 2 shrink pairs
+            shard_ranges[C2][1].object_count = 0
+            shard_ranges[C2][3].object_count = 0
+            brokers[C2].merge_shard_ranges(shard_ranges[C2])
+            brokers[C2].set_sharding_state()
+            brokers[C2].set_sharded_state()
+
+            # we want c1 to have the same, but one can't be shrunk
+            shard_ranges[C1][1].object_count = 0
+            shard_ranges[C1][2].object_count = \
+                DEFAULT_SHARDER_CONF['shard_container_threshold'] - 1
+            shard_ranges[C1][3].object_count = 0
+            brokers[C1].merge_shard_ranges(shard_ranges[C1])
+            brokers[C1].set_sharding_state()
+            brokers[C1].set_sharded_state()
+
+            # c3 we want to have more total_sharding donors then can be sharded
+            # in one go.
+            shard_ranges[C3][0].object_count = 0
+            shard_ranges[C3][1].object_count = 0
+            shard_ranges[C3][2].object_count = 0
+            shard_ranges[C3][3].object_count = 0
+            shard_ranges[C3][4].object_count = 0
+            shard_ranges[C3][5].object_count = 0
+            brokers[C3].merge_shard_ranges(shard_ranges[C3])
+            brokers[C3].set_sharding_state()
+            brokers[C3].set_sharded_state()
+
+            node = {'ip': '10.0.0.0', 'replication_ip': '10.0.1.0',
+                    'port': 1000, 'replication_port': 1100,
+                    'device': 'sda', 'zone': 0, 'region': 0, 'id': 1,
+                    'index': 0}
+
+            for broker in brokers:
+                sharder._identify_shrinking_candidate(broker, node)
+
+            sharder._report_stats()
+            expected_shrinking_candidates_data = {
+                'found': 3,
+                'top': [
+                    {
+                        'object_count': mock.ANY,
+                        'account': brokers[C3].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C3].container,
+                        'file_size': os.stat(brokers[C3].db_file).st_size,
+                        'path': brokers[C3].db_file,
+                        'root': brokers[C3].path,
+                        'node_index': 0,
+                        'compactible_ranges': 3
+                    }, {
+                        'object_count': mock.ANY,
+                        'account': brokers[C2].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C2].container,
+                        'file_size': os.stat(brokers[1].db_file).st_size,
+                        'path': brokers[C2].db_file,
+                        'root': brokers[C2].path,
+                        'node_index': 0,
+                        'compactible_ranges': 2
+                    }, {
+                        'object_count': mock.ANY,
+                        'account': brokers[C1].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C1].container,
+                        'file_size': os.stat(brokers[C1].db_file).st_size,
+                        'path': brokers[C1].db_file,
+                        'root': brokers[C1].path,
+                        'node_index': 0,
+                        'compactible_ranges': 1
+                    }
+                ]}
+            self._assert_recon_stats(expected_shrinking_candidates_data,
+                                     sharder, 'shrinking_candidates')
+
+            # check shrinking stats are reset
+            sharder._zero_stats()
+            for broker in brokers:
+                sharder._identify_shrinking_candidate(broker, node)
+            sharder._report_stats()
+            self._assert_recon_stats(expected_shrinking_candidates_data,
+                                     sharder, 'shrinking_candidates')
+
+            # set some ranges to shrinking and check that stats are updated; in
+            # this case the container C2 no longer has any shrinkable ranges
+            # and no longer appears in stats
+            def shrink_actionable_ranges(broker):
+                compactible = find_compactible_shard_sequences(
+                    broker, sharder.shrink_threshold, sharder.expansion_limit,
+                    1, -1)
+                self.assertNotEqual([], compactible)
+                with mock_timestamp_now(next(self.ts_iter)):
+                    process_compactible_shard_sequences(broker, compactible)
+
+            shrink_actionable_ranges(brokers[C2])
+            sharder._zero_stats()
+            for broker in brokers:
+                sharder._identify_shrinking_candidate(broker, node)
+            sharder._report_stats()
+            expected_shrinking_candidates_data = {
+                'found': 2,
+                'top': [
+                    {
+                        'object_count': mock.ANY,
+                        'account': brokers[C3].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C3].container,
+                        'file_size': os.stat(brokers[C3].db_file).st_size,
+                        'path': brokers[C3].db_file,
+                        'root': brokers[C3].path,
+                        'node_index': 0,
+                        'compactible_ranges': 3
+                    }, {
+                        'object_count': mock.ANY,
+                        'account': brokers[C1].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C1].container,
+                        'file_size': os.stat(brokers[C1].db_file).st_size,
+                        'path': brokers[C1].db_file,
+                        'root': brokers[C1].path,
+                        'node_index': 0,
+                        'compactible_ranges': 1
+                    }
+                ]}
+            self._assert_recon_stats(expected_shrinking_candidates_data,
+                                     sharder, 'shrinking_candidates')
+
+            # set some ranges to shrinking and check that stats are updated; in
+            # this case the container C3 no longer has any actionable ranges
+            # and no longer appears in stats
+            shrink_actionable_ranges(brokers[C3])
+            sharder._zero_stats()
+            for broker in brokers:
+                sharder._identify_shrinking_candidate(broker, node)
+            sharder._report_stats()
+            expected_shrinking_candidates_data = {
+                'found': 1,
+                'top': [
+                    {
+                        'object_count': mock.ANY,
+                        'account': brokers[C1].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C1].container,
+                        'file_size': os.stat(brokers[C1].db_file).st_size,
+                        'path': brokers[C1].db_file,
+                        'root': brokers[C1].path,
+                        'node_index': 0,
+                        'compactible_ranges': 1
+                    }
+                ]}
+            self._assert_recon_stats(expected_shrinking_candidates_data,
+                                     sharder, 'shrinking_candidates')
+
+            # set some ranges to shrunk in C3 so that other sequences become
+            # compactible
+            now = next(self.ts_iter)
+            shard_ranges = brokers[C3].get_shard_ranges()
+            for (donor, acceptor) in zip(shard_ranges, shard_ranges[1:]):
+                if donor.state == ShardRange.SHRINKING:
+                    donor.update_state(ShardRange.SHRUNK, state_timestamp=now)
+                    donor.set_deleted(timestamp=now)
+                    acceptor.lower = donor.lower
+                    acceptor.timestamp = now
+            brokers[C3].merge_shard_ranges(shard_ranges)
+            sharder._zero_stats()
+            for broker in brokers:
+                sharder._identify_shrinking_candidate(broker, node)
+            sharder._report_stats()
+            expected_shrinking_candidates_data = {
+                'found': 2,
+                'top': [
+                    {
+                        'object_count': mock.ANY,
+                        'account': brokers[C3].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C3].container,
+                        'file_size': os.stat(brokers[C3].db_file).st_size,
+                        'path': brokers[C3].db_file,
+                        'root': brokers[C3].path,
+                        'node_index': 0,
+                        'compactible_ranges': 2
+                    }, {
+                        'object_count': mock.ANY,
+                        'account': brokers[C1].account,
+                        'meta_timestamp': mock.ANY,
+                        'container': brokers[C1].container,
+                        'file_size': os.stat(brokers[C1].db_file).st_size,
+                        'path': brokers[C1].db_file,
+                        'root': brokers[C1].path,
+                        'node_index': 0,
+                        'compactible_ranges': 1
+                    }
+                ]}
+            self._assert_recon_stats(expected_shrinking_candidates_data,
+                                     sharder, 'shrinking_candidates')
 
 
 class TestCleavingContext(BaseTestSharder):
@@ -5338,6 +6382,11 @@ class TestCleavingContext(BaseTestSharder):
             else:
                 self.assertEqual(lm, timestamp.internal)
 
+        # delete all contexts
+        for ctx, lm in CleavingContext.load_all(broker):
+            ctx.delete(broker)
+        self.assertEqual([], CleavingContext.load_all(broker))
+
     def test_delete(self):
         broker = self._make_broker()
 
@@ -5360,6 +6409,7 @@ class TestCleavingContext(BaseTestSharder):
         # Now let's delete it. When deleted the metadata key will exist, but
         # the value will be "" as this means it'll be reaped later.
         ctx.delete(broker)
+
         sysmeta = broker.get_sharding_sysmeta()
         for key, val in sysmeta.items():
             if key == "Context-%s" % db_id:
@@ -5638,13 +6688,896 @@ class TestCleavingContext(BaseTestSharder):
         self.assertEqual(4, ctx.ranges_todo)
         self.assertEqual('b', ctx.cursor)
 
-        ctx.range_done(None)
-        self.assertEqual(2, ctx.ranges_done)
-        self.assertEqual(3, ctx.ranges_todo)
-        self.assertEqual('b', ctx.cursor)
-
         ctx.ranges_todo = 9
         ctx.range_done('c')
-        self.assertEqual(3, ctx.ranges_done)
+        self.assertEqual(2, ctx.ranges_done)
         self.assertEqual(8, ctx.ranges_todo)
         self.assertEqual('c', ctx.cursor)
+
+    def test_done(self):
+        ctx = CleavingContext(
+            'test', '', max_row=12, cleave_to_row=12, last_cleave_to_row=2,
+            cleaving_done=True, misplaced_done=True)
+        self.assertTrue(ctx.done())
+        ctx = CleavingContext(
+            'test', '', max_row=12, cleave_to_row=11, last_cleave_to_row=2,
+            cleaving_done=True, misplaced_done=True)
+        self.assertFalse(ctx.done())
+        ctx = CleavingContext(
+            'test', '', max_row=12, cleave_to_row=12, last_cleave_to_row=2,
+            cleaving_done=True, misplaced_done=False)
+        self.assertFalse(ctx.done())
+        ctx = CleavingContext(
+            'test', '', max_row=12, cleave_to_row=12, last_cleave_to_row=2,
+            cleaving_done=False, misplaced_done=True)
+        self.assertFalse(ctx.done())
+
+
+class TestSharderFunctions(BaseTestSharder):
+    def test_find_shrinking_candidates(self):
+        broker = self._make_broker()
+        shard_bounds = (('', 'a'), ('a', 'b'), ('b', 'c'), ('c', 'd'))
+        threshold = (DEFAULT_SHARDER_CONF['shrink_threshold'])
+        shard_ranges = self._make_shard_ranges(
+            shard_bounds, state=ShardRange.ACTIVE, object_count=threshold,
+            timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges)
+        pairs = find_shrinking_candidates(broker, threshold, threshold * 4)
+        self.assertEqual({}, pairs)
+
+        # one range just below threshold
+        shard_ranges[0].update_meta(threshold - 1, 0,
+                                    meta_timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges[0])
+        pairs = find_shrinking_candidates(broker, threshold, threshold * 4)
+        self.assertEqual(1, len(pairs), pairs)
+        for acceptor, donor in pairs.items():
+            self.assertEqual(shard_ranges[1], acceptor)
+            self.assertEqual(shard_ranges[0], donor)
+
+        # two ranges just below threshold
+        shard_ranges[2].update_meta(threshold - 1, 0,
+                                    meta_timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges[2])
+        pairs = find_shrinking_candidates(broker, threshold, threshold * 4)
+
+        # shenanigans to work around dicts with ShardRanges keys not comparing
+        def check_pairs(pairs):
+            acceptors = []
+            donors = []
+            for acceptor, donor in pairs.items():
+                acceptors.append(acceptor)
+                donors.append(donor)
+            acceptors.sort(key=ShardRange.sort_key)
+            donors.sort(key=ShardRange.sort_key)
+            self.assertEqual([shard_ranges[1], shard_ranges[3]], acceptors)
+            self.assertEqual([shard_ranges[0], shard_ranges[2]], donors)
+
+        check_pairs(pairs)
+
+        # repeat call after broker is updated and expect same pairs
+        shard_ranges[0].update_state(ShardRange.SHRINKING, next(self.ts_iter))
+        shard_ranges[2].update_state(ShardRange.SHRINKING, next(self.ts_iter))
+        shard_ranges[1].lower = shard_ranges[0].lower
+        shard_ranges[1].timestamp = next(self.ts_iter)
+        shard_ranges[3].lower = shard_ranges[2].lower
+        shard_ranges[3].timestamp = next(self.ts_iter)
+        broker.merge_shard_ranges(shard_ranges)
+        pairs = find_shrinking_candidates(broker, threshold, threshold * 4)
+        check_pairs(pairs)
+
+    def test_finalize_shrinking(self):
+        broker = self._make_broker()
+        broker.enable_sharding(next(self.ts_iter))
+        shard_bounds = (('', 'here'), ('here', 'there'), ('there', ''))
+        ts_0 = next(self.ts_iter)
+        shard_ranges = self._make_shard_ranges(
+            shard_bounds, state=ShardRange.ACTIVE, timestamp=ts_0)
+        self.assertTrue(broker.set_sharding_state())
+        self.assertTrue(broker.set_sharded_state())
+        ts_1 = next(self.ts_iter)
+        finalize_shrinking(broker, shard_ranges[2:], shard_ranges[:2], ts_1)
+        updated_ranges = broker.get_shard_ranges()
+        self.assertEqual(
+            [ShardRange.SHRINKING, ShardRange.SHRINKING, ShardRange.ACTIVE],
+            [sr.state for sr in updated_ranges]
+        )
+        # acceptor is not updated...
+        self.assertEqual(ts_0, updated_ranges[2].timestamp)
+        # donors are updated...
+        self.assertEqual([ts_1] * 2,
+                         [sr.state_timestamp for sr in updated_ranges[:2]])
+        self.assertEqual([ts_1] * 2,
+                         [sr.epoch for sr in updated_ranges[:2]])
+        # check idempotency
+        ts_2 = next(self.ts_iter)
+        finalize_shrinking(broker, shard_ranges[2:], shard_ranges[:2], ts_2)
+        updated_ranges = broker.get_shard_ranges()
+        self.assertEqual(
+            [ShardRange.SHRINKING, ShardRange.SHRINKING, ShardRange.ACTIVE],
+            [sr.state for sr in updated_ranges]
+        )
+        # acceptor is not updated...
+        self.assertEqual(ts_0, updated_ranges[2].timestamp)
+        # donors are not updated...
+        self.assertEqual([ts_1] * 2,
+                         [sr.state_timestamp for sr in updated_ranges[:2]])
+        self.assertEqual([ts_1] * 2,
+                         [sr.epoch for sr in updated_ranges[:2]])
+
+    def test_process_compactible(self):
+        # no sequences...
+        broker = self._make_broker()
+        with mock.patch('swift.container.sharder.finalize_shrinking') as fs:
+            with mock_timestamp_now(next(self.ts_iter)) as now:
+                process_compactible_shard_sequences(broker, [])
+        fs.assert_called_once_with(broker, [], [], now)
+
+        # two sequences with acceptor bounds needing to be updated
+        ts_0 = next(self.ts_iter)
+        sequence_1 = self._make_shard_ranges(
+            (('a', 'b'), ('b', 'c'), ('c', 'd')),
+            state=ShardRange.ACTIVE, timestamp=ts_0)
+        sequence_2 = self._make_shard_ranges(
+            (('x', 'y'), ('y', 'z')),
+            state=ShardRange.ACTIVE, timestamp=ts_0)
+        with mock.patch('swift.container.sharder.finalize_shrinking') as fs:
+            with mock_timestamp_now(next(self.ts_iter)) as now:
+                process_compactible_shard_sequences(
+                    broker, [sequence_1, sequence_2])
+        expected_donors = sequence_1[:-1] + sequence_2[:-1]
+        expected_acceptors = [sequence_1[-1].copy(lower='a', timestamp=now),
+                              sequence_2[-1].copy(lower='x', timestamp=now)]
+        fs.assert_called_once_with(
+            broker, expected_acceptors, expected_donors, now)
+        self.assertEqual([dict(sr) for sr in expected_acceptors],
+                         [dict(sr) for sr in fs.call_args[0][1]])
+        self.assertEqual([dict(sr) for sr in expected_donors],
+                         [dict(sr) for sr in fs.call_args[0][2]])
+
+        # sequences have already been processed - acceptors expanded
+        sequence_1 = self._make_shard_ranges(
+            (('a', 'b'), ('b', 'c'), ('a', 'd')),
+            state=ShardRange.ACTIVE, timestamp=ts_0)
+        sequence_2 = self._make_shard_ranges(
+            (('x', 'y'), ('x', 'z')),
+            state=ShardRange.ACTIVE, timestamp=ts_0)
+        with mock.patch('swift.container.sharder.finalize_shrinking') as fs:
+            with mock_timestamp_now(next(self.ts_iter)) as now:
+                process_compactible_shard_sequences(
+                    broker, [sequence_1, sequence_2])
+        expected_donors = sequence_1[:-1] + sequence_2[:-1]
+        expected_acceptors = [sequence_1[-1], sequence_2[-1]]
+        fs.assert_called_once_with(
+            broker, expected_acceptors, expected_donors, now)
+
+        self.assertEqual([dict(sr) for sr in expected_acceptors],
+                         [dict(sr) for sr in fs.call_args[0][1]])
+        self.assertEqual([dict(sr) for sr in expected_donors],
+                         [dict(sr) for sr in fs.call_args[0][2]])
+
+        # acceptor is root - needs state to be updated, but not bounds
+        sequence_1 = self._make_shard_ranges(
+            (('a', 'b'), ('b', 'c'), ('a', 'd'), ('d', ''), ('', '')),
+            state=[ShardRange.ACTIVE] * 4 + [ShardRange.SHARDED],
+            timestamp=ts_0)
+        with mock.patch('swift.container.sharder.finalize_shrinking') as fs:
+            with mock_timestamp_now(next(self.ts_iter)) as now:
+                process_compactible_shard_sequences(broker, [sequence_1])
+        expected_donors = sequence_1[:-1]
+        expected_acceptors = [sequence_1[-1].copy(state=ShardRange.ACTIVE,
+                                                  state_timestamp=now)]
+        fs.assert_called_once_with(
+            broker, expected_acceptors, expected_donors, now)
+
+        self.assertEqual([dict(sr) for sr in expected_acceptors],
+                         [dict(sr) for sr in fs.call_args[0][1]])
+        self.assertEqual([dict(sr) for sr in expected_donors],
+                         [dict(sr) for sr in fs.call_args[0][2]])
+
+    def test_find_compactible_shard_ranges_in_found_state(self):
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('a', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.FOUND)
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([], sequences)
+
+    def test_find_compactible_no_donors(self):
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('a', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE, object_count=10)
+        broker.merge_shard_ranges(shard_ranges)
+        # shards exceed shrink threshold
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([], sequences)
+        # compacted shards would exceed merge size
+        sequences = find_compactible_shard_sequences(broker, 11, 19, -1, -1)
+        self.assertEqual([], sequences)
+        # shards exceed merge size
+        sequences = find_compactible_shard_sequences(broker, 11, 9, -1, -1)
+        self.assertEqual([], sequences)
+        # shards exceed merge size and shrink threshold
+        sequences = find_compactible_shard_sequences(broker, 10, 9, -1, -1)
+        self.assertEqual([], sequences)
+        # shards exceed *zero'd* merge size and shrink threshold
+        sequences = find_compactible_shard_sequences(broker, 0, 0, -1, -1)
+        self.assertEqual([], sequences)
+        # shards exceed *negative* merge size and shrink threshold
+        sequences = find_compactible_shard_sequences(broker, -1, -2, -1, -1)
+        self.assertEqual([], sequences)
+        # weird case: shards object count less than threshold but compacted
+        # shards would exceed merge size
+        sequences = find_compactible_shard_sequences(broker, 20, 19, -1, -1)
+        self.assertEqual([], sequences)
+
+    def test_find_compactible_nine_donors_one_acceptor(self):
+        # one sequence that spans entire namespace but does not shrink to root
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        shard_ranges[9].object_count = 11  # final shard too big to shrink
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges], sequences)
+
+    def test_find_compactible_four_donors_two_acceptors(self):
+        small_ranges = (2, 3, 4, 7)
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        for i, sr in enumerate(shard_ranges):
+            if i not in small_ranges:
+                sr.object_count = 100
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges[2:6], shard_ranges[7:9]], sequences)
+
+    def test_find_compactible_all_donors_shrink_to_root(self):
+        # by default all shard ranges are small enough to shrink so the root
+        # becomes the acceptor
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        broker.merge_shard_ranges(shard_ranges)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED)
+        broker.merge_shard_ranges(own_sr)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges + [own_sr]], sequences)
+
+    def test_find_compactible_single_donor_shrink_to_root(self):
+        # single shard range small enough to shrink so the root becomes the
+        # acceptor
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', ''),), state=ShardRange.ACTIVE, timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED, next(self.ts_iter))
+        broker.merge_shard_ranges(own_sr)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges + [own_sr]], sequences)
+
+        # update broker with donor/acceptor
+        shard_ranges[0].update_state(ShardRange.SHRINKING, next(self.ts_iter))
+        own_sr.update_state(ShardRange.ACTIVE, next(self.ts_iter))
+        broker.merge_shard_ranges([shard_ranges[0], own_sr])
+        # we don't find the same sequence again...
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([], sequences)
+        # ...unless explicitly requesting it
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1,
+                                                     include_shrinking=True)
+        self.assertEqual([shard_ranges + [own_sr]], sequences)
+
+    def test_find_compactible_overlapping_ranges(self):
+        # unexpected case: all shrinkable, two overlapping sequences, one which
+        # spans entire namespace; should not shrink to root
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'),  # overlaps form one sequence
+             ('', 'j'), ('j', '')),  # second sequence spans entire namespace
+            state=ShardRange.ACTIVE)
+        shard_ranges[1].object_count = 11  # cannot shrink, so becomes acceptor
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges[:2], shard_ranges[2:]], sequences)
+
+    def test_find_compactible_overlapping_ranges_with_ineligible_state(self):
+        # unexpected case: one ineligible state shard range overlapping one
+        # sequence which spans entire namespace; should not shrink to root
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'),  # overlap in ineligible state
+             ('', 'j'), ('j', '')),  # sequence spans entire namespace
+            state=[ShardRange.CREATED, ShardRange.ACTIVE, ShardRange.ACTIVE])
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges[1:]], sequences)
+
+    def test_find_compactible_donors_but_no_suitable_acceptor(self):
+        # if shard ranges are already shrinking, check that the final one is
+        # not made into an acceptor if a suitable adjacent acceptor is not
+        # found (unexpected scenario but possible in an overlap situation)
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=([ShardRange.SHRINKING] * 3 +
+                   [ShardRange.SHARDING] +
+                   [ShardRange.ACTIVE] * 6))
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges[4:]], sequences)
+
+    def test_find_compactible_no_gaps(self):
+        # verify that compactible sequences do not include gaps
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('e', 'f'),  # gap d - e
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        broker.merge_shard_ranges(shard_ranges)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED)
+        broker.merge_shard_ranges(own_sr)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([shard_ranges[:3], shard_ranges[3:]], sequences)
+
+    def test_find_compactible_eligible_states(self):
+        # verify that compactible sequences only include shards in valid states
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=[ShardRange.SHRINKING, ShardRange.ACTIVE,  # ok, shrinking
+                   ShardRange.CREATED,  # ineligible state
+                   ShardRange.ACTIVE, ShardRange.ACTIVE,  # ok
+                   ShardRange.FOUND,  # ineligible state
+                   ShardRange.SHARDED,  # ineligible state
+                   ShardRange.ACTIVE, ShardRange.SHRINKING,  # ineligible state
+                   ShardRange.SHARDING,  # ineligible state
+                   ])
+        broker.merge_shard_ranges(shard_ranges)
+        own_sr = broker.get_own_shard_range()
+        own_sr.update_state(ShardRange.SHARDED)
+        broker.merge_shard_ranges(own_sr)
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1,
+                                                     include_shrinking=True)
+        self.assertEqual([shard_ranges[:2], shard_ranges[3:5], ], sequences)
+
+    def test_find_compactible_max_shrinking(self):
+        # verify option to limit the number of shrinking shards per acceptor
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        broker.merge_shard_ranges(shard_ranges)
+        # limit to 1 donor per acceptor
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 1, -1)
+        self.assertEqual([shard_ranges[n:n + 2] for n in range(0, 9, 2)],
+                         sequences)
+
+    def test_find_compactible_max_expanding(self):
+        # verify option to limit the number of expanding shards per acceptor
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE)
+        broker.merge_shard_ranges(shard_ranges)
+        # note: max_shrinking is set to 3 so that there is opportunity for more
+        # than 2 acceptors
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 3, 2)
+        self.assertEqual([shard_ranges[:4], shard_ranges[4:8]], sequences)
+        # relax max_expanding
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 3, 3)
+        self.assertEqual(
+            [shard_ranges[:4], shard_ranges[4:8], shard_ranges[8:]], sequences)
+
+        # commit the first two sequences to the broker
+        for sr in shard_ranges[:3] + shard_ranges[4:7]:
+            sr.update_state(ShardRange.SHRINKING,
+                            state_timestamp=next(self.ts_iter))
+        shard_ranges[3].lower = shard_ranges[0].lower
+        shard_ranges[3].timestamp = next(self.ts_iter)
+        shard_ranges[7].lower = shard_ranges[4].lower
+        shard_ranges[7].timestamp = next(self.ts_iter)
+        broker.merge_shard_ranges(shard_ranges)
+        # we don't find them again...
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 3, 2)
+        self.assertEqual([], sequences)
+        # ...unless requested explicitly
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 3, 2,
+                                                     include_shrinking=True)
+        self.assertEqual([shard_ranges[:4], shard_ranges[4:8]], sequences)
+        # we could find another if max_expanding is increased
+        sequences = find_compactible_shard_sequences(broker, 10, 999, 3, 3)
+        self.assertEqual([shard_ranges[8:]], sequences)
+
+    def _do_test_find_compactible_shrink_threshold(self, broker, shard_ranges):
+        # verify option to set the shrink threshold for compaction;
+        # (n-2)th shard range has one extra object
+        shard_ranges[-2].object_count = 11
+        broker.merge_shard_ranges(shard_ranges)
+        # with threshold set to 10 no shard ranges can be shrunk
+        sequences = find_compactible_shard_sequences(broker, 10, 999, -1, -1)
+        self.assertEqual([], sequences)
+        # with threshold == 11 all but the final 2 shard ranges can be shrunk;
+        # note: the (n-1)th shard range is NOT shrunk to root
+        sequences = find_compactible_shard_sequences(broker, 11, 999, -1, -1)
+        self.assertEqual([shard_ranges[:9]], sequences)
+
+    def test_find_compactible_shrink_threshold(self):
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE, object_count=10)
+        self._do_test_find_compactible_shrink_threshold(broker, shard_ranges)
+
+    def test_find_compactible_shrink_threshold_with_tombstones(self):
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE, object_count=7, tombstones=3)
+        self._do_test_find_compactible_shrink_threshold(broker, shard_ranges)
+
+    def _do_test_find_compactible_expansion_limit(self, broker, shard_ranges):
+        # verify option to limit the size of each acceptor after compaction
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 33, -1, -1)
+        self.assertEqual([shard_ranges[:5], shard_ranges[5:]], sequences)
+        shard_ranges[4].update_meta(20, 2000)
+        shard_ranges[6].update_meta(28, 2700)
+        broker.merge_shard_ranges(shard_ranges)
+        sequences = find_compactible_shard_sequences(broker, 10, 33, -1, -1)
+        self.assertEqual([shard_ranges[:4], shard_ranges[7:]], sequences)
+
+    def test_find_compactible_expansion_limit(self):
+        # verify option to limit the size of each acceptor after compaction
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE, object_count=6)
+        self._do_test_find_compactible_expansion_limit(broker, shard_ranges)
+
+    def test_find_compactible_expansion_limit_with_tombstones(self):
+        # verify option to limit the size of each acceptor after compaction
+        broker = self._make_broker()
+        shard_ranges = self._make_shard_ranges(
+            (('', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+             ('f', 'g'), ('g', 'h'), ('h', 'i'), ('i', 'j'), ('j', '')),
+            state=ShardRange.ACTIVE, object_count=1, tombstones=5)
+        self._do_test_find_compactible_expansion_limit(broker, shard_ranges)
+
+    def test_is_sharding_candidate(self):
+        for state in ShardRange.STATES:
+            for object_count in (9, 10, 11):
+                sr = ShardRange('.shards_a/c', next(self.ts_iter), '', '',
+                                state=state, object_count=object_count,
+                                tombstones=100)  # tombstones not considered
+                with annotate_failure('%s %s' % (state, object_count)):
+                    if state == ShardRange.ACTIVE and object_count >= 10:
+                        self.assertTrue(is_sharding_candidate(sr, 10))
+                    else:
+                        self.assertFalse(is_sharding_candidate(sr, 10))
+
+    def test_is_shrinking_candidate(self):
+        def do_check_true(state, ok_states):
+            # shard range has 9 objects
+            sr = ShardRange('.shards_a/c', next(self.ts_iter), '', '',
+                            state=state, object_count=9)
+            self.assertTrue(is_shrinking_candidate(sr, 10, 9, ok_states))
+            # shard range has 9 rows
+            sr = ShardRange('.shards_a/c', next(self.ts_iter), '', '',
+                            state=state, object_count=4, tombstones=5)
+            self.assertTrue(is_shrinking_candidate(sr, 10, 9, ok_states))
+
+        do_check_true(ShardRange.ACTIVE, (ShardRange.ACTIVE,))
+        do_check_true(ShardRange.ACTIVE,
+                      (ShardRange.ACTIVE, ShardRange.SHRINKING))
+        do_check_true(ShardRange.SHRINKING,
+                      (ShardRange.ACTIVE, ShardRange.SHRINKING))
+
+        def do_check_false(state, object_count, tombstones):
+            states = (ShardRange.ACTIVE, ShardRange.SHRINKING)
+            # shard range has 10 objects
+            sr = ShardRange('.shards_a/c', next(self.ts_iter), '', '',
+                            state=state, object_count=object_count,
+                            tombstones=tombstones)
+            self.assertFalse(is_shrinking_candidate(sr, 10, 20))
+            self.assertFalse(is_shrinking_candidate(sr, 10, 20, states))
+            self.assertFalse(is_shrinking_candidate(sr, 10, 9))
+            self.assertFalse(is_shrinking_candidate(sr, 10, 9, states))
+            self.assertFalse(is_shrinking_candidate(sr, 20, 9))
+            self.assertFalse(is_shrinking_candidate(sr, 20, 9, states))
+
+        for state in ShardRange.STATES:
+            for object_count in (10, 11):
+                with annotate_failure('%s %s' % (state, object_count)):
+                    do_check_false(state, object_count, 0)
+            for tombstones in (10, 11):
+                with annotate_failure('%s %s' % (state, tombstones)):
+                    do_check_false(state, 0, tombstones)
+            for tombstones in (5, 6):
+                with annotate_failure('%s %s' % (state, tombstones)):
+                    do_check_false(state, 5, tombstones)
+
+    def test_find_and_rank_whole_path_split(self):
+        ts_0 = next(self.ts_iter)
+        ts_1 = next(self.ts_iter)
+        bounds_0 = (
+            ('', 'f'),
+            ('f', 'k'),
+            ('k', 's'),
+            ('s', 'x'),
+            ('x', ''),
+        )
+        bounds_1 = (
+            ('', 'g'),
+            ('g', 'l'),
+            ('l', 't'),
+            ('t', 'y'),
+            ('y', ''),
+        )
+        # path with newer timestamp wins
+        ranges_0 = self._make_shard_ranges(bounds_0, ShardRange.ACTIVE,
+                                           timestamp=ts_0)
+        ranges_1 = self._make_shard_ranges(bounds_1, ShardRange.ACTIVE,
+                                           timestamp=ts_1)
+
+        paths = find_paths(ranges_0 + ranges_1)
+        self.assertEqual(2, len(paths))
+        self.assertIn(ranges_0, paths)
+        self.assertIn(ranges_1, paths)
+        own_sr = ShardRange('a/c', Timestamp.now())
+        self.assertEqual(
+            [
+                ranges_1,  # complete and newer timestamp
+                ranges_0,  # complete
+            ],
+            rank_paths(paths, own_sr))
+
+        # but object_count trumps matching timestamp
+        ranges_0 = self._make_shard_ranges(bounds_0, ShardRange.ACTIVE,
+                                           timestamp=ts_1, object_count=1)
+        paths = find_paths(ranges_0 + ranges_1)
+        self.assertEqual(2, len(paths))
+        self.assertIn(ranges_0, paths)
+        self.assertIn(ranges_1, paths)
+        self.assertEqual(
+            [
+                ranges_0,  # complete with more objects
+                ranges_1,  # complete
+            ],
+            rank_paths(paths, own_sr))
+
+    def test_find_and_rank_two_sub_path_splits(self):
+        ts_0 = next(self.ts_iter)
+        ts_1 = next(self.ts_iter)
+        ts_2 = next(self.ts_iter)
+        bounds_0 = (
+            ('', 'a'),
+            ('a', 'm'),
+            ('m', 'p'),
+            ('p', 't'),
+            ('t', 'x'),
+            ('x', 'y'),
+            ('y', ''),
+        )
+        bounds_1 = (
+            ('a', 'g'),  # split at 'a'
+            ('g', 'l'),
+            ('l', 'm'),  # rejoin at 'm'
+        )
+        bounds_2 = (
+            ('t', 'y'),  # split at 't', rejoin at 'y'
+        )
+        ranges_0 = self._make_shard_ranges(bounds_0, ShardRange.ACTIVE,
+                                           timestamp=ts_0)
+        ranges_1 = self._make_shard_ranges(bounds_1, ShardRange.ACTIVE,
+                                           timestamp=ts_1, object_count=1)
+        ranges_2 = self._make_shard_ranges(bounds_2, ShardRange.ACTIVE,
+                                           timestamp=ts_2, object_count=1)
+        # all paths are complete
+        mix_path_0 = ranges_0[:1] + ranges_1 + ranges_0[2:]  # 3 objects
+        mix_path_1 = ranges_0[:4] + ranges_2 + ranges_0[6:]  # 1 object
+        mix_path_2 = (ranges_0[:1] + ranges_1 + ranges_0[2:4] + ranges_2 +
+                      ranges_0[6:])  # 4 objects
+        paths = find_paths(ranges_0 + ranges_1 + ranges_2)
+        self.assertEqual(4, len(paths))
+        self.assertIn(ranges_0, paths)
+        self.assertIn(mix_path_0, paths)
+        self.assertIn(mix_path_1, paths)
+        self.assertIn(mix_path_2, paths)
+        own_sr = ShardRange('a/c', Timestamp.now())
+        self.assertEqual(
+            [
+                mix_path_2,  # has 4 objects, 3 different timestamps
+                mix_path_0,  # has 3 objects, 2 different timestamps
+                mix_path_1,  # has 1 object, 2 different timestamps
+                ranges_0,  # has 0 objects, 1 timestamp
+            ],
+            rank_paths(paths, own_sr)
+        )
+
+    def test_find_and_rank_most_cleave_progress(self):
+        ts_0 = next(self.ts_iter)
+        ts_1 = next(self.ts_iter)
+        ts_2 = next(self.ts_iter)
+        bounds_0 = (
+            ('', 'f'),
+            ('f', 'k'),
+            ('k', 'p'),
+            ('p', '')
+        )
+        bounds_1 = (
+            ('', 'g'),
+            ('g', 'l'),
+            ('l', 'q'),
+            ('q', '')
+        )
+        bounds_2 = (
+            ('', 'r'),
+            ('r', '')
+        )
+        ranges_0 = self._make_shard_ranges(
+            bounds_0, [ShardRange.CLEAVED] * 3 + [ShardRange.CREATED],
+            timestamp=ts_1, object_count=1)
+        ranges_1 = self._make_shard_ranges(
+            bounds_1, [ShardRange.CLEAVED] * 4,
+            timestamp=ts_0)
+        ranges_2 = self._make_shard_ranges(
+            bounds_2, [ShardRange.CLEAVED, ShardRange.CREATED],
+            timestamp=ts_2, object_count=1)
+        paths = find_paths(ranges_0 + ranges_1 + ranges_2)
+        self.assertEqual(3, len(paths))
+        own_sr = ShardRange('a/c', Timestamp.now())
+        self.assertEqual(
+            [
+                ranges_1,  # cleaved to end
+                ranges_2,  # cleaved to r
+                ranges_0,  # cleaved to p
+            ],
+            rank_paths(paths, own_sr)
+        )
+        ranges_2 = self._make_shard_ranges(
+            bounds_2, [ShardRange.ACTIVE] * 2,
+            timestamp=ts_2, object_count=1)
+        paths = find_paths(ranges_0 + ranges_1 + ranges_2)
+        self.assertEqual(
+            [
+                ranges_2,  # active to end, newer timestamp
+                ranges_1,  # cleaved to r
+                ranges_0,  # cleaved to p
+            ],
+            rank_paths(paths, own_sr)
+        )
+
+    def test_find_and_rank_no_complete_path(self):
+        ts_0 = next(self.ts_iter)
+        ts_1 = next(self.ts_iter)
+        ts_2 = next(self.ts_iter)
+        bounds_0 = (
+            ('', 'f'),
+            ('f', 'k'),
+            ('k', 'm'),
+        )
+        bounds_1 = (
+            ('', 'g'),
+            ('g', 'l'),
+            ('l', 'n'),
+        )
+        bounds_2 = (
+            ('', 'l'),
+        )
+        ranges_0 = self._make_shard_ranges(bounds_0, ShardRange.ACTIVE,
+                                           timestamp=ts_0)
+        ranges_1 = self._make_shard_ranges(bounds_1, ShardRange.ACTIVE,
+                                           timestamp=ts_1, object_count=1)
+        ranges_2 = self._make_shard_ranges(bounds_2, ShardRange.ACTIVE,
+                                           timestamp=ts_2, object_count=1)
+        mix_path_0 = ranges_2 + ranges_1[2:]
+        paths = find_paths(ranges_0 + ranges_1 + ranges_2)
+        self.assertEqual(3, len(paths))
+        self.assertIn(ranges_0, paths)
+        self.assertIn(ranges_1, paths)
+        self.assertIn(mix_path_0, paths)
+        own_sr = ShardRange('a/c', Timestamp.now())
+        self.assertEqual(
+            [
+                ranges_1,  # cleaved to n, one timestamp
+                mix_path_0,  # cleaved to n, has two different timestamps
+                ranges_0,  # cleaved to m
+            ],
+            rank_paths(paths, own_sr)
+        )
+
+
+class TestContainerSharderConf(unittest.TestCase):
+    def test_default(self):
+        expected = {'shard_container_threshold': 1000000,
+                    'max_shrinking': 1,
+                    'max_expanding': -1,
+                    'shard_scanner_batch_size': 10,
+                    'cleave_batch_size': 2,
+                    'cleave_row_batch_size': 10000,
+                    'broker_timeout': 60,
+                    'recon_candidates_limit': 5,
+                    'recon_sharded_timeout': 43200,
+                    'conn_timeout': 5.0,
+                    'auto_shard': False,
+                    'shrink_threshold': 100000,
+                    'expansion_limit': 750000,
+                    'rows_per_shard': 500000,
+                    'minimum_shard_size': 100000}
+        self.assertEqual(expected, vars(ContainerSharderConf()))
+        self.assertEqual(expected, vars(ContainerSharderConf(None)))
+        self.assertEqual(expected, DEFAULT_SHARDER_CONF)
+
+    def test_conf(self):
+        conf = {'shard_container_threshold': 2000000,
+                'max_shrinking': 2,
+                'max_expanding': 3,
+                'shard_scanner_batch_size': 11,
+                'cleave_batch_size': 4,
+                'cleave_row_batch_size': 50000,
+                'broker_timeout': 61,
+                'recon_candidates_limit': 6,
+                'recon_sharded_timeout': 43201,
+                'conn_timeout': 5.1,
+                'auto_shard': True,
+                'shrink_threshold': 100001,
+                'expansion_limit': 750001,
+                'rows_per_shard': 500001,
+                'minimum_shard_size': 20}
+        expected = dict(conf)
+        conf.update({'unexpected': 'option'})
+        self.assertEqual(expected, vars(ContainerSharderConf(conf)))
+
+    def test_deprecated_percent_conf(self):
+        base_conf = {'shard_container_threshold': 2000000,
+                     'max_shrinking': 2,
+                     'max_expanding': 3,
+                     'shard_scanner_batch_size': 11,
+                     'cleave_batch_size': 4,
+                     'cleave_row_batch_size': 50000,
+                     'broker_timeout': 61,
+                     'recon_candidates_limit': 6,
+                     'recon_sharded_timeout': 43201,
+                     'conn_timeout': 5.1,
+                     'auto_shard': True,
+                     'minimum_shard_size': 1}
+
+        # percent options work
+        deprecated_conf = {'shard_shrink_point': 9,
+                           'shard_shrink_merge_point': 71}
+        expected = dict(base_conf, rows_per_shard=1000000,
+                        shrink_threshold=180000, expansion_limit=1420000)
+        conf = dict(base_conf)
+        conf.update(deprecated_conf)
+        self.assertEqual(expected, vars(ContainerSharderConf(conf)))
+
+        # check absolute options override percent options
+        conf.update({'shrink_threshold': 100001,
+                     'expansion_limit': 750001})
+
+        expected = dict(base_conf, rows_per_shard=1000000,
+                        shrink_threshold=100001, expansion_limit=750001)
+        conf.update(deprecated_conf)
+        self.assertEqual(expected, vars(ContainerSharderConf(conf)))
+
+    def test_bad_values(self):
+        not_positive_int = [0, -1, 'bad']
+        not_int = not_float = ['bad']
+        not_percent = ['bad', -1, 101, -0.1, 100.1]
+        bad = {'shard_container_threshold': not_positive_int,
+               'max_shrinking': not_int,
+               'max_expanding': not_int,
+               'shard_scanner_batch_size': not_positive_int,
+               'cleave_batch_size': not_positive_int,
+               'cleave_row_batch_size': not_positive_int,
+               'broker_timeout': not_positive_int,
+               'recon_candidates_limit': not_int,
+               'recon_sharded_timeout': not_int,
+               'conn_timeout': not_float,
+               # 'auto_shard': anything can be passed to config_true_value
+               'shrink_threshold': not_int,
+               'expansion_limit': not_int,
+               'shard_shrink_point': not_percent,
+               'shard_shrink_merge_point': not_percent,
+               'minimum_shard_size': not_positive_int}
+
+        for key, bad_values in bad.items():
+            for bad_value in bad_values:
+                with self.assertRaises(
+                        ValueError, msg='{%s : %s}' % (key, bad_value)) as cm:
+                    ContainerSharderConf({key: bad_value})
+                self.assertIn('Error setting %s' % key, str(cm.exception))
+
+    def test_validate(self):
+        def assert_bad(conf):
+            with self.assertRaises(ValueError):
+                ContainerSharderConf.validate_conf(ContainerSharderConf(conf))
+
+        def assert_ok(conf):
+            try:
+                ContainerSharderConf.validate_conf(ContainerSharderConf(conf))
+            except ValueError as err:
+                self.fail('Unexpected ValueError: %s' % err)
+
+        assert_ok({})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100,
+                   'rows_per_shard': 100})
+        assert_bad({'minimum_shard_size': 100})
+        assert_bad({'shrink_threshold': 100001})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100})
+        assert_bad({'minimum_shard_size': 100,
+                    'shrink_threshold': 100,
+                    'rows_per_shard': 99})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'rows_per_shard': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'rows_per_shard': 100})
+        assert_bad({'rows_per_shard': 10000001})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'expansion_limit': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'expansion_limit': 100})
+        assert_bad({'expansion_limit': 100000001})
+
+    def test_validate_subset(self):
+        # verify that validation is only applied for keys that exist in the
+        # given namespace
+        def assert_bad(conf):
+            with self.assertRaises(ValueError):
+                ContainerSharderConf.validate_conf(Namespace(**conf))
+
+        def assert_ok(conf):
+            try:
+                ContainerSharderConf.validate_conf(Namespace(**conf))
+            except ValueError as err:
+                self.fail('Unexpected ValueError: %s' % err)
+
+        assert_ok({})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100,
+                   'rows_per_shard': 100})
+        assert_ok({'minimum_shard_size': 100})
+        assert_ok({'shrink_threshold': 100001})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100})
+        assert_bad({'minimum_shard_size': 100,
+                    'shrink_threshold': 100,
+                    'rows_per_shard': 99})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'rows_per_shard': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'rows_per_shard': 100})
+        assert_ok({'rows_per_shard': 10000001})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'expansion_limit': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'expansion_limit': 100})
+        assert_ok({'expansion_limit': 100000001})

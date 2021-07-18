@@ -66,7 +66,7 @@ from swift.common.utils import mkdirs, Timestamp, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
     MD5_OF_EMPTY_STRING, link_fd_to_path, \
     O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory, \
-    md5
+    md5, is_file_older
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
@@ -341,6 +341,12 @@ def quarantine_renamer(device_path, corrupted_file_path):
     return to_dir
 
 
+def valid_suffix(value):
+    if not isinstance(value, six.string_types) or len(value) != 3:
+        return False
+    return all(c in '0123456789abcdef' for c in value)
+
+
 def read_hashes(partition_dir):
     """
     Read the existing hashes.pkl
@@ -365,9 +371,9 @@ def read_hashes(partition_dir):
             pass
 
     # Check for corrupted data that could break os.listdir()
-    for suffix in hashes.keys():
-        if not suffix.isalnum():
-            return {'valid': False}
+    if not all(valid_suffix(key) or key in ('valid', 'updated')
+               for key in hashes):
+        return {'valid': False}
 
     # hashes.pkl w/o valid updated key is "valid" but "forever old"
     hashes.setdefault('valid', True)
@@ -443,35 +449,58 @@ def invalidate_hash(suffix_dir):
         inv_fh.write(suffix + b"\n")
 
 
-def relink_paths(target_path, new_target_path, check_existing=False):
+def relink_paths(target_path, new_target_path, ignore_missing=True):
     """
-    Hard-links a file located in target_path using the second path
-    new_target_path. Creates intermediate directories if required.
+    Hard-links a file located in ``target_path`` using the second path
+    ``new_target_path``. Creates intermediate directories if required.
 
     :param target_path: current absolute filename
     :param new_target_path: new absolute filename for the hardlink
-    :param check_existing: if True, check whether the link is already present
-                           before attempting to create a new one
+    :param ignore_missing: if True then no exception is raised if the link
+        could not be made because ``target_path`` did not exist, otherwise an
+        OSError will be raised.
+    :raises: OSError if the hard link could not be created, unless the intended
+        hard link already exists or the ``target_path`` does not exist and
+        ``must_exist`` if False.
+    :returns: True if the link was created by the call to this method, False
+        otherwise.
     """
-
+    link_created = False
     if target_path != new_target_path:
-        logging.debug('Relinking %s to %s due to next_part_power set',
-                      target_path, new_target_path)
         new_target_dir = os.path.dirname(new_target_path)
-        if not os.path.isdir(new_target_dir):
+        try:
             os.makedirs(new_target_dir)
+        except OSError as err:
+            if err.errno != errno.EEXIST:
+                raise
 
-        link_exists = False
-        if check_existing:
-            try:
-                new_stat = os.stat(new_target_path)
-                orig_stat = os.stat(target_path)
-                link_exists = (new_stat.st_ino == orig_stat.st_ino)
-            except OSError:
-                pass  # if anything goes wrong, try anyway
-
-        if not link_exists:
+        try:
             os.link(target_path, new_target_path)
+            link_created = True
+        except OSError as err:
+            # there are some circumstances in which it may be ok that the
+            # attempted link failed
+            ok = False
+            if err.errno == errno.ENOENT:
+                # this is ok if the *target* path doesn't exist anymore
+                ok = not os.path.exists(target_path) and ignore_missing
+            if err.errno == errno.EEXIST:
+                # this is ok *if* the intended link has already been made
+                try:
+                    orig_stat = os.stat(target_path)
+                except OSError as sub_err:
+                    # this is ok: the *target* path doesn't exist anymore
+                    ok = sub_err.errno == errno.ENOENT and ignore_missing
+                else:
+                    try:
+                        new_stat = os.stat(new_target_path)
+                        ok = new_stat.st_ino == orig_stat.st_ino
+                    except OSError:
+                        # squash this exception; the original will be raised
+                        pass
+            if not ok:
+                raise err
+    return link_created
 
 
 def get_part_path(dev_path, policy, partition):
@@ -628,15 +657,6 @@ def clear_auditor_status(devices, datadir, auditor_type="ALL"):
         remove_file(auditor_status)
 
 
-def strip_self(f):
-    """
-    Wrapper to attach module level functions to base class.
-    """
-    def wrapper(self, *args, **kwargs):
-        return f(*args, **kwargs)
-    return wrapper
-
-
 class DiskFileRouter(object):
 
     def __init__(self, *args, **kwargs):
@@ -676,9 +696,9 @@ class BaseDiskFileManager(object):
     diskfile_cls = None  # must be set by subclasses
     policy = None  # must be set by subclasses
 
-    invalidate_hash = strip_self(invalidate_hash)
-    consolidate_hashes = strip_self(consolidate_hashes)
-    quarantine_renamer = strip_self(quarantine_renamer)
+    invalidate_hash = staticmethod(invalidate_hash)
+    consolidate_hashes = staticmethod(consolidate_hashes)
+    quarantine_renamer = staticmethod(quarantine_renamer)
 
     def __init__(self, conf, logger):
         self.logger = logger
@@ -916,7 +936,9 @@ class BaseDiskFileManager(object):
         valid fileset, or None.
 
         :param files: a list of file names.
-        :param datadir: directory name files are from.
+        :param datadir: directory name files are from; this is used to
+                        construct file paths in the results, but the datadir is
+                        not modified by this method.
         :param verify: if True verify that the ondisk file contract has not
                        been violated, otherwise do not verify.
         :param policy: storage policy used to store the files. Used to
@@ -1280,6 +1302,8 @@ class BaseDiskFileManager(object):
             self.logger.debug('Run listdir on %s', partition_path)
         hashes.update((suffix, None) for suffix in recalculate)
         for suffix, hash_ in list(hashes.items()):
+            if suffix in ('valid', 'updated'):
+                continue
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
@@ -1527,12 +1551,14 @@ class BaseDiskFileManager(object):
         if not dev_path:
             raise DiskFileDeviceUnavailable()
         partition_path = get_part_path(dev_path, policy, partition)
-        if not os.path.exists(partition_path):
-            mkdirs(partition_path)
+        suffixes = [suf for suf in suffixes or [] if valid_suffix(suf)]
+
         if skip_rehash:
-            for suffix in suffixes or []:
-                invalidate_hash(os.path.join(partition_path, suffix))
-            return None
+            for suffix in suffixes:
+                self.invalidate_hash(os.path.join(partition_path, suffix))
+            hashes = None
+        elif not os.path.exists(partition_path):
+            hashes = {}
         else:
             _junk, hashes = tpool.execute(
                 self._get_hashes, device, partition, policy,
@@ -1811,7 +1837,10 @@ class BaseDiskFileWriter(object):
         """
         return self._upload_size, self._chunks_etag.hexdigest()
 
-    def _finalize_put(self, metadata, target_path, cleanup):
+    def _finalize_put(self, metadata, target_path, cleanup,
+                      logger_thread_locals):
+        if logger_thread_locals is not None:
+            self.logger.thread_locals = logger_thread_locals
         # Write the metadata before calling fsync() so that both data and
         # metadata are flushed to disk.
         write_metadata(self._fd, metadata)
@@ -1838,10 +1867,13 @@ class BaseDiskFileWriter(object):
         new_target_path = None
         if self.next_part_power:
             new_target_path = replace_partition_in_path(
-                target_path, self.next_part_power)
+                self.manager.devices, target_path, self.next_part_power)
             if target_path != new_target_path:
                 try:
                     fsync_dir(os.path.dirname(target_path))
+                    self.manager.logger.debug(
+                        'Relinking %s to %s due to next_part_power set',
+                        target_path, new_target_path)
                     relink_paths(target_path, new_target_path)
                 except OSError as exc:
                     self.manager.logger.exception(
@@ -1885,7 +1917,9 @@ class BaseDiskFileWriter(object):
         metadata['name'] = self._name
         target_path = join(self._datadir, filename)
 
-        tpool.execute(self._finalize_put, metadata, target_path, cleanup)
+        tpool.execute(
+            self._finalize_put, metadata, target_path, cleanup,
+            logger_thread_locals=getattr(self.logger, 'thread_locals', None))
 
     def put(self, metadata):
         """
@@ -1935,7 +1969,7 @@ class BaseDiskFileWriter(object):
         else:
             prev_part_power = int(self.next_part_power) - 1
             old_target_path = replace_partition_in_path(
-                cur_path, prev_part_power)
+                self.manager.devices, cur_path, prev_part_power)
             old_target_dir = os.path.dirname(old_target_path)
             try:
                 self.manager.cleanup_ondisk_files(old_target_dir)
@@ -2029,7 +2063,15 @@ class BaseDiskFileReader(object):
             self._read_to_eof = False
             self._init_checks()
             while True:
-                chunk = self._fp.read(self._disk_chunk_size)
+                try:
+                    chunk = self._fp.read(self._disk_chunk_size)
+                except IOError as e:
+                    if e.errno == errno.EIO:
+                        # Note that if there's no quarantine hook set up,
+                        # this won't raise any exception
+                        self._quarantine(str(e))
+                    # ... so it's significant that this is not in an else
+                    raise
                 if chunk:
                     self._update_checks(chunk)
                     self._bytes_read += len(chunk)
@@ -3071,9 +3113,10 @@ class ECDiskFileWriter(BaseDiskFileWriter):
         new_data_file_path = new_durable_data_file_path = None
         if self.next_part_power:
             new_data_file_path = replace_partition_in_path(
-                data_file_path, self.next_part_power)
+                self.manager.devices, data_file_path, self.next_part_power)
             new_durable_data_file_path = replace_partition_in_path(
-                durable_data_file_path, self.next_part_power)
+                self.manager.devices, durable_data_file_path,
+                self.next_part_power)
         try:
             try:
                 os.rename(data_file_path, durable_data_file_path)
@@ -3273,7 +3316,7 @@ class ECDiskFile(BaseDiskFile):
             frag_prefs=self._frag_prefs, policy=policy)
         return self._ondisk_info
 
-    def purge(self, timestamp, frag_index):
+    def purge(self, timestamp, frag_index, nondurable_purge_delay=0):
         """
         Remove a tombstone file matching the specified timestamp or
         datafile matching the specified timestamp and fragment index
@@ -3290,6 +3333,8 @@ class ECDiskFile(BaseDiskFile):
                           :class:`~swift.common.utils.Timestamp`
         :param frag_index: fragment archive index, must be
                            a whole number or None.
+        :param nondurable_purge_delay: only remove a non-durable data file if
+            it's been on disk longer than this many seconds.
         """
         purge_file = self.manager.make_on_disk_filename(
             timestamp, ext='.ts')
@@ -3299,7 +3344,8 @@ class ECDiskFile(BaseDiskFile):
             # possibilities
             purge_file = self.manager.make_on_disk_filename(
                 timestamp, ext='.data', frag_index=frag_index)
-            remove_file(os.path.join(self._datadir, purge_file))
+            if is_file_older(purge_file, nondurable_purge_delay):
+                remove_file(os.path.join(self._datadir, purge_file))
             purge_file = self.manager.make_on_disk_filename(
                 timestamp, ext='.data', frag_index=frag_index, durable=True)
             remove_file(os.path.join(self._datadir, purge_file))
